@@ -1,0 +1,11 @@
+#!/bin/bash
+set -euo pipefail
+VERSION=$(head -1 < VERSION)
+REGISTRY="${REGISTRY:-harbor.volte.io/cnaas}"
+IMAGE="epdg"
+
+echo "Building ${IMAGE} version ${VERSION}"
+docker build -t "${REGISTRY}/${IMAGE}:latest" -f docker/Dockerfile .
+docker tag "${REGISTRY}/${IMAGE}:latest" "${REGISTRY}/${IMAGE}:${VERSION}"
+docker push "${REGISTRY}/${IMAGE}:latest"
+docker push "${REGISTRY}/${IMAGE}:${VERSION}"
