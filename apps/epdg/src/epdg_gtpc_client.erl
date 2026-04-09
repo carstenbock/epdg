@@ -179,6 +179,16 @@ handle_response(Data, #state{pending = Pending} = State) ->
 %%====================================================================
 
 parse_ip(Str) when is_list(Str) ->
-    {ok, IP} = inet:parse_address(Str),
-    IP;
+    case inet:parse_address(Str) of
+        {ok, IP} -> IP;
+        {error, _} ->
+            case inet:getaddr(Str, inet) of
+                {ok, IP} -> IP;
+                {error, _} ->
+                    case inet:getaddr(Str, inet6) of
+                        {ok, IP6} -> IP6;
+                        {error, Reason} -> error({resolve_failed, Str, Reason})
+                    end
+            end
+    end;
 parse_ip(T) when is_tuple(T) -> T.

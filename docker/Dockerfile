@@ -3,7 +3,7 @@ FROM erlang:26-alpine
 WORKDIR /app
 COPY . .
 
-RUN apk add --no-cache bash git build-base wget iproute2 ethtool libcap \
+RUN apk add --no-cache bash git build-base wget iproute2 ethtool libcap lksctp-tools \
   && adduser -D -u 1000 epdg-user \
   && wget -qO- https://github.com/erlang/rebar3/releases/download/3.23.0/rebar3 \
        | install -m 0755 /dev/stdin /usr/local/bin/rebar3 \
