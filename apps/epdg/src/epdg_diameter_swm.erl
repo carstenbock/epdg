@@ -77,13 +77,12 @@ init([]) ->
         {'Supported-Vendor-Id', [?VENDOR_3GPP]},
         {string_decode, false},
         {application, [{alias, swm},
-                       {dictionary, diameter_gen_base_rfc6733},
+                       {dictionary, diameter_dict_swm},
                        {module, ?MODULE}]}
     ],
 
     case diameter:start_service(?SVC_NAME, SvcOpts) of
         ok ->
-            %% Add listener for incoming connections (DRA connect-back)
             TransMod = transport_module(Transport),
             diameter:add_transport(?SVC_NAME, {listen, [
                 {transport_module, TransMod},
@@ -92,7 +91,6 @@ init([]) ->
                                     {port, DiamPort}]}
             ]}),
 
-            %% Connect to DRA
             case resolve_host(DRAHost) of
                 {ok, DRAIP} ->
                     diameter:add_transport(?SVC_NAME, {connect, [
