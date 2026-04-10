@@ -7,7 +7,9 @@
 
 -export([decode_header/1, encode_header/1,
          decode_payloads/2, encode_payloads/1,
-         decode_sa_payload/1]).
+         decode_sa_payload/1,
+         encode_cert_payload/1, encode_auth_payload/2,
+         encode_certreq_payload/1]).
 
 %% Exchange types (RFC 7296 section 3.1)
 -define(IKE_SA_INIT,      34).
@@ -21,8 +23,9 @@
 -define(PL_KE,    34).
 -define(PL_IDI,   35).
 -define(PL_IDR,   36).
--define(PL_CERT,  37).
--define(PL_AUTH,  39).
+-define(PL_CERT,    37).
+-define(PL_CERTREQ, 38).
+-define(PL_AUTH,    39).
 -define(PL_NONCE, 40).
 -define(PL_NOTIFY,41).
 -define(PL_TSI,   44).
@@ -156,6 +159,27 @@ decode_proposals(_, _) ->
     {error, malformed_sa}.
 
 %%====================================================================
+%% Certificate / Auth payload helpers (RFC 7296 §3.6, §3.8, §3.7)
+%%====================================================================
+
+%% X.509 Certificate - Signature (encoding type 4, RFC 7296 §3.6)
+-define(CERT_ENCODING_X509_SIGN, 4).
+
+-spec encode_cert_payload(binary()) -> binary().
+encode_cert_payload(DerCert) ->
+    <<?CERT_ENCODING_X509_SIGN:8, DerCert/binary>>.
+
+%% AUTH payload: auth method byte + signature data (RFC 7296 §3.8)
+-spec encode_auth_payload(non_neg_integer(), binary()) -> binary().
+encode_auth_payload(AuthMethod, Signature) ->
+    <<AuthMethod:8, 0:24, Signature/binary>>.
+
+%% CERTREQ payload: encoding type + SHA-1 hashes of trusted CA public keys
+-spec encode_certreq_payload(binary()) -> binary().
+encode_certreq_payload(CaPublicKeyHashes) ->
+    <<?CERT_ENCODING_X509_SIGN:8, CaPublicKeyHashes/binary>>.
+
+%%====================================================================
 %% Atoms
 %%====================================================================
 
@@ -169,8 +193,9 @@ payload_type_atom(?PL_SA)     -> sa;
 payload_type_atom(?PL_KE)     -> ke;
 payload_type_atom(?PL_IDI)    -> idi;
 payload_type_atom(?PL_IDR)    -> idr;
-payload_type_atom(?PL_CERT)   -> cert;
-payload_type_atom(?PL_AUTH)   -> auth;
+payload_type_atom(?PL_CERT)    -> cert;
+payload_type_atom(?PL_CERTREQ) -> certreq;
+payload_type_atom(?PL_AUTH)    -> auth;
 payload_type_atom(?PL_NONCE)  -> nonce;
 payload_type_atom(?PL_NOTIFY) -> notify;
 payload_type_atom(?PL_TSI)    -> tsi;
@@ -184,8 +209,9 @@ payload_type_raw(sa)     -> ?PL_SA;
 payload_type_raw(ke)     -> ?PL_KE;
 payload_type_raw(idi)    -> ?PL_IDI;
 payload_type_raw(idr)    -> ?PL_IDR;
-payload_type_raw(cert)   -> ?PL_CERT;
-payload_type_raw(auth)   -> ?PL_AUTH;
+payload_type_raw(cert)    -> ?PL_CERT;
+payload_type_raw(certreq) -> ?PL_CERTREQ;
+payload_type_raw(auth)    -> ?PL_AUTH;
 payload_type_raw(nonce)  -> ?PL_NONCE;
 payload_type_raw(notify) -> ?PL_NOTIFY;
 payload_type_raw(tsi)    -> ?PL_TSI;

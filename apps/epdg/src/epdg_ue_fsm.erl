@@ -23,7 +23,7 @@
     initiator_spi    :: non_neg_integer() | undefined,
     responder_spi    :: non_neg_integer() | undefined,
     imsi             :: binary() | undefined,
-    apn              :: binary() | undefined,  % APN/DNN from UE or default "ims"
+    apn              :: binary() | undefined,
     ike_sa           :: map() | undefined,
     child_sa         :: map() | undefined,
     eap_state        :: map() | undefined,
@@ -35,7 +35,12 @@
     nonce_r          :: binary() | undefined,
     dh_group         :: non_neg_integer() | undefined,
     dh_public        :: binary() | undefined,
-    dh_private       :: binary() | undefined
+    dh_private       :: binary() | undefined,
+    %% X.509 certificate for IKEv2 responder auth (TS 33.402 §7.2.1)
+    cert_der         :: binary() | undefined,
+    private_key      :: term() | undefined,
+    %% Stored IKE_SA_INIT response bytes for AUTH signature (RFC 7296 §2.15)
+    ike_sa_init_resp :: binary() | undefined
 }).
 
 %%====================================================================
@@ -67,11 +72,14 @@ init(#{peer_ip := PeerIP, peer_port := PeerPort} = _Ctx) ->
     RSPI = epdg_ikev2_crypto:generate_spi(),
     epdg_metrics:inc(ue_sessions_total),
     epdg_metrics:gauge_inc(ue_sessions_active),
+    {CertDer, PrivKey} = load_ike_certificate(),
     {ok, idle, #data{
         peer_ip       = PeerIP,
         peer_port     = PeerPort,
         responder_spi = RSPI,
-        message_id    = 0
+        message_id    = 0,
+        cert_der      = CertDer,
+        private_key   = PrivKey
     }}.
 
 terminate(_Reason, _State, #data{responder_spi = RSPI, imsi = IMSI,
@@ -197,37 +205,77 @@ handle_ike_sa_init_request(#{initiator_spi := ISPI} = _Header, _RawData,
     DHGroup = 14,
     {DHPub, DHPriv} = epdg_ikev2_crypto:dh_generate(DHGroup),
 
-    NewData = Data#data{
-        initiator_spi = ISPI,
-        nonce_r       = NonceR,
-        dh_group      = DHGroup,
-        dh_public     = DHPub,
-        dh_private    = DHPriv
-    },
-
     %% Register SPI so subsequent messages find this FSM
     epdg_ue_registry:register(RSPI, self(), undefined),
 
     logger:debug("IKE_SA_INIT: ISPI=~.16B RSPI=~.16B DH=~p",
                  [ISPI, RSPI, DHGroup]),
 
-    %% TODO: build and send IKE_SA_INIT response
+    %% TODO: build and send the actual IKE_SA_INIT response packet.
+    %% Store the full response octets for AUTH signature (RFC 7296 §2.15).
+    %% Placeholder: empty binary until the response builder is complete.
+    IkeSaInitRespBytes = <<>>,
+
+    NewData = Data#data{
+        initiator_spi    = ISPI,
+        nonce_r          = NonceR,
+        dh_group         = DHGroup,
+        dh_public        = DHPub,
+        dh_private       = DHPriv,
+        ike_sa_init_resp = IkeSaInitRespBytes
+    },
+
     {next_state, ike_sa_init, NewData}.
 
 %%====================================================================
 %% IKE_AUTH handler (initial)
 %%====================================================================
 
-handle_ike_auth_request(_Header, _RawData, Data) ->
+handle_ike_auth_request(_Header, _RawData,
+                        #data{cert_der = CertDer, private_key = PrivKey,
+                              ike_sa_init_resp = IkeSaInitRespBytes,
+                              nonce_i = NonceI} = Data) ->
     %% 1. Decrypt SK payload
     %% 2. Extract IDi (IMSI from NAI: 0<IMSI>@nai.epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org)
-    %% 3. Begin EAP-AKA' via SWm (Diameter to AAA Server)
-    %%    - Send DER with EAP-Payload containing EAP-Identity
-    %%    - Receive DEA with EAP-AKA' Challenge
-    %% 4. Send IKE_AUTH response with EAP payload
+    %% 3. Build first IKE_AUTH response: IDr, CERT, AUTH, EAP
+    %%    - ePDG authenticates to UE via certificate (TS 33.402 §7.2.1)
+    %% 4. Begin EAP-AKA' via SWm (Diameter to AAA Server)
 
-    %% Transition to ike_auth state for EAP round-trips
-    {next_state, ike_auth, Data}.
+    %% Build responder AUTH payload (RFC 7296 §2.15, §2.16):
+    %% SignedOctets = IKE_SA_INIT_response | Nonce_i | prf(SK_pr, IDr')
+    case {CertDer, PrivKey} of
+        {undefined, _} ->
+            logger:warning("No IKE certificate configured, cannot authenticate"),
+            {next_state, ike_auth, Data};
+        {_, undefined} ->
+            logger:warning("No IKE private key configured, cannot authenticate"),
+            {next_state, ike_auth, Data};
+        {_, _} ->
+            %% Encode CERT payload (X.509, encoding type 4)
+            CertPayloadData = epdg_ikev2_codec:encode_cert_payload(CertDer),
+
+            %% TODO: compute AUTH signature once IKE SA keys (SK_pr) and IDr
+            %% payload are available from a complete IKE_SA_INIT exchange.
+            %% For now, prepare the CERT payload; the AUTH signature will be
+            %% generated once derive_ike_keys and IDr construction are wired in.
+            _AuthInput = #{sk_pr => <<>>,
+                           id_payload => <<>>},
+            _IkeSaInitBytes = case IkeSaInitRespBytes of
+                undefined -> <<>>;
+                B -> B
+            end,
+            _NonceI = case NonceI of
+                undefined -> <<>>;
+                N -> N
+            end,
+
+            logger:debug("IKE_AUTH: CERT payload prepared (~p bytes), "
+                         "awaiting full key derivation for AUTH signature",
+                         [byte_size(CertPayloadData)]),
+
+            %% Transition to ike_auth state for EAP round-trips
+            {next_state, ike_auth, Data}
+    end.
 
 %%====================================================================
 %% IKE_AUTH EAP continuation
@@ -260,3 +308,36 @@ handle_ike_auth_eap(_Header, _RawData,
 handle_informational(_Header, _RawData, Data) ->
     %% Handle DPD (empty INFORMATIONAL) or DELETE payloads
     {keep_state, Data}.
+
+%%====================================================================
+%% Internal: certificate loading
+%%====================================================================
+
+load_ike_certificate() ->
+    CertFile = epdg_config:get(ike_cert_file, ""),
+    KeyFile  = epdg_config:get(ike_key_file, ""),
+    case {CertFile, KeyFile} of
+        {"", _} ->
+            logger:info("No IKE certificate file configured (EPDG_IKE_CERT_FILE)"),
+            {undefined, undefined};
+        {_, ""} ->
+            logger:info("No IKE private key file configured (EPDG_IKE_KEY_FILE)"),
+            {undefined, undefined};
+        {CF, KF} ->
+            CertResult = epdg_ikev2_crypto:load_certificate(CF),
+            KeyResult  = epdg_ikev2_crypto:load_private_key(KF),
+            case {CertResult, KeyResult} of
+                {{ok, DerCert}, {ok, PrivKey}} ->
+                    logger:info("IKE certificate loaded from ~s (~p bytes)",
+                                [CF, byte_size(DerCert)]),
+                    {DerCert, PrivKey};
+                {{error, CertErr}, _} ->
+                    logger:error("Failed to load IKE certificate ~s: ~p",
+                                 [CF, CertErr]),
+                    {undefined, undefined};
+                {_, {error, KeyErr}} ->
+                    logger:error("Failed to load IKE private key ~s: ~p",
+                                 [KF, KeyErr]),
+                    {undefined, undefined}
+            end
+    end.

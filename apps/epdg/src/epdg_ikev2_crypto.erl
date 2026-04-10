@@ -5,13 +5,17 @@
 %%%-------------------------------------------------------------------
 -module(epdg_ikev2_crypto).
 
+-include_lib("public_key/include/public_key.hrl").
+
 -export([generate_nonce/0, generate_spi/0,
          dh_generate/1, dh_compute/3,
          prf/3, prf_plus/4,
          derive_ike_keys/4,
          derive_child_keys/5,
          encrypt_sk/4, decrypt_sk/4,
-         derive_aka_prime_keys/4]).
+         derive_aka_prime_keys/4,
+         load_certificate/1, load_private_key/1,
+         sign_auth_data/5, auth_method/1]).
 
 -define(NONCE_LEN, 32).
 
@@ -179,6 +183,84 @@ derive_aka_prime_keys(CK, IK, ServingNetworkName, SQNxorAK) ->
     %% First 16 bytes = CK', next 16 bytes = IK'
     <<CKPrime:16/binary, IKPrime:16/binary>> = Derived,
     {CKPrime, IKPrime}.
+
+%%====================================================================
+%% X.509 certificate loading (PEM → DER)
+%%====================================================================
+
+-spec load_certificate(string()) -> {ok, binary()} | {error, term()}.
+load_certificate(PemFile) ->
+    case file:read_file(PemFile) of
+        {ok, PemBin} ->
+            case public_key:pem_decode(PemBin) of
+                [{'Certificate', DerCert, not_encrypted} | _] ->
+                    {ok, DerCert};
+                [] ->
+                    {error, no_certificate_in_pem};
+                _ ->
+                    {error, unexpected_pem_entry}
+            end;
+        {error, Reason} ->
+            {error, {read_file, Reason}}
+    end.
+
+-spec load_private_key(string()) -> {ok, term()} | {error, term()}.
+load_private_key(PemFile) ->
+    case file:read_file(PemFile) of
+        {ok, PemBin} ->
+            case public_key:pem_decode(PemBin) of
+                [{KeyType, DerKey, not_encrypted} | _]
+                  when KeyType =:= 'RSAPrivateKey';
+                       KeyType =:= 'ECPrivateKey';
+                       KeyType =:= 'PrivateKeyInfo' ->
+                    Key = public_key:pem_entry_decode({KeyType, DerKey, not_encrypted}),
+                    {ok, Key};
+                [] ->
+                    {error, no_key_in_pem};
+                _ ->
+                    {error, unexpected_pem_entry}
+            end;
+        {error, Reason} ->
+            {error, {read_file, Reason}}
+    end.
+
+%%====================================================================
+%% IKEv2 AUTH signature (RFC 7296 §2.15)
+%%
+%% SignedOctets = RealIKE_SA_INIT_response | NonceI | prf(SK_pr, IDr')
+%% where IDr' is the ID payload body (type + reserved + identity data).
+%%====================================================================
+
+-spec sign_auth_data(atom(), binary(), binary(), binary(), term()) ->
+    {non_neg_integer(), binary()}.
+sign_auth_data(PRF, IkeSaInitResponseBytes, NonceI,
+               #{sk_pr := SK_pr, id_payload := IDrPayload}, PrivateKey) ->
+    MacOverId = prf(PRF, SK_pr, IDrPayload),
+    SignedOctets = <<IkeSaInitResponseBytes/binary, NonceI/binary, MacOverId/binary>>,
+    Signature = do_sign(PrivateKey, SignedOctets),
+    {auth_method(PrivateKey), Signature}.
+
+do_sign(#'RSAPrivateKey'{} = Key, Data) ->
+    public_key:sign(Data, sha256, Key, [{rsa_padding, rsa_pkcs1_pss_padding},
+                                         {rsa_pss_saltlen, 32}]);
+do_sign(#'ECPrivateKey'{parameters = {namedCurve, Curve}} = Key, Data)
+  when Curve =:= ?'secp256r1' ->
+    public_key:sign(Data, sha256, Key);
+do_sign(#'ECPrivateKey'{parameters = {namedCurve, Curve}} = Key, Data)
+  when Curve =:= ?'secp384r1' ->
+    public_key:sign(Data, sha384, Key);
+do_sign(#'ECPrivateKey'{} = Key, Data) ->
+    public_key:sign(Data, sha256, Key).
+
+%% IKEv2 auth method byte per RFC 7296 §3.8
+-spec auth_method(term()) -> non_neg_integer().
+auth_method(#'RSAPrivateKey'{}) -> 1;     %% RSA Digital Signature
+auth_method(#'ECPrivateKey'{parameters = {namedCurve, Curve}})
+  when Curve =:= ?'secp256r1' -> 9;       %% ECDSA with SHA-256 on P-256
+auth_method(#'ECPrivateKey'{parameters = {namedCurve, Curve}})
+  when Curve =:= ?'secp384r1' -> 10;      %% ECDSA with SHA-384 on P-384
+auth_method(#'ECPrivateKey'{}) -> 9;       %% default ECDSA
+auth_method(_) -> 1.
 
 %%====================================================================
 %% Internal

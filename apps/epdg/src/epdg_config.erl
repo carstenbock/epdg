@@ -18,6 +18,10 @@ init() ->
     set_from_env_int("EPDG_IKE_PORT", ike_port, 500),
     set_from_env_int("EPDG_IKE_NATT_PORT", ike_natt_port, 4500),
 
+    %% IKE X.509 certificate (TS 33.402 §7.2.1)
+    set_from_env("EPDG_IKE_CERT_FILE", ike_cert_file, ""),
+    set_from_env("EPDG_IKE_KEY_FILE", ike_key_file, ""),
+
     %% EAP-AKA'
     set_from_env("EPDG_EAP_METHOD", eap_method, "aka-prime"),
 
