@@ -28,8 +28,17 @@
 -define(SWM_APP_ID, 16777264).
 -define(VENDOR_3GPP, 10415).
 
+-define(DNS_RETRY_INITIAL, 5000).
+-define(DNS_RETRY_MAX,    60000).
+
 -record(state, {
-    service_started :: boolean()
+    service_started :: boolean(),
+    transport_added :: boolean(),
+    dns_retries     :: non_neg_integer(),
+    dra_host        :: string() | undefined,
+    dra_port        :: non_neg_integer() | undefined,
+    transport_mod   :: module() | undefined,
+    transport_ref   :: term() | undefined
 }).
 
 %%====================================================================
@@ -91,25 +100,18 @@ init([]) ->
                                     {port, DiamPort}]}
             ]}),
 
-            case resolve_host(DRAHost) of
-                {ok, DRAIP} ->
-                    diameter:add_transport(?SVC_NAME, {connect, [
-                        {transport_module, TransMod},
-                        {transport_config, [{raddr, DRAIP},
-                                            {rport, DRAPort},
-                                            {ip, {0,0,0,0}}]},
-                        {reconnect_timer, 5000}
-                    ]}),
-                    logger:info("SWm Diameter service started, DRA=~s:~p",
-                                [DRAHost, DRAPort]);
-                {error, _} ->
-                    logger:warning("Cannot resolve DRA host ~s, will retry on reconnect",
-                                   [DRAHost])
-            end,
-            {ok, #state{service_started = true}};
+            State0 = #state{service_started = true,
+                            transport_added = false,
+                            dns_retries     = 0,
+                            dra_host        = DRAHost,
+                            dra_port        = DRAPort,
+                            transport_mod   = TransMod},
+            {ok, try_add_dra_transport(State0)};
         {error, Reason} ->
             logger:error("Failed to start SWm Diameter service: ~p", [Reason]),
-            {ok, #state{service_started = false}}
+            {ok, #state{service_started = false,
+                        transport_added = false,
+                        dns_retries     = 0}}
     end.
 
 handle_call({der, IMSI, Opts}, _From, #state{service_started = true} = State) ->
@@ -164,6 +166,20 @@ handle_call(_Req, _From, State) ->
     {reply, {error, unknown}, State}.
 
 handle_cast(_Msg, State) -> {noreply, State}.
+
+handle_info(retry_dra_dns, #state{transport_added = false} = State) ->
+    {noreply, try_add_dra_transport(State)};
+handle_info(retry_dra_dns, State) ->
+    {noreply, State};
+handle_info(re_resolve_dra, #state{transport_added = true,
+                                    transport_ref = OldRef} = State) ->
+    logger:info("SWm: re-resolving DRA hostname after peer down"),
+    catch diameter:remove_transport(?SVC_NAME, OldRef),
+    {noreply, try_add_dra_transport(State#state{transport_added = false,
+                                                 transport_ref = undefined,
+                                                 dns_retries = 0})};
+handle_info(re_resolve_dra, State) ->
+    {noreply, State};
 handle_info(_Info, State) -> {noreply, State}.
 
 terminate(_Reason, #state{service_started = true}) ->
@@ -186,6 +202,7 @@ peer_up(_SvcName, _Peer, State) ->
 peer_down(_SvcName, _Peer, State) ->
     logger:warning("SWm Diameter peer down"),
     epdg_metrics:gauge_set(diameter_swm_peers, 0),
+    erlang:send_after(15000, ?SERVER, re_resolve_dra),
     State.
 
 pick_peer([Peer | _], _, _SvcName, _State) ->
@@ -212,6 +229,43 @@ handle_request(_Pkt, _SvcName, _Peer) ->
 %%====================================================================
 %% Internal
 %%====================================================================
+
+try_add_dra_transport(#state{dra_host = DRAHost, dra_port = DRAPort,
+                             transport_mod = TransMod,
+                             dns_retries = Retries} = State) ->
+    case resolve_host(DRAHost) of
+        {ok, DRAIP} ->
+            case diameter:add_transport(?SVC_NAME, {connect, [
+                {transport_module, TransMod},
+                {transport_config, [{raddr, DRAIP},
+                                    {rport, DRAPort},
+                                    {ip, {0,0,0,0}}]},
+                {reconnect_timer, 5000}
+            ]}) of
+                {ok, Ref} ->
+                    logger:info("SWm client → DRA ~s:~p", [DRAHost, DRAPort]),
+                    State#state{transport_added = true, dns_retries = 0,
+                                transport_ref = Ref};
+                {error, TErr} ->
+                    Delay = retry_delay(Retries),
+                    logger:error("SWm transport to DRA ~s:~p failed: ~p, "
+                                 "retrying in ~Bms",
+                                 [DRAHost, DRAPort, TErr, Delay]),
+                    erlang:send_after(Delay, self(), retry_dra_dns),
+                    State#state{transport_added = false,
+                                dns_retries = Retries + 1}
+            end;
+        {error, _} ->
+            Delay = retry_delay(Retries),
+            logger:warning("Cannot resolve DRA host ~s, retrying in ~Bms "
+                           "(attempt ~B)",
+                           [DRAHost, Delay, Retries + 1]),
+            erlang:send_after(Delay, self(), retry_dra_dns),
+            State#state{dns_retries = Retries + 1}
+    end.
+
+retry_delay(Retries) ->
+    min(?DNS_RETRY_INITIAL bsl min(Retries, 4), ?DNS_RETRY_MAX).
 
 generate_session_id() ->
     TS = erlang:system_time(microsecond),
