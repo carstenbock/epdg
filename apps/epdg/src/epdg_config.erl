@@ -36,7 +36,8 @@ init() ->
     set_from_env_int("EPDG_GTPC_PORT", gtpc_port, 2123),
 
     %% Diameter SWm (toward AAA Server via DRA)
-    set_from_env("DRA_HOST", dra_host, "dra-diameter"),
+    %% DRA_HOSTS takes precedence (comma-separated); falls back to DRA_HOST
+    set_dra_hosts(),
     set_from_env_int("DRA_PORT", dra_port, 3868),
     set_from_env("DRA_TRANSPORT", dra_transport, "tcp"),
     set_from_env_int("EPDG_DIAMETER_PORT", diameter_port, 3868),
@@ -87,6 +88,20 @@ set_from_env_int(EnvVar, AppKey, Default) ->
         Val -> list_to_integer(Val)
     end,
     application:set_env(?APP, AppKey, Value).
+
+set_dra_hosts() ->
+    Hosts = case os:getenv("DRA_HOSTS") of
+        false ->
+            Single = case os:getenv("DRA_HOST") of
+                false -> "dra-diameter";
+                V     -> V
+            end,
+            [Single];
+        Csv ->
+            [string:trim(H) || H <- string:split(Csv, ",", all),
+                                string:trim(H) =/= ""]
+    end,
+    application:set_env(?APP, dra_hosts, Hosts).
 
 hostname_default() ->
     case os:getenv("HOSTNAME") of

@@ -2,7 +2,7 @@
 %%% @doc Diameter SWm client (ePDG → 3GPP AAA Server).
 %%% Application-ID 16777264 (TS 29.273).
 %%% Sends DER/DEA for EAP relay, AAR/AAA for authorization.
-%%% Connects to AAA Server via DRA.
+%%% Connects to AAA Server via all configured DRA replicas.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(epdg_diameter_swm).
@@ -33,12 +33,10 @@
 
 -record(state, {
     service_started :: boolean(),
-    transport_added :: boolean(),
-    dns_retries     :: non_neg_integer(),
-    dra_host        :: string() | undefined,
     dra_port        :: non_neg_integer() | undefined,
     transport_mod   :: module() | undefined,
-    transport_ref   :: term() | undefined
+    %% Per-host transport state: #{Host => {Ref | undefined, Retries}}
+    transports      :: #{string() => {term() | undefined, non_neg_integer()}}
 }).
 
 %%====================================================================
@@ -71,7 +69,7 @@ init([]) ->
     OriginHost  = epdg_config:get(origin_host, "epdg.localdomain"),
     OriginRealm = epdg_config:get(origin_realm, "localdomain"),
     DiamPort    = epdg_config:get(diameter_port, 3868),
-    DRAHost     = epdg_config:get(dra_host, "dra-diameter"),
+    DRAHosts    = epdg_config:get(dra_hosts, ["dra-diameter"]),
     DRAPort     = epdg_config:get(dra_port, 3868),
     Transport   = epdg_config:get(dra_transport, "tcp"),
 
@@ -100,26 +98,26 @@ init([]) ->
                                     {port, DiamPort}]}
             ]}),
 
+            InitTransports = maps:from_list(
+                [{H, {undefined, 0}} || H <- DRAHosts]),
             State0 = #state{service_started = true,
-                            transport_added = false,
-                            dns_retries     = 0,
-                            dra_host        = DRAHost,
                             dra_port        = DRAPort,
-                            transport_mod   = TransMod},
-            {ok, try_add_dra_transport(State0)};
+                            transport_mod   = TransMod,
+                            transports      = InitTransports},
+            logger:info("SWm client: connecting to ~B DRA host(s): ~p",
+                        [length(DRAHosts), DRAHosts]),
+            {ok, connect_all(State0)};
         {error, Reason} ->
             logger:error("Failed to start SWm Diameter service: ~p", [Reason]),
             {ok, #state{service_started = false,
-                        transport_added = false,
-                        dns_retries     = 0}}
+                        transports      = #{}}}
     end.
 
 handle_call({der, IMSI, Opts}, _From, #state{service_started = true} = State) ->
     EAPPayload = maps:get(eap_payload, Opts, <<>>),
     SessionId  = generate_session_id(),
 
-    %% Build DER message using base dictionary (simplified)
-    Msg = ['ASR',  %% placeholder — real impl uses compiled SWm dictionary
+    Msg = ['ASR',
            {'Session-Id', SessionId},
            {'User-Name', IMSI},
            {'Auth-Request-Type', 3}],
@@ -167,19 +165,18 @@ handle_call(_Req, _From, State) ->
 
 handle_cast(_Msg, State) -> {noreply, State}.
 
-handle_info(retry_dra_dns, #state{transport_added = false} = State) ->
-    {noreply, try_add_dra_transport(State)};
-handle_info(retry_dra_dns, State) ->
-    {noreply, State};
-handle_info(re_resolve_dra, #state{transport_added = true,
-                                    transport_ref = OldRef} = State) ->
-    logger:info("SWm: re-resolving DRA hostname after peer down"),
-    catch diameter:remove_transport(?SVC_NAME, OldRef),
-    {noreply, try_add_dra_transport(State#state{transport_added = false,
-                                                 transport_ref = undefined,
-                                                 dns_retries = 0})};
-handle_info(re_resolve_dra, State) ->
-    {noreply, State};
+handle_info({retry_dra_dns, Host}, State) ->
+    {noreply, try_connect_host(Host, State)};
+handle_info({re_resolve_dra, Host}, #state{transports = Ts} = State) ->
+    case maps:find(Host, Ts) of
+        {ok, {OldRef, _}} when OldRef =/= undefined ->
+            logger:info("SWm: re-resolving DRA ~s after peer down", [Host]),
+            catch diameter:remove_transport(?SVC_NAME, OldRef),
+            NewTs = Ts#{Host => {undefined, 0}},
+            {noreply, try_connect_host(Host, State#state{transports = NewTs})};
+        _ ->
+            {noreply, try_connect_host(Host, State)}
+    end;
 handle_info(_Info, State) -> {noreply, State}.
 
 terminate(_Reason, #state{service_started = true}) ->
@@ -196,13 +193,14 @@ code_change(_OldVsn, State, _Extra) -> {ok, State}.
 
 peer_up(_SvcName, _Peer, State) ->
     logger:info("SWm Diameter peer up"),
-    epdg_metrics:gauge_set(diameter_swm_peers, 1),
+    epdg_metrics:gauge_inc(diameter_swm_peers),
     State.
 
-peer_down(_SvcName, _Peer, State) ->
+peer_down(_SvcName, {PeerRef, _Caps}, State) ->
     logger:warning("SWm Diameter peer down"),
-    epdg_metrics:gauge_set(diameter_swm_peers, 0),
-    erlang:send_after(15000, ?SERVER, re_resolve_dra),
+    epdg_metrics:gauge_dec(diameter_swm_peers),
+    Host = host_for_ref(PeerRef),
+    erlang:send_after(15000, ?SERVER, {re_resolve_dra, Host}),
     State.
 
 pick_peer([Peer | _], _, _SvcName, _State) ->
@@ -230,10 +228,14 @@ handle_request(_Pkt, _SvcName, _Peer) ->
 %% Internal
 %%====================================================================
 
-try_add_dra_transport(#state{dra_host = DRAHost, dra_port = DRAPort,
-                             transport_mod = TransMod,
-                             dns_retries = Retries} = State) ->
-    case resolve_host(DRAHost) of
+connect_all(State) ->
+    Hosts = maps:keys(State#state.transports),
+    lists:foldl(fun(H, S) -> try_connect_host(H, S) end, State, Hosts).
+
+try_connect_host(Host, #state{dra_port = DRAPort, transport_mod = TransMod,
+                               transports = Ts} = State) ->
+    {_OldRef, Retries} = maps:get(Host, Ts, {undefined, 0}),
+    case resolve_host(Host) of
         {ok, DRAIP} ->
             case diameter:add_transport(?SVC_NAME, {connect, [
                 {transport_module, TransMod},
@@ -243,25 +245,30 @@ try_add_dra_transport(#state{dra_host = DRAHost, dra_port = DRAPort,
                 {reconnect_timer, 5000}
             ]}) of
                 {ok, Ref} ->
-                    logger:info("SWm client → DRA ~s:~p", [DRAHost, DRAPort]),
-                    State#state{transport_added = true, dns_retries = 0,
-                                transport_ref = Ref};
+                    logger:info("SWm client -> DRA ~s:~p", [Host, DRAPort]),
+                    put({dra_ref, Ref}, Host),
+                    State#state{transports = Ts#{Host => {Ref, 0}}};
                 {error, TErr} ->
                     Delay = retry_delay(Retries),
                     logger:error("SWm transport to DRA ~s:~p failed: ~p, "
                                  "retrying in ~Bms",
-                                 [DRAHost, DRAPort, TErr, Delay]),
-                    erlang:send_after(Delay, self(), retry_dra_dns),
-                    State#state{transport_added = false,
-                                dns_retries = Retries + 1}
+                                 [Host, DRAPort, TErr, Delay]),
+                    erlang:send_after(Delay, self(), {retry_dra_dns, Host}),
+                    State#state{transports = Ts#{Host => {undefined, Retries + 1}}}
             end;
         {error, _} ->
             Delay = retry_delay(Retries),
             logger:warning("Cannot resolve DRA host ~s, retrying in ~Bms "
                            "(attempt ~B)",
-                           [DRAHost, Delay, Retries + 1]),
-            erlang:send_after(Delay, self(), retry_dra_dns),
-            State#state{dns_retries = Retries + 1}
+                           [Host, Delay, Retries + 1]),
+            erlang:send_after(Delay, self(), {retry_dra_dns, Host}),
+            State#state{transports = Ts#{Host => {undefined, Retries + 1}}}
+    end.
+
+host_for_ref(PeerRef) ->
+    case get({dra_ref, PeerRef}) of
+        undefined -> "unknown";
+        Host      -> Host
     end.
 
 retry_delay(Retries) ->
