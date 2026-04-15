@@ -17,7 +17,9 @@ init(Req, #{action := ready} = State) ->
     Peers = epdg_metrics:get(diameter_swm_peers),
     {Code, Body} = case Peers > 0 of
         true  -> {200, <<"ready">>};
-        false -> {503, <<"not ready: no diameter peers">>}
+        false ->
+            logger:warning("Readiness check failed: no SWm Diameter peers connected"),
+            {503, <<"not ready: no diameter peers">>}
     end,
     Reply = cowboy_req:reply(Code,
         #{<<"content-type">> => <<"text/plain">>},
