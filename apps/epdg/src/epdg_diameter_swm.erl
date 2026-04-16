@@ -30,6 +30,7 @@
 
 -define(DNS_RETRY_INITIAL, 5000).
 -define(DNS_RETRY_MAX,    60000).
+-define(HEALTH_CHECK_INTERVAL, 30000).
 
 -record(state, {
     service_started :: boolean(),
@@ -104,8 +105,9 @@ init([]) ->
                             dra_port        = DRAPort,
                             transport_mod   = TransMod,
                             transports      = InitTransports},
-            logger:info("SWm client: connecting to ~B DRA host(s): ~p",
-                        [length(DRAHosts), DRAHosts]),
+            logger:notice("SWm client: connecting to ~B DRA host(s): ~p",
+                          [length(DRAHosts), DRAHosts]),
+            erlang:send_after(?HEALTH_CHECK_INTERVAL, self(), health_check),
             {ok, connect_all(State0)};
         {error, Reason} ->
             logger:error("Failed to start SWm Diameter service: ~p", [Reason]),
@@ -180,13 +182,30 @@ handle_info({diameter_peer_down, PeerRef}, #state{transports = Ts} = State) ->
 handle_info({re_resolve_dra, Host}, #state{transports = Ts} = State) ->
     case maps:find(Host, Ts) of
         {ok, {OldRef, _}} when OldRef =/= undefined ->
-            logger:info("SWm: re-resolving DRA ~s after peer down", [Host]),
+            logger:notice("SWm: re-resolving DRA ~s after peer down", [Host]),
             catch diameter:remove_transport(?SVC_NAME, OldRef),
             NewTs = Ts#{Host => {undefined, 0}},
             {noreply, try_connect_host(Host, State#state{transports = NewTs})};
         _ ->
             {noreply, try_connect_host(Host, State)}
     end;
+handle_info({force_reconnect, Host}, #state{transports = Ts} = State) ->
+    case maps:find(Host, Ts) of
+        {ok, {OldRef, _}} when OldRef =/= undefined ->
+            logger:warning("SWm: forcing reconnect to DRA ~s (stale IP detected)", [Host]),
+            catch diameter:remove_transport(?SVC_NAME, OldRef),
+            NewTs = Ts#{Host => {undefined, 0}},
+            {noreply, try_connect_host(Host, State#state{transports = NewTs})};
+        _ ->
+            {noreply, try_connect_host(Host, State)}
+    end;
+handle_info(health_check, #state{service_started = true} = State) ->
+    check_transport_health(State),
+    erlang:send_after(?HEALTH_CHECK_INTERVAL, self(), health_check),
+    {noreply, State};
+handle_info(health_check, State) ->
+    erlang:send_after(?HEALTH_CHECK_INTERVAL, self(), health_check),
+    {noreply, State};
 handle_info(_Info, State) -> {noreply, State}.
 
 terminate(_Reason, #state{service_started = true}) ->
@@ -201,13 +220,21 @@ code_change(_OldVsn, State, _Extra) -> {ok, State}.
 %% Diameter callbacks
 %%====================================================================
 
-peer_up(_SvcName, _Peer, State) ->
-    logger:info("SWm Diameter peer up"),
+peer_up(_SvcName, {_PeerRef, Caps}, State) ->
+    RemoteHost = case Caps of
+        #diameter_caps{origin_host = {_, RH}} -> RH;
+        _ -> <<"unknown">>
+    end,
+    logger:notice("SWm peer up: ~s (DRA reachable)", [RemoteHost]),
     epdg_metrics:gauge_inc(diameter_swm_peers),
     State.
 
-peer_down(_SvcName, {PeerRef, _Caps}, State) ->
-    logger:warning("SWm Diameter peer down"),
+peer_down(_SvcName, {PeerRef, Caps}, State) ->
+    RemoteHost = case Caps of
+        #diameter_caps{origin_host = {_, RH}} -> RH;
+        _ -> <<"unknown">>
+    end,
+    logger:notice("SWm peer down: ~s", [RemoteHost]),
     epdg_metrics:gauge_dec(diameter_swm_peers),
     ?SERVER ! {diameter_peer_down, PeerRef},
     State.
@@ -237,6 +264,80 @@ handle_request(_Pkt, _SvcName, _Peer) ->
 %% Internal
 %%====================================================================
 
+check_transport_health(#state{transports = Ts}) ->
+    TInfos = diameter:service_info(?SVC_NAME, transport),
+    lists:foreach(fun(Info) when is_list(Info) ->
+        check_single_transport(Info, Ts);
+    (_) -> ok
+    end, TInfos).
+
+check_single_transport(Info, Transports) ->
+    Type = proplists:get_value(type, Info),
+    case Type of
+        connect -> check_connect_transport(Info, Transports);
+        _ -> ok
+    end.
+
+check_connect_transport(Info, Transports) ->
+    Ref = proplists:get_value(ref, Info),
+    Options = proplists:get_value(options, Info, []),
+    TransConfig = proplists:get_value(transport_config, Options, []),
+    RAddr = proplists:get_value(raddr, TransConfig),
+    WatchdogState = case proplists:get_value(watchdog, Info) of
+        {_, _, S} -> S;
+        _ -> unknown
+    end,
+    case WatchdogState of
+        okay -> ok;
+        _ ->
+            check_cer_result(Info, Ref),
+            check_stale_ip(RAddr, Ref, Transports)
+    end.
+
+check_cer_result(Info, Ref) ->
+    case proplists:get_value(peer, Info) of
+        {_, _} -> ok;
+        undefined ->
+            case proplists:get_value(watchdog, Info) of
+                {_, _, initial} ->
+                    logger:warning("SWm transport ~p: stuck in initial state "
+                                   "(no CER exchanged yet)", [Ref]);
+                _ -> ok
+            end
+    end,
+    case proplists:get_value(close, Info) of
+        {ResultCode, _, _} when ResultCode =:= 4003 ->
+            logger:warning("SWm transport ~p: CER rejected with Result-Code "
+                           "4003 (DIAMETER_ELECTION_LOST) -- check "
+                           "Origin-Host uniqueness", [Ref]);
+        {ResultCode, _, _} when ResultCode =/= 2001 ->
+            logger:warning("SWm transport ~p: CER rejected with "
+                           "Result-Code ~B", [Ref, ResultCode]);
+        _ -> ok
+    end.
+
+check_stale_ip(undefined, _Ref, _Transports) -> ok;
+check_stale_ip(RAddr, Ref, Transports) ->
+    Host = host_for_ref(Ref, Transports),
+    case Host of
+        undefined -> ok;
+        _ ->
+            case resolve_host(Host) of
+                {ok, CurrentIP} when CurrentIP =/= RAddr ->
+                    logger:warning("SWm transport ~p: stale IP ~p for host ~s "
+                                   "(current DNS: ~p), forcing reconnect",
+                                   [Ref, RAddr, Host, CurrentIP]),
+                    self() ! {force_reconnect, Host};
+                _ -> ok
+            end
+    end.
+
+host_for_ref(Ref, Transports) ->
+    case [H || {H, {R, _}} <- maps:to_list(Transports), R =:= Ref] of
+        [Host | _] -> Host;
+        [] -> undefined
+    end.
+
 connect_all(State) ->
     Hosts = maps:keys(State#state.transports),
     lists:foldl(fun(H, S) -> try_connect_host(H, S) end, State, Hosts).
@@ -254,7 +355,7 @@ try_connect_host(Host, #state{dra_port = DRAPort, transport_mod = TransMod,
                 {reconnect_timer, 5000}
             ]}) of
                 {ok, Ref} ->
-                    logger:info("SWm client -> DRA ~s:~p", [Host, DRAPort]),
+                    logger:notice("SWm transport added -> DRA ~s:~B", [Host, DRAPort]),
                     State#state{transports = Ts#{Host => {Ref, 0}}};
                 {error, TErr} ->
                     Delay = retry_delay(Retries),
