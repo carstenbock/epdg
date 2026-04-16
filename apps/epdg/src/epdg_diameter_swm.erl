@@ -167,6 +167,16 @@ handle_cast(_Msg, State) -> {noreply, State}.
 
 handle_info({retry_dra_dns, Host}, State) ->
     {noreply, try_connect_host(Host, State)};
+handle_info({diameter_peer_down, PeerRef}, #state{transports = Ts} = State) ->
+    Host = host_for_peer_ref(PeerRef, Ts),
+    case Host of
+        "unknown" ->
+            logger:warning("SWm peer down: could not map PeerRef to host"),
+            {noreply, State};
+        _ ->
+            erlang:send_after(15000, self(), {re_resolve_dra, Host}),
+            {noreply, State}
+    end;
 handle_info({re_resolve_dra, Host}, #state{transports = Ts} = State) ->
     case maps:find(Host, Ts) of
         {ok, {OldRef, _}} when OldRef =/= undefined ->
@@ -199,8 +209,7 @@ peer_up(_SvcName, _Peer, State) ->
 peer_down(_SvcName, {PeerRef, _Caps}, State) ->
     logger:warning("SWm Diameter peer down"),
     epdg_metrics:gauge_dec(diameter_swm_peers),
-    Host = host_for_ref(PeerRef),
-    erlang:send_after(15000, ?SERVER, {re_resolve_dra, Host}),
+    ?SERVER ! {diameter_peer_down, PeerRef},
     State.
 
 pick_peer([Peer | _], _, _SvcName, _State) ->
@@ -246,7 +255,6 @@ try_connect_host(Host, #state{dra_port = DRAPort, transport_mod = TransMod,
             ]}) of
                 {ok, Ref} ->
                     logger:info("SWm client -> DRA ~s:~p", [Host, DRAPort]),
-                    put({dra_ref, Ref}, Host),
                     State#state{transports = Ts#{Host => {Ref, 0}}};
                 {error, TErr} ->
                     Delay = retry_delay(Retries),
@@ -265,10 +273,44 @@ try_connect_host(Host, #state{dra_port = DRAPort, transport_mod = TransMod,
             State#state{transports = Ts#{Host => {undefined, Retries + 1}}}
     end.
 
-host_for_ref(PeerRef) ->
-    case get({dra_ref, PeerRef}) of
-        undefined -> "unknown";
-        Host      -> Host
+%% Map a Diameter PeerRef (from peer_down callback) to the configured
+%% DRA hostname via diameter:service_info transport introspection.
+host_for_peer_ref(PeerRef, Transports) ->
+    TInfos = diameter:service_info(?SVC_NAME, transport),
+    case find_transport_ref(TInfos, PeerRef) of
+        {ok, TransRef} ->
+            case [H || {H, {R, _}} <- maps:to_list(Transports),
+                       R =:= TransRef] of
+                [Host | _] -> Host;
+                [] -> "unknown"
+            end;
+        error -> "unknown"
+    end.
+
+find_transport_ref(TInfos, PeerRef) ->
+    Matches = [proplists:get_value(ref, Info)
+               || Info <- TInfos,
+                  is_list(Info),
+                  match_peer_ref(Info, PeerRef)],
+    case Matches of
+        [Ref | _] -> {ok, Ref};
+        [] -> error
+    end.
+
+match_peer_ref(Info, PeerRef) ->
+    case proplists:get_value(peer, Info) of
+        {_, PRef} when PRef =:= PeerRef -> true;
+        _ ->
+            case proplists:get_value(accept, Info) of
+                Accept when is_list(Accept) ->
+                    lists:any(fun(A) ->
+                        case proplists:get_value(peer, A) of
+                            {_, PR} when PR =:= PeerRef -> true;
+                            _ -> false
+                        end
+                    end, Accept);
+                _ -> false
+            end
     end.
 
 retry_delay(Retries) ->
