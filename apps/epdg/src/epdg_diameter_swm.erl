@@ -1,8 +1,25 @@
 %%%-------------------------------------------------------------------
-%%% @doc Diameter SWm client (ePDG → 3GPP AAA Server).
-%%% Application-ID 16777264 (TS 29.273).
-%%% Sends DER/DEA for EAP relay, AAR/AAA for authorization.
-%%% Connects to AAA Server via all configured DRA replicas.
+%%% @doc Diameter SWm client (ePDG → 3GPP AAA Server via DRA).
+%%%
+%%% Application-ID 16777264 (TS 29.273 clause 7). This module owns a
+%%% single Diameter service (`epdg_diameter_svc') advertising SWm, and
+%%% maintains one connect-transport per configured DRA replica. It
+%%% exposes three synchronous APIs that the per-UE FSM calls:
+%%%
+%%%   new_session_id/0              — allocate a fresh Session-Id
+%%%   diameter_eap_request/1        — DER (code 268) relaying an EAP
+%%%                                    packet between UE and AAA
+%%%   aa_request/1                  — AAR (code 265) post-EAP
+%%%                                    authorization (not wired to
+%%%                                    FSM yet; reserved for CP phase)
+%%%   session_termination_request/1 — STR (code 275) on tunnel teardown
+%%%
+%%% The wire format uses the generated `diameter_gen_swm' dictionary
+%%% (compiled from priv/dict/swm.dia by scripts/compile-diameter-dicts.sh),
+%%% so all 3GPP AVPs (EAP-Payload, EAP-Master-Session-Key, RAT-Type,
+%%% Visited-Network-Identifier, Service-Selection, Non-3GPP-User-Data,
+%%% APN-Configuration, MIP6-Feature-Vector, 3GPP-AAA-Server-Name, …)
+%%% encode and decode correctly against the AAA server.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(epdg_diameter_swm).
@@ -10,11 +27,13 @@
 -behaviour(gen_server).
 
 -include_lib("diameter/include/diameter.hrl").
+-include_lib("diameter/include/diameter_gen_base_rfc6733.hrl").
 
 -export([start_link/0,
-         diameter_eap_request/2,
-         aa_request/2,
-         session_termination_request/2]).
+         new_session_id/0,
+         diameter_eap_request/1,
+         aa_request/1,
+         session_termination_request/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
@@ -25,8 +44,10 @@
 
 -define(SERVER, ?MODULE).
 -define(SVC_NAME, epdg_diameter_svc).
+-define(APP_ALIAS, swm).
 -define(SWM_APP_ID, 16777264).
 -define(VENDOR_3GPP, 10415).
+-define(DIAM_CALL_TIMEOUT, 10000).
 
 -define(DNS_RETRY_INITIAL, 5000).
 -define(DNS_RETRY_MAX,    60000).
@@ -47,20 +68,52 @@
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
-%% @doc Send Diameter-EAP-Request (DER) — relay EAP payload to AAA Server.
--spec diameter_eap_request(binary(), map()) -> {ok, map()} | {error, term()}.
-diameter_eap_request(IMSI, Opts) ->
-    gen_server:call(?SERVER, {der, IMSI, Opts}, 15000).
+%% @doc Allocate a stable Diameter Session-Id for a single EAP-AKA'
+%% conversation (one UE, one ePDG attach). RFC 6733 §8.8 format.
+-spec new_session_id() -> binary().
+new_session_id() ->
+    OriginHost = to_list(epdg_config:get(origin_host, "epdg.localdomain")),
+    <<High:32, Low:32>> = crypto:strong_rand_bytes(8),
+    Now = erlang:system_time(second),
+    list_to_binary(
+      io_lib:format("~s;~B;~B;~8.16.0B~8.16.0B",
+                    [OriginHost, Now, erlang:unique_integer([positive]),
+                     High, Low])).
 
-%% @doc Send AA-Request (AAR) — authorize session after successful EAP.
--spec aa_request(binary(), map()) -> {ok, map()} | {error, term()}.
-aa_request(IMSI, Opts) ->
-    gen_server:call(?SERVER, {aar, IMSI, Opts}, 15000).
+%% @doc Send a Diameter-EAP-Request (DER, command 268) relaying an EAP
+%% packet from the UE to the AAA server. Opts must include:
+%%   session_id    :: binary()        — stable per-UE, allocated once
+%%   user_name     :: binary()        — NAI the UE sent (IDi)
+%%   eap_payload   :: binary()        — raw RFC 3748 EAP packet bytes
+%% Opts may include:
+%%   apn                :: binary()   — Service-Selection, default "ims"
+%%   rat_type           :: integer()  — default WLAN (0)
+%%   visited_plmn       :: binary()   — Visited-Network-Identifier
+%%   auth_request_type  :: integer()  — default 3 (AUTHORIZE_AUTHENTICATE)
+%%   destination_realm  :: binary()   — override Destination-Realm
+%%
+%% Returns on success a map:
+%%   result_code    :: integer()      — 2001 | 1001 | 4xxx | 5xxx
+%%   eap_payload    :: binary()       — next EAP packet for the UE
+%%   msk            :: binary()       — on 2001 only
+%%   session_timeout:: integer()      — when present
+%%   non_3gpp_user_data :: term() | undefined
+%%   apn_configurations :: [term()]
+-spec diameter_eap_request(map()) -> {ok, map()} | {error, term()}.
+diameter_eap_request(Opts) when is_map(Opts) ->
+    gen_server:call(?SERVER, {der, Opts}, ?DIAM_CALL_TIMEOUT + 1000).
 
-%% @doc Send Session-Termination-Request (STR).
--spec session_termination_request(binary(), map()) -> {ok, map()} | {error, term()}.
-session_termination_request(SessionId, Opts) ->
-    gen_server:call(?SERVER, {str, SessionId, Opts}, 15000).
+%% @doc Send an AA-Request (AAR, command 265) to authorize the session
+%% after successful EAP authentication. Not used by the FSM in this
+%% revision; reserved for the CP/child-SA phase.
+-spec aa_request(map()) -> {ok, map()} | {error, term()}.
+aa_request(Opts) when is_map(Opts) ->
+    gen_server:call(?SERVER, {aar, Opts}, ?DIAM_CALL_TIMEOUT + 1000).
+
+%% @doc Send a Session-Termination-Request (STR, command 275).
+-spec session_termination_request(map()) -> {ok, map()} | {error, term()}.
+session_termination_request(Opts) when is_map(Opts) ->
+    gen_server:call(?SERVER, {str, Opts}, ?DIAM_CALL_TIMEOUT + 1000).
 
 %%====================================================================
 %% gen_server callbacks
@@ -75,18 +128,36 @@ init([]) ->
     Transport   = epdg_config:get(dra_transport, "tcp"),
 
     diameter:start(),
+    %% Make sure the generated codec module is loaded before the
+    %% service references it as `dictionary'.
+    _ = code:ensure_loaded(diameter_gen_swm),
 
+    OriginStateId = erlang:system_time(second),
     SvcOpts = [
-        {'Origin-Host',  list_to_binary(OriginHost)},
-        {'Origin-Realm', list_to_binary(OriginRealm)},
+        {'Origin-Host',  to_bin(OriginHost)},
+        {'Origin-Realm', to_bin(OriginRealm)},
         {'Vendor-Id', ?VENDOR_3GPP},
         {'Product-Name', "volte.io ePDG"},
+        {'Origin-State-Id', OriginStateId},
+        {'Firmware-Revision', 1},
         {'Auth-Application-Id', [?SWM_APP_ID]},
         {'Supported-Vendor-Id', [?VENDOR_3GPP]},
+        {'Vendor-Specific-Application-Id',
+           [#'diameter_base_Vendor-Specific-Application-Id'{
+              'Vendor-Id' = ?VENDOR_3GPP,
+              'Auth-Application-Id' = [?SWM_APP_ID]}]},
         {string_decode, false},
-        {application, [{alias, swm},
-                       {dictionary, diameter_dict_swm},
-                       {module, ?MODULE}]}
+        %% parse_swm_dea/1 pattern-matches the list form
+        %% `['DEA' | AVPs]' returned by OTP when `decode_format=list'.
+        %% The default is `record', which would deliver a
+        %% `#diameter_swm_DEA{}' tuple and make our parser default
+        %% Result-Code to 0.
+        {decode_format, list},
+        {application, [{alias, ?APP_ALIAS},
+                       {dictionary, diameter_gen_swm},
+                       {module, ?MODULE},
+                       {answer_errors, callback},
+                       {request_errors, answer_3xxx}]}
     ],
 
     case diameter:start_service(?SVC_NAME, SvcOpts) of
@@ -115,48 +186,18 @@ init([]) ->
                         transports      = #{}}}
     end.
 
-handle_call({der, IMSI, Opts}, _From, #state{service_started = true} = State) ->
-    EAPPayload = maps:get(eap_payload, Opts, <<>>),
-    SessionId  = generate_session_id(),
-
-    Msg = ['ASR',
-           {'Session-Id', SessionId},
-           {'User-Name', IMSI},
-           {'Auth-Request-Type', 3}],
-
-    Result = case diameter:call(?SVC_NAME, swm, Msg, []) of
-        {ok, Answer} ->
-            {ok, #{session_id => SessionId,
-                   eap_payload => EAPPayload,
-                   answer => Answer}};
-        {error, R} ->
-            {error, R}
-    end,
+handle_call({der, Opts}, _From, #state{service_started = true} = State) ->
+    Result = send_der(Opts),
     epdg_metrics:inc(diameter_swm_requests_total),
     {reply, Result, State};
 
-handle_call({aar, IMSI, Opts}, _From, #state{service_started = true} = State) ->
-    APN = maps:get(apn, Opts, <<"ims">>),
-    SessionId = generate_session_id(),
-    Msg = ['ASR',
-           {'Session-Id', SessionId},
-           {'User-Name', IMSI},
-           {'Auth-Request-Type', 1}],
-    Result = case diameter:call(?SVC_NAME, swm, Msg, []) of
-        {ok, Answer} -> {ok, #{session_id => SessionId, apn => APN, answer => Answer}};
-        {error, R}   -> {error, R}
-    end,
+handle_call({aar, Opts}, _From, #state{service_started = true} = State) ->
+    Result = send_aar(Opts),
     epdg_metrics:inc(diameter_swm_requests_total),
     {reply, Result, State};
 
-handle_call({str, SessionId, _Opts}, _From, #state{service_started = true} = State) ->
-    Msg = ['STR',
-           {'Session-Id', SessionId},
-           {'Termination-Cause', 1}],
-    Result = case diameter:call(?SVC_NAME, swm, Msg, []) of
-        {ok, Answer} -> {ok, #{answer => Answer}};
-        {error, R}   -> {error, R}
-    end,
+handle_call({str, Opts}, _From, #state{service_started = true} = State) ->
+    Result = send_str(Opts),
     {reply, Result, State};
 
 handle_call(_, _From, #state{service_started = false} = State) ->
@@ -217,6 +258,220 @@ terminate(_Reason, _State) ->
 code_change(_OldVsn, State, _Extra) -> {ok, State}.
 
 %%====================================================================
+%% Message builders (list form, OTP diameter encodes via diameter_gen_swm)
+%%====================================================================
+
+send_der(#{session_id := SessionId, eap_payload := EAPPayload} = Opts) ->
+    UserName = maps:get(user_name, Opts, undefined),
+    APN      = to_bin(maps:get(apn, Opts, epdg_config:get(default_apn, "ims"))),
+    RATType  = maps:get(rat_type, Opts, epdg_config:get(swm_rat_type, 0)),
+    AuthReqT = maps:get(auth_request_type, Opts, 3),   % AUTHORIZE_AUTHENTICATE
+    DestRealm = to_bin(maps:get(destination_realm, Opts,
+                                epdg_config:get(swm_dest_realm,
+                                    epdg_config:get(origin_realm, "localdomain")))),
+    DestHost  = maps:get(destination_host, Opts, undefined),
+    Base = ['DER',
+            {'Session-Id', SessionId},
+            {'Auth-Application-Id', ?SWM_APP_ID},
+            {'Auth-Request-Type', AuthReqT},
+            {'Destination-Realm', DestRealm},
+            {'EAP-Payload', EAPPayload},
+            {'Service-Selection', APN},
+            {'RAT-Type', RATType}],
+    Msg0 = maybe_add(Base, 'User-Name', UserName),
+    Msg1 = maybe_add(Msg0, 'Visited-Network-Identifier',
+                      maps:get(visited_plmn, Opts, undefined)),
+    %% RFC 6733 §6.8 / 3GPP TS 29.273: pin follow-up DERs of a session to
+    %% the AAA that anchored the first DEA. The DRA honours Destination-Host
+    %% over load-balancing realm-based routing.
+    Msg  = maybe_add(Msg1, 'Destination-Host', DestHost),
+    % #region agent log
+    write_log(<<"epdg_diameter_swm:send_der">>, <<"A1">>,
+              #{session_id => SessionId,
+                user_name  => UserName,
+                eap_len    => byte_size(EAPPayload),
+                apn        => APN,
+                rat_type   => RATType,
+                auth_req_t => AuthReqT,
+                dest_realm => DestRealm,
+                dest_host  => DestHost,
+                msg_shape  => [element(1, as_tuple(K)) ||
+                                {_, _} = K <- tl(Msg)] ++ ['DER']}),
+    % #endregion
+    do_call(Msg, fun parse_dea/1);
+
+send_der(_Opts) ->
+    {error, {missing, [session_id, eap_payload]}}.
+
+send_aar(#{session_id := SessionId,
+           user_name  := UserName} = Opts) ->
+    APN      = to_bin(maps:get(apn, Opts, epdg_config:get(default_apn, "ims"))),
+    RATType  = maps:get(rat_type, Opts, epdg_config:get(swm_rat_type, 0)),
+    AuthReqT = maps:get(auth_request_type, Opts, 1),   % AUTHORIZE_ONLY
+    DestRealm = to_bin(maps:get(destination_realm, Opts,
+                                epdg_config:get(swm_dest_realm,
+                                    epdg_config:get(origin_realm, "localdomain")))),
+    DestHost  = maps:get(destination_host, Opts, undefined),
+    Base = ['AAR',
+            {'Session-Id', SessionId},
+            {'Auth-Application-Id', ?SWM_APP_ID},
+            {'Auth-Request-Type', AuthReqT},
+            {'Destination-Realm', DestRealm},
+            {'User-Name', UserName},
+            {'Service-Selection', APN},
+            {'RAT-Type', RATType}],
+    Msg = maybe_add(Base, 'Destination-Host', DestHost),
+    do_call(Msg, fun parse_aaa/1);
+
+send_aar(_Opts) ->
+    {error, {missing, [session_id, user_name]}}.
+
+send_str(#{session_id := SessionId} = Opts) ->
+    UserName  = maps:get(user_name, Opts, undefined),
+    Cause     = maps:get(termination_cause, Opts, 1),  % LOGOUT
+    DestRealm = to_bin(maps:get(destination_realm, Opts,
+                                epdg_config:get(swm_dest_realm,
+                                    epdg_config:get(origin_realm, "localdomain")))),
+    DestHost  = maps:get(destination_host, Opts, undefined),
+    Base = ['STR',
+            {'Session-Id', SessionId},
+            {'Destination-Realm', DestRealm},
+            {'Auth-Application-Id', ?SWM_APP_ID},
+            {'Termination-Cause', Cause}],
+    Msg0 = maybe_add(Base, 'User-Name', UserName),
+    Msg  = maybe_add(Msg0, 'Destination-Host', DestHost),
+    do_call(Msg, fun parse_sta/1);
+
+send_str(_Opts) ->
+    {error, missing_session_id}.
+
+do_call(Msg, ParseFun) ->
+    %% #region agent log
+    logger:notice("SWm do_call: sending ~p", [msg_head(Msg)]),
+    %% #endregion
+    T0 = erlang:monotonic_time(millisecond),
+    Ret = diameter:call(?SVC_NAME, ?APP_ALIAS, Msg, [{timeout, ?DIAM_CALL_TIMEOUT}]),
+    T1 = erlang:monotonic_time(millisecond),
+    %% #region agent log
+    logger:notice("SWm do_call: returned after ~Bms: ~P",
+                  [T1 - T0, Ret, 12]),
+    %% #endregion
+    case Ret of
+        {ok, Answer} ->
+            %% #region agent log
+            logger:notice("SWm do_call: ok answer shape=~p head=~p sample=~P",
+                          [classify_answer(Answer),
+                           answer_head(Answer),
+                           Answer, 10]),
+            %% #endregion
+            {ok, ParseFun(Answer)};
+        {error, Reason} = Err ->
+            logger:warning("SWm do_call: error ~p", [Reason]),
+            Err;
+        Other ->
+            logger:warning("SWm do_call: unexpected return ~P", [Other, 10]),
+            {error, Other}
+    end.
+
+%% #region agent log helpers
+msg_head([Cmd | _]) -> Cmd;
+msg_head(M) -> M.
+
+classify_answer(A) when is_tuple(A) -> {tuple, element(1, A), tuple_size(A)};
+classify_answer([H | _]) when is_atom(H) -> {list_cmd, H};
+classify_answer([H | _]) when is_binary(H) -> {list_cmd_bin, H};
+classify_answer(L) when is_list(L) -> {list_plain, length(L)};
+classify_answer(Other) -> {other, Other}.
+%% #endregion
+
+%%====================================================================
+%% Answer parsers — tolerant of both the generated record form and the
+%% fallback list form returned by OTP diameter depending on how the
+%% codec decoded the answer.
+%%====================================================================
+
+parse_dea(Answer) ->
+    %% OTP diameter returns a `diameter_base_answer-message' record when
+    %% the remote peer synthesises an RFC 6733 base error answer (e.g.
+    %% the AAA server's OTP stack auto-answering with 3001 because the
+    %% app-id was not negotiated on that transport). Extract Result-Code
+    %% directly from that tuple shape so we surface the real error.
+    case is_tuple(Answer)
+         andalso element(1, Answer) =:= 'diameter_base_answer-message' of
+        true  -> parse_base_answer(Answer);
+        false -> parse_swm_dea(Answer)
+    end.
+
+parse_base_answer(Ans) ->
+    %% Record layout (from diameter_gen_base_rfc6733):
+    %%   {_tag, Session-Id, Origin-Host, Origin-Realm, Result-Code,
+    %%    Origin-State-Id, Error-Reporting-Host, Proxy-Info, AVP}
+    SId = first_binary(element(2, Ans)),
+    OH  = first_binary(element(3, Ans)),
+    RC  = element(5, Ans),
+    #{session_id         => SId,
+      origin_host        => OH,
+      result_code        => RC,
+      eap_payload        => <<>>,
+      msk                => undefined,
+      session_timeout    => undefined,
+      non_3gpp_user_data => undefined,
+      apn_configurations => [],
+      mip6_feature_vector => undefined}.
+
+parse_swm_dea(Answer) ->
+    RC       = avp_value('Result-Code', Answer, 0),
+    EapPl    = first_binary(avp_value('EAP-Payload', Answer, <<>>)),
+    MSK      = first_binary(avp_value('EAP-Master-Session-Key', Answer, undefined)),
+    Timeout  = avp_value('Session-Timeout', Answer, undefined),
+    UserData = avp_value('Non-3GPP-User-Data', Answer, undefined),
+    APNCfg   = avp_value('APN-Configuration', Answer, []),
+    MIP6FV   = avp_value('MIP6-Feature-Vector', Answer, undefined),
+    SId      = avp_value('Session-Id', Answer, <<>>),
+    %% Origin-Host anchors the Diameter session to a specific AAA instance
+    %% (RFC 6733 §6.8, 3GPP TS 29.273). Subsequent DERs for the same
+    %% session must carry this as Destination-Host so the DRA routes
+    %% them back to the AAA that holds the EAP state.
+    OriginHost = first_binary(avp_value('Origin-Host', Answer, undefined)),
+    % #region agent log
+    write_log(<<"epdg_diameter_swm:parse_dea">>, <<"A5">>,
+              #{session_id => SId,
+                result_code => RC,
+                origin_host => OriginHost,
+                eap_len => eap_len(EapPl),
+                msk_len => msk_len(MSK),
+                session_timeout => Timeout,
+                has_user_data => UserData =/= undefined,
+                apn_cfg_count => apn_count(APNCfg)}),
+    % #endregion
+    #{session_id         => SId,
+      result_code        => RC,
+      origin_host        => OriginHost,
+      eap_payload        => EapPl,
+      msk                => MSK,
+      session_timeout    => Timeout,
+      non_3gpp_user_data => UserData,
+      apn_configurations => ensure_list(APNCfg),
+      mip6_feature_vector => MIP6FV}.
+
+parse_aaa(Answer) ->
+    RC       = avp_value('Result-Code', Answer, 0),
+    Timeout  = avp_value('Session-Timeout', Answer, undefined),
+    UserData = avp_value('Non-3GPP-User-Data', Answer, undefined),
+    APNCfg   = avp_value('APN-Configuration', Answer, []),
+    SId      = avp_value('Session-Id', Answer, <<>>),
+    #{session_id         => SId,
+      result_code        => RC,
+      session_timeout    => Timeout,
+      non_3gpp_user_data => UserData,
+      apn_configurations => ensure_list(APNCfg)}.
+
+parse_sta(Answer) ->
+    RC  = avp_value('Result-Code', Answer, 0),
+    SId = avp_value('Session-Id', Answer, <<>>),
+    #{session_id => SId, result_code => RC}.
+
+%%====================================================================
 %% Diameter callbacks
 %%====================================================================
 
@@ -225,7 +480,18 @@ peer_up(_SvcName, {_PeerRef, Caps}, State) ->
         #diameter_caps{origin_host = {_, RH}} -> RH;
         _ -> <<"unknown">>
     end,
-    logger:notice("SWm peer up: ~s (DRA reachable)", [RemoteHost]),
+    %% #region agent log
+    RemoteAuthApps = case Caps of
+        #diameter_caps{auth_application_id = {_, RAuth}} -> RAuth;
+        _ -> undefined
+    end,
+    RemoteVSA = case Caps of
+        #diameter_caps{vendor_specific_application_id = {_, RVsa}} -> RVsa;
+        _ -> undefined
+    end,
+    logger:notice("SWm peer up: ~s auth_apps=~p vsa=~P",
+                  [RemoteHost, RemoteAuthApps, RemoteVSA, 8]),
+    %% #endregion
     epdg_metrics:gauge_inc(diameter_swm_peers),
     State.
 
@@ -239,29 +505,67 @@ peer_down(_SvcName, {PeerRef, Caps}, State) ->
     ?SERVER ! {diameter_peer_down, PeerRef},
     State.
 
-pick_peer([Peer | _], _, _SvcName, _State) ->
-    {ok, Peer}.
+pick_peer(LocalCandidates, RemoteCandidates, _SvcName, _State) ->
+    %% #region agent log
+    logger:notice("SWm pick_peer: local=~p remote=~p",
+                  [length(ensure_list(LocalCandidates)),
+                   length(ensure_list(RemoteCandidates))]),
+    %% #endregion
+    case LocalCandidates of
+        [Peer | _] -> {ok, Peer};
+        _ ->
+            case RemoteCandidates of
+                [RPeer | _] -> {ok, RPeer};
+                _ ->
+                    logger:warning("SWm pick_peer: no peers available"),
+                    false
+            end
+    end.
 
+%% Inject Origin-Host / Origin-Realm from service Caps right before send.
+%% Works on the list form of Msg (['DER', {AVP,V}, ...]).
 prepare_request(#diameter_packet{msg = Msg} = Pkt, _SvcName, {_, Caps}) ->
-    #diameter_caps{origin_host = {OH, _}, origin_realm = {OR, _}} = Caps,
-    NewMsg = setelement(2, Msg, [{'Origin-Host', OH}, {'Origin-Realm', OR}
-                                  | element(2, Msg)]),
-    {send, Pkt#diameter_packet{msg = NewMsg}}.
+    {send, Pkt#diameter_packet{msg = inject_origin(Msg, Caps)}}.
 
 prepare_retransmit(Pkt, SvcName, Peer) ->
     prepare_request(Pkt, SvcName, Peer).
 
-handle_answer(#diameter_packet{msg = Msg}, _Req, _SvcName, _Peer) ->
+handle_answer(#diameter_packet{msg = Msg, errors = Errors, header = Hdr},
+              _Req, _SvcName, _Peer) ->
+    %% #region agent log
+    logger:notice("SWm handle_answer: hdr=~P errors=~P msg=~P",
+                  [Hdr, 8, Errors, 8, Msg, 12]),
+    %% #endregion
     {ok, Msg}.
 
 handle_error(Reason, _Req, _SvcName, _Peer) ->
+    logger:warning("SWm handle_error: ~P", [Reason, 10]),
     {error, Reason}.
 
 handle_request(_Pkt, _SvcName, _Peer) ->
-    discard.
+    %% ePDG is not expected to serve SWm requests; AAA → ePDG ASR/RAR
+    %% arrive as this callback — answer with a 3001 for now.
+    {answer_message, 3001}.
 
 %%====================================================================
-%% Internal
+%% Origin injection (list form)
+%%====================================================================
+
+inject_origin(Msg, Caps) when is_list(Msg) ->
+    #diameter_caps{origin_host = {OH, _}, origin_realm = {OR, _}} = Caps,
+    case Msg of
+        [Cmd | Rest] when is_atom(Cmd); is_binary(Cmd) ->
+            Stripped = [AVP || AVP <- Rest, not is_origin(AVP)],
+            [Cmd, {'Origin-Host', OH}, {'Origin-Realm', OR} | Stripped];
+        _ -> Msg
+    end.
+
+is_origin({'Origin-Host', _})  -> true;
+is_origin({'Origin-Realm', _}) -> true;
+is_origin(_)                   -> false.
+
+%%====================================================================
+%% Transport health (unchanged from 0.0.16)
 %%====================================================================
 
 check_transport_health(#state{transports = Ts}) ->
@@ -352,7 +656,9 @@ try_connect_host(Host, #state{dra_port = DRAPort, transport_mod = TransMod,
                 {transport_config, [{raddr, DRAIP},
                                     {rport, DRAPort},
                                     {ip, {0,0,0,0}}]},
-                {reconnect_timer, 5000}
+                {reconnect_timer, 5000},
+                {capabilities,
+                    [{'Auth-Application-Id', [?SWM_APP_ID]}]}
             ]}) of
                 {ok, Ref} ->
                     logger:notice("SWm transport added -> DRA ~s:~B", [Host, DRAPort]),
@@ -374,8 +680,6 @@ try_connect_host(Host, #state{dra_port = DRAPort, transport_mod = TransMod,
             State#state{transports = Ts#{Host => {undefined, Retries + 1}}}
     end.
 
-%% Map a Diameter PeerRef (from peer_down callback) to the configured
-%% DRA hostname via diameter:service_info transport introspection.
 host_for_peer_ref(PeerRef, Transports) ->
     TInfos = diameter:service_info(?SVC_NAME, transport),
     case find_transport_ref(TInfos, PeerRef) of
@@ -417,11 +721,6 @@ match_peer_ref(Info, PeerRef) ->
 retry_delay(Retries) ->
     min(?DNS_RETRY_INITIAL bsl min(Retries, 4), ?DNS_RETRY_MAX).
 
-generate_session_id() ->
-    TS = erlang:system_time(microsecond),
-    Host = epdg_config:get(origin_host, "epdg"),
-    list_to_binary(io_lib:format("~s;~B;epdg", [Host, TS])).
-
 transport_module("sctp") -> diameter_sctp;
 transport_module("tcp")  -> diameter_tcp;
 transport_module(_)      -> diameter_tcp.
@@ -435,3 +734,104 @@ resolve_host(Host) ->
                 Err -> Err
             end
     end.
+
+%%====================================================================
+%% Answer helpers
+%%====================================================================
+
+%% Retrieve an AVP value from an Answer that might be:
+%%   * a record (tuple with first element = command atom e.g. 'diameter_gen_swm_DEA')
+%%   * a list ['DEA' | AVPs]
+%%   * a plain list of AVPs (legacy)
+avp_value(Key, Answer, Default) when is_tuple(Answer) ->
+    %% Record form: tag, Session-Id, then AVPs — fall back to list form
+    %% by searching recursively through the tuple fields.
+    case tuple_to_list(Answer) of
+        [_Tag | Fields] -> find_in_fields(Key, Fields, Default);
+        _ -> Default
+    end;
+avp_value(Key, [_Cmd | AVPs], Default) when is_atom(_Cmd); is_binary(_Cmd) ->
+    proplists:get_value(Key, AVPs, Default);
+avp_value(Key, AVPs, Default) when is_list(AVPs) ->
+    proplists:get_value(Key, AVPs, Default);
+avp_value(_, _, Default) ->
+    Default.
+
+find_in_fields(_Key, [], Default) -> Default;
+find_in_fields(Key, [V | Rest], Default) ->
+    case lookup_here(Key, V) of
+        {ok, Found} -> Found;
+        not_found -> find_in_fields(Key, Rest, Default)
+    end.
+
+lookup_here(Key, L) when is_list(L) ->
+    case proplists:get_value(Key, L) of
+        undefined -> not_found;
+        V -> {ok, V}
+    end;
+lookup_here(_, _) -> not_found.
+
+first_binary([H | _]) when is_binary(H) -> H;
+first_binary(B) when is_binary(B) -> B;
+first_binary(_) -> undefined.
+
+ensure_list(L) when is_list(L) -> L;
+ensure_list(undefined) -> [];
+ensure_list(V) -> [V].
+
+answer_head(Ans) when is_list(Ans), length(Ans) > 0 -> hd(Ans);
+answer_head(Ans) when is_tuple(Ans) -> element(1, Ans);
+answer_head(_) -> unknown.
+
+eap_len(B) when is_binary(B) -> byte_size(B);
+eap_len(_) -> 0.
+
+msk_len(B) when is_binary(B) -> byte_size(B);
+msk_len(_) -> 0.
+
+apn_count(L) when is_list(L) -> length(L);
+apn_count(_) -> 0.
+
+%%====================================================================
+%% Misc helpers
+%%====================================================================
+
+to_bin(B) when is_binary(B) -> B;
+to_bin(L) when is_list(L)   -> list_to_binary(L).
+
+to_list(L) when is_list(L)   -> L;
+to_list(B) when is_binary(B) -> binary_to_list(B).
+
+maybe_add(Msg, _K, undefined) -> Msg;
+maybe_add(Msg, K, V) -> Msg ++ [{K, V}].
+
+as_tuple({K, V}) -> {K, V};
+as_tuple(V) -> {V, undefined}.
+
+% #region agent log helpers
+write_log(Location, HypothesisId, Data) ->
+    Entry = jsx:encode(#{
+        sessionId    => <<"35d02f">>,
+        runId        => <<"swm-wiring">>,
+        hypothesisId => HypothesisId,
+        location     => Location,
+        message      => Location,
+        data         => sanitize(Data),
+        timestamp    => erlang:system_time(millisecond)}),
+    catch file:write_file(
+            "/home/carsten/Schreibtisch/volte.io/helm/.cursor/debug-35d02f.log",
+            <<Entry/binary, "\n">>, [append]),
+    ok.
+
+sanitize(M) when is_map(M) ->
+    maps:map(fun(_K, V) -> sanitize(V) end, M);
+sanitize(L) when is_list(L) ->
+    case io_lib:printable_list(L) of
+        true  -> iolist_to_binary(L);
+        false -> [sanitize(X) || X <- L]
+    end;
+sanitize(T) when is_tuple(T) -> sanitize(tuple_to_list(T));
+sanitize(B) when is_binary(B), byte_size(B) > 64 ->
+    <<B:64/binary>>;
+sanitize(V) -> V.
+% #endregion

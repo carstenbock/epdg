@@ -21,6 +21,9 @@ init() ->
     %% IKE X.509 certificate (TS 33.402 §7.2.1)
     set_from_env("EPDG_IKE_CERT_FILE", ike_cert_file, ""),
     set_from_env("EPDG_IKE_KEY_FILE", ike_key_file, ""),
+    %% IDr (FQDN the ePDG presents as its IKEv2 identity; should match
+    %% the SubjectAltName:DNS of the configured certificate).
+    set_from_env("EPDG_IKE_ID_FQDN", ike_id_fqdn, fun default_ike_id_fqdn/0),
 
     %% EAP-AKA'
     set_from_env("EPDG_EAP_METHOD", eap_method, "aka-prime"),
@@ -41,6 +44,14 @@ init() ->
     set_from_env_int("DRA_PORT", dra_port, 3868),
     set_from_env("DRA_TRANSPORT", dra_transport, "tcp"),
     set_from_env_int("EPDG_DIAMETER_PORT", diameter_port, 3868),
+    %% Destination realm for routed SWm DERs (AAA realm, not DRA realm).
+    %% Falls back to our Origin-Realm so single-realm deployments work
+    %% out of the box.
+    set_from_env("EPDG_SWM_DEST_REALM", swm_dest_realm,
+                 fun() -> epdg_config:get(origin_realm, "localdomain") end),
+    %% RAT-Type value for SWm DER (TS 29.273 §5.2.3.6). 0 = WLAN (default
+    %% for ePDG/untrusted Wi-Fi access per TS 29.212 §5.3.31).
+    set_from_env_int("EPDG_SWM_RAT_TYPE", swm_rat_type, 0),
 
     %% PLMN
     set_from_env("MCC", mcc, "001"),
@@ -110,3 +121,13 @@ hostname_default() ->
             Realm = os:getenv("EPDG_ORIGIN_REALM", "localdomain"),
             H ++ "." ++ Realm
     end.
+
+%% Default IDr FQDN per TS 23.003 §19.4.2.4: epdg.epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org.
+default_ike_id_fqdn() ->
+    MCC = os:getenv("MCC", "001"),
+    MNC = os:getenv("MNC", "01"),
+    MNC3 = case length(MNC) of
+        2 -> "0" ++ MNC;
+        _ -> MNC
+    end,
+    "epdg.epc.mnc" ++ MNC3 ++ ".mcc" ++ MCC ++ ".3gppnetwork.org".

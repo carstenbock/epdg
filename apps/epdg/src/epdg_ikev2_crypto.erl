@@ -13,6 +13,7 @@
          derive_ike_keys/4,
          derive_child_keys/5,
          encrypt_sk/4, decrypt_sk/4,
+         encode_encrypted_message/5, decode_encrypted_message/4,
          derive_aka_prime_keys/4,
          load_certificate/1, load_private_key/1,
          sign_auth_data/5, auth_method/1]).
@@ -99,13 +100,16 @@ prf_plus_loop(PRF, Key, Seed, Needed, Acc, Prev, N) ->
 derive_ike_keys(SharedSecret, NonceI, NonceR, #{prf := PRF,
                                                  enc_key_len := EncKeyLen,
                                                  integ_key_len := IntegKeyLen,
-                                                 prf_key_len := PRFKeyLen}) ->
+                                                 prf_key_len := PRFKeyLen,
+                                                 spi_i := SPIiBin,
+                                                 spi_r := SPIrBin}) ->
     SKEYSEED = prf(PRF, <<NonceI/binary, NonceR/binary>>, SharedSecret),
 
     Needed = PRFKeyLen + IntegKeyLen + EncKeyLen +
              PRFKeyLen + IntegKeyLen + EncKeyLen + PRFKeyLen,
 
-    Seed = <<NonceI/binary, NonceR/binary>>,
+    %% RFC 7296 §2.14: prf+(SKEYSEED, Ni | Nr | SPIi | SPIr)
+    Seed = <<NonceI/binary, NonceR/binary, SPIiBin/binary, SPIrBin/binary>>,
     KeyMat = prf_plus(PRF, SKEYSEED, Seed, Needed),
 
     %% SK_d | SK_ai | SK_ar | SK_ei | SK_er | SK_pi | SK_pr
@@ -162,6 +166,252 @@ decrypt_sk(aes_cbc_256, Key, <<IV:16/binary, Ciphertext/binary>>, _AAD) ->
     DataLen = byte_size(Padded) - PadLen - 1,
     <<Data:DataLen/binary, _/binary>> = Padded,
     Data.
+
+%%====================================================================
+%% Encrypted IKE message encode/decode (RFC 7296 §3.14, RFC 5282)
+%%
+%% These helpers operate on the full IKE message (including header) and
+%% take care of IKEv2-specific framing:
+%%   - SK payload header (4 bytes) immediately after IKE header
+%%   - IV (8 bytes for AEAD per RFC 5282 §3; 16 bytes for AES-CBC)
+%%   - Ciphertext over (inner payloads | Padding | Pad Length)
+%%   - ICV: AEAD tag (AES-GCM: 16 bytes) OR HMAC trailer for CBC+INTEG
+%%   - AEAD nonce = salt(4) | IV(8); salt comes from SK_e{i,r}
+%%   - AEAD AAD = partial IKE header + SK payload header (32 bytes)
+%%
+%% AES-CBC + HMAC-SHA-2 (legacy suites — observed in the field on Samsung
+%% VoWiFi clients proposing AES-CBC-256 + HMAC-SHA-256-128 / HMAC-SHA-512-256
+%% + MODP-2048/3072) is handled by the `is_aead=false` clauses below. The
+%% HMAC is computed over `IKE_Hdr | SK_Hdr | IV | Ciphertext` (RFC 7296
+%% §3.14), truncated to the per-algorithm output length from RFC 4868
+%% (HMAC-SHA-256-128 → 16 B, HMAC-SHA-384-192 → 24 B, HMAC-SHA-512-256
+%% → 32 B).
+%%====================================================================
+
+-define(IKE_HDR_LEN, 28).
+-define(SK_HDR_LEN, 4).
+-define(PAYLOAD_SK, 46).
+
+%% Encode a full IKE message with an SK payload chain.
+%%
+%% Params:
+%%   SuiteParams - map from epdg_ikev2_codec:keys_params_for_suite/1
+%%   Keys        - map from derive_ike_keys/4
+%%   Direction   - responder | initiator (determines SK_e{i,r}/SK_a{i,r})
+%%   HeaderIn    - map with initiator_spi, responder_spi, exchange_type_raw,
+%%                 flags, message_id, next_payload_first_inner (atom or raw int)
+%%   InnerChain  - [{AtomType, Bin}, ...] list consumed by codec encode_payloads
+-spec encode_encrypted_message(map(), map(), responder | initiator,
+                                map(), [{atom(), binary()}]) ->
+    {ok, binary()} | {error, term()}.
+encode_encrypted_message(#{is_aead := true, enc_alg := aes_gcm_256,
+                           enc_base_key_len := EncKeyLen, salt_len := SaltLen},
+                         Keys, Direction,
+                         #{initiator_spi := ISPI, responder_spi := RSPI,
+                           exchange_type_raw := ExType, flags := Flags,
+                           message_id := MsgId}, InnerChain) ->
+    {SK_e_full, _SK_a} = keys_for_direction(Direction, Keys),
+    <<EncKey:EncKeyLen/binary, Salt:SaltLen/binary>> = SK_e_full,
+
+    {FirstInnerType, InnerBin} = epdg_ikev2_codec:encode_payloads(InnerChain),
+
+    %% Pad-only trailer per RFC 7296 §3.14: last byte = pad length.
+    %% For AEAD block alignment is not required; use a single pad-length
+    %% byte of 0x00 (zero-length padding).
+    Plaintext = <<InnerBin/binary, 0:8>>,
+    IV = crypto:strong_rand_bytes(8),
+    Nonce = <<Salt/binary, IV/binary>>,
+
+    CtLen    = byte_size(Plaintext),
+    SKBodyLen = ?SK_HDR_LEN + byte_size(IV) + CtLen + 16,
+    TotalLen  = ?IKE_HDR_LEN + SKBodyLen,
+
+    IkeHdr = <<ISPI:64, RSPI:64, ?PAYLOAD_SK:8, 2:4, 0:4,
+               ExType:8, Flags:8, MsgId:32, TotalLen:32>>,
+    %% SK payload header: next_payload = first inner payload type, critical=0,
+    %% reserved=0, length = 4+IV+CT+ICV (i.e. full SK payload incl header).
+    SKPLen  = SKBodyLen,
+    SKHdr   = <<FirstInnerType:8, 0:8, SKPLen:16>>,
+    AAD     = <<IkeHdr/binary, SKHdr/binary>>,
+
+    {Ciphertext, Tag} =
+        crypto:crypto_one_time_aead(aes_256_gcm, EncKey, Nonce, Plaintext,
+                                    AAD, 16, true),
+
+    {ok, <<IkeHdr/binary, SKHdr/binary, IV/binary, Ciphertext/binary, Tag/binary>>};
+encode_encrypted_message(#{is_aead := false, enc_alg := EncAlg,
+                           enc_base_key_len := EncKeyLen,
+                           integ_alg := IntegAlg, integ_key_len := IntegKeyLen},
+                         Keys, Direction,
+                         #{initiator_spi := ISPI, responder_spi := RSPI,
+                           exchange_type_raw := ExType, flags := Flags,
+                           message_id := MsgId}, InnerChain)
+  when EncAlg =:= aes_cbc_256 orelse EncAlg =:= aes_cbc_128 ->
+    {SK_e, SK_a} = keys_for_direction(Direction, Keys),
+    <<EncKey:EncKeyLen/binary, _/binary>> = SK_e,
+    <<IntegKey:IntegKeyLen/binary, _/binary>> = SK_a,
+    {FirstInnerType, InnerBin} = epdg_ikev2_codec:encode_payloads(InnerChain),
+    %% Pad so (InnerBin | Padding | Pad-Length-byte) is a multiple of 16.
+    InnerLen = byte_size(InnerBin),
+    PadBytes = (16 - ((InnerLen + 1) rem 16)) rem 16,
+    Padding = crypto:strong_rand_bytes(PadBytes),
+    Plaintext = <<InnerBin/binary, Padding/binary, PadBytes:8>>,
+    IV = crypto:strong_rand_bytes(16),
+    Ciphertext = crypto:crypto_one_time(
+        aes_cbc_atom(EncAlg), EncKey, IV, Plaintext, true),
+    IcvLen = icv_len(IntegAlg),
+    SKBodyLen = ?SK_HDR_LEN + 16 + byte_size(Ciphertext) + IcvLen,
+    TotalLen  = ?IKE_HDR_LEN + SKBodyLen,
+    IkeHdr = <<ISPI:64, RSPI:64, ?PAYLOAD_SK:8, 2:4, 0:4,
+               ExType:8, Flags:8, MsgId:32, TotalLen:32>>,
+    SKHdr = <<FirstInnerType:8, 0:8, SKBodyLen:16>>,
+    MacIn = <<IkeHdr/binary, SKHdr/binary, IV/binary, Ciphertext/binary>>,
+    MacFull = crypto:mac(hmac, hmac_hash(IntegAlg), IntegKey, MacIn),
+    ICV = binary:part(MacFull, 0, IcvLen),
+    {ok, <<IkeHdr/binary, SKHdr/binary, IV/binary, Ciphertext/binary, ICV/binary>>};
+encode_encrypted_message(_, _, _, _, _) ->
+    {error, unsupported_crypto_suite}.
+
+%% Decode + decrypt an incoming SK-protected IKE message. Returns the
+%% decoded inner payload list plus the message header (for convenience).
+-spec decode_encrypted_message(map(), map(), responder | initiator, binary()) ->
+    {ok, #{header := map(), payloads := [map()]}} | {error, term()}.
+decode_encrypted_message(#{is_aead := true, enc_alg := aes_gcm_256,
+                           enc_base_key_len := EncKeyLen, salt_len := SaltLen},
+                         Keys, PeerDirection, RawMessage)
+  when byte_size(RawMessage) > (?IKE_HDR_LEN + ?SK_HDR_LEN + 8 + 16) ->
+    {SK_e_full, _SK_a} = keys_for_direction(PeerDirection, Keys),
+    <<EncKey:EncKeyLen/binary, Salt:SaltLen/binary>> = SK_e_full,
+
+    case epdg_ikev2_codec:decode_header(RawMessage) of
+        {ok, #{next_payload := ?PAYLOAD_SK, length := _TotalLen,
+               payload_data := PayloadBin} = Header} ->
+            case PayloadBin of
+                <<InnerFirstType:8, _Crit:1, _Res:7, SKPLen:16, SKBody/binary>>
+                  when byte_size(SKBody) >= (SKPLen - ?SK_HDR_LEN) ->
+                    InnerBodyLen = SKPLen - ?SK_HDR_LEN,
+                    <<SKBodyBin:InnerBodyLen/binary, _Trailing/binary>> = SKBody,
+                    case SKBodyBin of
+                        <<IV:8/binary, Rest/binary>>
+                          when byte_size(Rest) >= 16 ->
+                            CtLen = byte_size(Rest) - 16,
+                            <<Ciphertext:CtLen/binary, Tag:16/binary>> = Rest,
+                            Nonce = <<Salt/binary, IV/binary>>,
+                            IkeHdrBytes = binary:part(RawMessage, 0, ?IKE_HDR_LEN),
+                            SKHdrBytes  =
+                                <<InnerFirstType:8, 0:8, SKPLen:16>>,
+                            AAD = <<IkeHdrBytes/binary, SKHdrBytes/binary>>,
+                            case crypto:crypto_one_time_aead(aes_256_gcm, EncKey,
+                                                              Nonce, Ciphertext,
+                                                              AAD, Tag, false) of
+                                error ->
+                                    {error, icv_check_failed};
+                                Plaintext when is_binary(Plaintext) ->
+                                    finalize_decrypted(Header, InnerFirstType, Plaintext)
+                            end;
+                        _ -> {error, sk_payload_truncated}
+                    end;
+                _ -> {error, sk_payload_malformed}
+            end;
+        {ok, #{next_payload := Other}} ->
+            {error, {not_encrypted, Other}};
+        {error, Reason} ->
+            {error, Reason}
+    end;
+decode_encrypted_message(#{is_aead := false, enc_alg := EncAlg,
+                           enc_base_key_len := EncKeyLen,
+                           integ_alg := IntegAlg, integ_key_len := IntegKeyLen},
+                         Keys, PeerDirection, RawMessage)
+  when EncAlg =:= aes_cbc_256 orelse EncAlg =:= aes_cbc_128 ->
+    {SK_e, SK_a} = keys_for_direction(PeerDirection, Keys),
+    <<EncKey:EncKeyLen/binary, _/binary>> = SK_e,
+    <<IntegKey:IntegKeyLen/binary, _/binary>> = SK_a,
+    IcvLen = icv_len(IntegAlg),
+    case epdg_ikev2_codec:decode_header(RawMessage) of
+        {ok, #{next_payload := ?PAYLOAD_SK,
+               payload_data := PayloadBin} = Header} ->
+            case PayloadBin of
+                <<InnerFirstType:8, _Crit:1, _Res:7, SKPLen:16, SKBody/binary>>
+                  when byte_size(SKBody) >= (SKPLen - ?SK_HDR_LEN) ->
+                    InnerBodyLen = SKPLen - ?SK_HDR_LEN,
+                    <<SKBodyBin:InnerBodyLen/binary, _/binary>> = SKBody,
+                    case SKBodyBin of
+                        <<IV:16/binary, Rest/binary>>
+                          when byte_size(Rest) >= IcvLen ->
+                            CtLen = byte_size(Rest) - IcvLen,
+                            case CtLen rem 16 of
+                                0 ->
+                                    <<Ciphertext:CtLen/binary, ICV:IcvLen/binary>> = Rest,
+                                    %% Use raw on-wire bytes for MAC input, exactly
+                                    %% RawMessage[0 .. end-ICV_len] per RFC 7296 §3.14.
+                                    MacInLen = byte_size(RawMessage) - IcvLen,
+                                    MacIn = binary:part(RawMessage, 0, MacInLen),
+                                    MacFull = crypto:mac(hmac, hmac_hash(IntegAlg),
+                                                          IntegKey, MacIn),
+                                    Expected = binary:part(MacFull, 0, IcvLen),
+                                    case Expected =:= ICV of
+                                        false -> {error, icv_check_failed};
+                                        true ->
+                                            Plaintext = crypto:crypto_one_time(
+                                                aes_cbc_atom(EncAlg), EncKey, IV,
+                                                Ciphertext, false),
+                                            finalize_decrypted(Header, InnerFirstType,
+                                                               Plaintext)
+                                    end;
+                                _ -> {error, ciphertext_not_block_aligned}
+                            end;
+                        _ -> {error, sk_payload_truncated}
+                    end;
+                _ -> {error, sk_payload_malformed}
+            end;
+        {ok, #{next_payload := Other}} ->
+            {error, {not_encrypted, Other}};
+        {error, Reason} -> {error, Reason}
+    end;
+decode_encrypted_message(_, _, _, _) ->
+    {error, unsupported_or_short_message}.
+
+aes_cbc_atom(aes_cbc_128) -> aes_128_cbc;
+aes_cbc_atom(aes_cbc_256) -> aes_256_cbc.
+
+hmac_hash(hmac_sha256_128) -> sha256;
+hmac_hash(hmac_sha384_192) -> sha384;
+hmac_hash(hmac_sha512_256) -> sha512.
+
+%% RFC 4868: truncated output length for HMAC-SHA-2-based integrity algos.
+icv_len(hmac_sha256_128) -> 16;
+icv_len(hmac_sha384_192) -> 24;
+icv_len(hmac_sha512_256) -> 32.
+
+finalize_decrypted(Header, InnerFirstType, Plaintext) ->
+    %% Strip pad length byte + padding octets (RFC 7296 §3.14).
+    case Plaintext of
+        <<>> -> {error, empty_plaintext};
+        _ ->
+            PadLen = binary:last(Plaintext),
+            Total  = byte_size(Plaintext),
+            case Total > PadLen of
+                true ->
+                    InnerLen = Total - PadLen - 1,
+                    <<InnerBin:InnerLen/binary, _/binary>> = Plaintext,
+                    case epdg_ikev2_codec:decode_payloads(InnerFirstType, InnerBin) of
+                        {ok, Payloads} ->
+                            {ok, #{header => Header, payloads => Payloads,
+                                   first_inner => InnerFirstType,
+                                   plaintext => InnerBin}};
+                        {error, R} -> {error, {inner_decode, R}}
+                    end;
+                false ->
+                    {error, invalid_padding}
+            end
+    end.
+
+%% Return the encryption+integrity keys to use for each direction.
+%%   Direction=responder → we are encrypting an OUTGOING message (use SK_er/SK_ar)
+%%   Direction=initiator → we are decrypting an INCOMING initiator message
+%%                          (use SK_ei/SK_ai)
+keys_for_direction(responder, #{sk_er := Er, sk_ar := Ar}) -> {Er, Ar};
+keys_for_direction(initiator, #{sk_ei := Ei, sk_ai := Ai}) -> {Ei, Ai}.
 
 %%====================================================================
 %% EAP-AKA' key derivation (RFC 5448 section 3.3)

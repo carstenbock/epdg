@@ -1,0 +1,314 @@
+;;
+;; SWm Diameter application — 3GPP TS 29.273 clause 7
+;; Application-Id: 16777264   Vendor: 10415 (3GPP)
+;;
+;; Used between ePDG (untrusted non-3GPP access) and the 3GPP AAA Server.
+;; Commands: DER/DEA, AAR/AAA, STR/STA, ASR/ASA, RAR/RAA.
+;;
+
+@id     16777264
+@name   diameter_gen_swm
+@prefix diameter_swm
+@vendor 10415 3GPP
+
+@inherits diameter_gen_base_rfc6733
+
+@avp_types
+
+   ;; --- RFC 4005 NASREQ / RFC 3579 EAP (vendor 0) --------------------
+   EAP-Payload                               462   OctetString      M
+   EAP-Master-Session-Key                    343   OctetString      -
+   EAP-Key-Name                              102   OctetString      -
+   Calling-Station-Id                         31   UTF8String       M
+   Called-Station-Id                          30   UTF8String       M
+   NAS-Identifier                             32   UTF8String       M
+   NAS-IP-Address                              4   OctetString      M
+
+   ;; --- RFC 5447 MIPv6 integration (vendor 0) ------------------------
+   MIP6-Feature-Vector                       124   Unsigned64       M
+   MIP6-Home-Link-Prefix                     125   OctetString      M
+   MIP6-Agent-Info                           486   Grouped          M
+   MIP-Home-Agent-Address                    334   Address          M
+   MIP-Home-Agent-Host                       348   Grouped          M
+
+   ;; --- RFC 5778 service selection (vendor 0) ------------------------
+   Service-Selection                         493   UTF8String       M
+
+   ;; --- 3GPP vendor AVPs (vendor 10415) ------------------------------
+   Visited-Network-Identifier                600   OctetString      MV
+   RAT-Type                                 1032   Enumerated       MV
+   AN-Trusted                               1503   Enumerated        V
+   UE-Local-IP-Address                      2805   Address           V
+   Terminal-Information                     1401   Grouped          MV
+   IMEI                                     1402   UTF8String       MV
+   Software-Version                         1403   UTF8String       MV
+
+   APN-Configuration                        1430   Grouped          MV
+   Context-Identifier                       1423   Unsigned32       MV
+   PDN-Type                                 1456   Enumerated       MV
+   AMBR                                     1435   Grouped          MV
+   Max-Requested-Bandwidth-UL                516   Unsigned32       M
+   Max-Requested-Bandwidth-DL                515   Unsigned32       M
+   Served-Party-IP-Address                   848   Address          MV
+
+   Non-3GPP-User-Data                       1500   Grouped           V
+   Non-3GPP-IP-Access                       1501   Enumerated        V
+   Non-3GPP-IP-Access-APN                   1502   Enumerated        V
+
+   3GPP-AAA-Server-Name                      318   DiameterIdentity MV
+
+@grouped
+
+   MIP6-Agent-Info ::= < AVP Header: 486 >
+                      * [ MIP-Home-Agent-Address ]
+                        [ MIP-Home-Agent-Host ]
+                        [ MIP6-Home-Link-Prefix ]
+
+   MIP-Home-Agent-Host ::= < AVP Header: 348 >
+                           { Destination-Realm }
+                           { Destination-Host }
+
+   Terminal-Information ::= < AVP Header: 1401 10415 >
+                            [ IMEI ]
+                            [ Software-Version ]
+
+   APN-Configuration ::= < AVP Header: 1430 10415 >
+                         { Context-Identifier }
+                         { PDN-Type }
+                         { Service-Selection }
+                         [ AMBR ]
+                       * [ Served-Party-IP-Address ]
+                       * [ AVP ]
+
+   AMBR ::= < AVP Header: 1435 10415 >
+            { Max-Requested-Bandwidth-UL }
+            { Max-Requested-Bandwidth-DL }
+
+   Non-3GPP-User-Data ::= < AVP Header: 1500 10415 >
+                          [ Non-3GPP-IP-Access ]
+                          [ Non-3GPP-IP-Access-APN ]
+                          [ RAT-Type ]
+                          [ Session-Timeout ]
+                          [ MIP6-Feature-Vector ]
+                          [ AMBR ]
+                        * [ APN-Configuration ]
+                        * [ AVP ]
+
+@define Result-Code
+
+   DIAMETER_ERROR_USER_UNKNOWN                     5001
+   DIAMETER_ERROR_UNKNOWN_EPS_SUBSCRIPTION         5420
+   DIAMETER_ERROR_RAT_NOT_ALLOWED                  5421
+   DIAMETER_ERROR_ROAMING_NOT_ALLOWED              5004
+   DIAMETER_ERROR_EQUIPMENT_UNKNOWN                5422
+   DIAMETER_AUTHENTICATION_DATA_UNAVAILABLE        4181
+   DIAMETER_ERROR_USER_NO_NON_3GPP_SUBSCRIPTION    5450
+   DIAMETER_ERROR_USER_NO_APN_SUBSCRIPTION         5451
+   DIAMETER_ERROR_RAT_TYPE_NOT_ALLOWED             5452
+   DIAMETER_MULTI_ROUND_AUTH                       1001
+
+@enum RAT-Type
+   WLAN                          0
+   VIRTUAL                       1
+   UTRAN                      1000
+   GERAN                      1001
+   GAN                        1002
+   HSPA-EVOLUTION             1003
+   EUTRAN                     1004
+   CDMA2000-1X                2000
+   HRPD                       2001
+   UMB                        2002
+   EHRPD                      2003
+   NR                         2004
+
+@enum AN-Trusted
+   TRUSTED       0
+   UNTRUSTED     1
+
+@enum Non-3GPP-IP-Access
+   NON_3GPP_SUBSCRIPTION_ALLOWED    0
+   NON_3GPP_SUBSCRIPTION_BARRED     1
+
+@enum Non-3GPP-IP-Access-APN
+   NON_3GPP_APNS_ENABLE     0
+   NON_3GPP_APNS_DISABLE    1
+
+@enum PDN-Type
+   IPv4        0
+   IPv6        1
+   IPv4v6      2
+   IPv4_OR_IPv6 3
+   NON_IP      4
+
+@messages
+
+   ;; Diameter-EAP-Request (268) — ePDG → AAA (EAP relay)
+   DER ::= < Diameter Header: 268, REQ, PXY >
+           < Session-Id >
+           { Auth-Application-Id }
+           { Origin-Host }
+           { Origin-Realm }
+           { Destination-Realm }
+           { Auth-Request-Type }
+           [ Destination-Host ]
+           [ User-Name ]
+           [ EAP-Payload ]
+           [ RAT-Type ]
+           [ Service-Selection ]
+           [ MIP6-Feature-Vector ]
+           [ Visited-Network-Identifier ]
+           [ AN-Trusted ]
+           [ Terminal-Information ]
+           [ UE-Local-IP-Address ]
+           [ Calling-Station-Id ]
+           [ Called-Station-Id ]
+           [ Auth-Session-State ]
+         * [ Proxy-Info ]
+         * [ Route-Record ]
+         * [ AVP ]
+
+   DEA ::= < Diameter Header: 268, PXY >
+           < Session-Id >
+           { Auth-Application-Id }
+           { Result-Code }
+           { Origin-Host }
+           { Origin-Realm }
+           { Auth-Request-Type }
+           [ User-Name ]
+           [ EAP-Payload ]
+           [ EAP-Master-Session-Key ]
+           [ EAP-Key-Name ]
+           [ Session-Timeout ]
+           [ Auth-Grace-Period ]
+           [ MIP6-Feature-Vector ]
+           [ APN-Configuration ]
+           [ Non-3GPP-User-Data ]
+           [ 3GPP-AAA-Server-Name ]
+           [ Error-Message ]
+           [ Error-Reporting-Host ]
+           [ Failed-AVP ]
+         * [ Redirect-Host ]
+         * [ Proxy-Info ]
+         * [ AVP ]
+
+   ;; AA-Request / AA-Answer (265) — ePDG → AAA (authorization)
+   AAR ::= < Diameter Header: 265, REQ, PXY >
+           < Session-Id >
+           { Auth-Application-Id }
+           { Origin-Host }
+           { Origin-Realm }
+           { Destination-Realm }
+           { Auth-Request-Type }
+           [ Destination-Host ]
+           [ User-Name ]
+           [ Service-Selection ]
+           [ RAT-Type ]
+           [ MIP6-Feature-Vector ]
+           [ Visited-Network-Identifier ]
+           [ Auth-Session-State ]
+           [ UE-Local-IP-Address ]
+         * [ Proxy-Info ]
+         * [ Route-Record ]
+         * [ AVP ]
+
+   AAA ::= < Diameter Header: 265, PXY >
+           < Session-Id >
+           { Auth-Application-Id }
+           { Result-Code }
+           { Origin-Host }
+           { Origin-Realm }
+           { Auth-Request-Type }
+           [ User-Name ]
+           [ Session-Timeout ]
+           [ MIP6-Feature-Vector ]
+           [ APN-Configuration ]
+           [ Non-3GPP-User-Data ]
+           [ 3GPP-AAA-Server-Name ]
+           [ Error-Message ]
+           [ Error-Reporting-Host ]
+           [ Failed-AVP ]
+         * [ Redirect-Host ]
+         * [ Proxy-Info ]
+         * [ AVP ]
+
+   ;; Session-Termination-Request / Answer (275)
+   STR ::= < Diameter Header: 275, REQ, PXY >
+           < Session-Id >
+           { Origin-Host }
+           { Origin-Realm }
+           { Destination-Realm }
+           { Auth-Application-Id }
+           { Termination-Cause }
+           [ Destination-Host ]
+           [ User-Name ]
+           [ Auth-Session-State ]
+         * [ Class ]
+         * [ Proxy-Info ]
+         * [ Route-Record ]
+         * [ AVP ]
+
+   STA ::= < Diameter Header: 275, PXY >
+           < Session-Id >
+           { Result-Code }
+           { Origin-Host }
+           { Origin-Realm }
+           [ User-Name ]
+           [ Error-Message ]
+           [ Error-Reporting-Host ]
+           [ Failed-AVP ]
+         * [ Redirect-Host ]
+         * [ Proxy-Info ]
+         * [ AVP ]
+
+   ;; Abort-Session-Request / Answer (274) — AAA-initiated detach
+   ASR ::= < Diameter Header: 274, REQ, PXY >
+           < Session-Id >
+           { Origin-Host }
+           { Origin-Realm }
+           { Destination-Realm }
+           { Destination-Host }
+           { Auth-Application-Id }
+           [ User-Name ]
+           [ Auth-Session-State ]
+         * [ Proxy-Info ]
+         * [ Route-Record ]
+         * [ AVP ]
+
+   ASA ::= < Diameter Header: 274, PXY >
+           < Session-Id >
+           { Result-Code }
+           { Origin-Host }
+           { Origin-Realm }
+           [ User-Name ]
+           [ Error-Message ]
+           [ Error-Reporting-Host ]
+           [ Failed-AVP ]
+         * [ Proxy-Info ]
+         * [ AVP ]
+
+   ;; Re-Auth-Request / Answer (258)
+   RAR ::= < Diameter Header: 258, REQ, PXY >
+           < Session-Id >
+           { Origin-Host }
+           { Origin-Realm }
+           { Destination-Realm }
+           { Destination-Host }
+           { Auth-Application-Id }
+           { Re-Auth-Request-Type }
+           [ User-Name ]
+           [ Auth-Session-State ]
+         * [ Proxy-Info ]
+         * [ Route-Record ]
+         * [ AVP ]
+
+   RAA ::= < Diameter Header: 258, PXY >
+           < Session-Id >
+           { Result-Code }
+           { Origin-Host }
+           { Origin-Realm }
+           [ User-Name ]
+           [ Error-Message ]
+           [ Error-Reporting-Host ]
+           [ Failed-AVP ]
+         * [ Proxy-Info ]
+         * [ AVP ]

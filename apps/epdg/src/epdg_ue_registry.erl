@@ -9,6 +9,7 @@
 
 -export([start_link/0,
          register/3, unregister/1,
+         register_initiator/3, lookup_by_initiator/2, unregister_initiator/2,
          lookup_by_spi/1, lookup_by_imsi/1,
          count/0, all/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -17,6 +18,7 @@
 -define(SERVER, ?MODULE).
 -define(TAB_SPI,  epdg_spi_tab).
 -define(TAB_IMSI, epdg_imsi_tab).
+-define(TAB_INIT, epdg_initiator_tab).  %% {PeerIP, ISPI} -> Pid (dedup IKE_SA_INIT retransmits)
 
 %%====================================================================
 %% API
@@ -32,6 +34,30 @@ register(SPI, Pid, IMSI) ->
 -spec unregister(non_neg_integer()) -> ok.
 unregister(SPI) ->
     gen_server:call(?SERVER, {unregister, SPI}).
+
+-spec register_initiator(inet:ip_address(), non_neg_integer(), pid()) -> ok.
+register_initiator(PeerIP, ISPI, Pid) ->
+    ets:insert(?TAB_INIT, {{PeerIP, ISPI}, Pid}),
+    ok.
+
+-spec lookup_by_initiator(inet:ip_address(), non_neg_integer()) ->
+    {ok, pid()} | error.
+lookup_by_initiator(PeerIP, ISPI) ->
+    case ets:lookup(?TAB_INIT, {PeerIP, ISPI}) of
+        [{_, Pid}] ->
+            case is_process_alive(Pid) of
+                true  -> {ok, Pid};
+                false ->
+                    ets:delete(?TAB_INIT, {PeerIP, ISPI}),
+                    error
+            end;
+        [] -> error
+    end.
+
+-spec unregister_initiator(inet:ip_address(), non_neg_integer()) -> ok.
+unregister_initiator(PeerIP, ISPI) ->
+    ets:delete(?TAB_INIT, {PeerIP, ISPI}),
+    ok.
 
 -spec lookup_by_spi(non_neg_integer()) -> {ok, pid()} | error.
 lookup_by_spi(SPI) ->
@@ -64,6 +90,8 @@ all() ->
 init([]) ->
     ets:new(?TAB_SPI,  [named_table, public, set, {read_concurrency, true}]),
     ets:new(?TAB_IMSI, [named_table, public, set, {read_concurrency, true}]),
+    ets:new(?TAB_INIT, [named_table, public, set, {read_concurrency, true},
+                        {write_concurrency, true}]),
     {ok, #{}}.
 
 handle_call({register, SPI, Pid, IMSI}, _From, State) ->

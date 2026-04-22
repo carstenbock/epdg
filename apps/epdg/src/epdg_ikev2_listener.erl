@@ -127,14 +127,21 @@ handle_ikev2_packet(Data, FromIP, FromPort, _RecvPort) ->
                            [Reason, FromIP, FromPort])
     end.
 
-dispatch(_ISPI, 0, Header, Data, FromIP, FromPort) ->
-    %% RSPI=0 → new IKE SA
-    case epdg_ue_sup:start_ue_fsm(#{peer_ip => FromIP,
-                                     peer_port => FromPort}) of
+dispatch(ISPI, 0, Header, Data, FromIP, FromPort) ->
+    %% RSPI=0 → new IKE SA OR IKE_SA_INIT retransmit.
+    %% RFC 7296 §2.1: if we already have an FSM for (PeerIP, ISPI), route the
+    %% retransmit there instead of spawning a zombie duplicate.
+    case epdg_ue_registry:lookup_by_initiator(FromIP, ISPI) of
         {ok, Pid} ->
             epdg_ue_fsm:handle_ikev2(Pid, Header, Data);
-        {error, Reason} ->
-            logger:error("Failed to start UE FSM: ~p", [Reason])
+        error ->
+            case epdg_ue_sup:start_ue_fsm(#{peer_ip => FromIP,
+                                             peer_port => FromPort}) of
+                {ok, Pid} ->
+                    epdg_ue_fsm:handle_ikev2(Pid, Header, Data);
+                {error, Reason} ->
+                    logger:error("Failed to start UE FSM: ~p", [Reason])
+            end
     end;
 dispatch(_ISPI, RSPI, Header, Data, _FromIP, _FromPort) ->
     case epdg_ue_registry:lookup_by_spi(RSPI) of
