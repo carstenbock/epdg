@@ -53,9 +53,17 @@
     %% X.509 certificate for IKEv2 responder auth (TS 33.402 §7.2.1)
     cert_der         :: binary() | undefined,
     private_key      :: term() | undefined,
+    %% Stored IKE_SA_INIT request bytes (as received from the UE) for use
+    %% when verifying the UE's AUTH payload (RFC 7296 §2.15 "InitiatorSigned
+    %% Octets" = RealMessage1).
+    ike_sa_init_req  :: binary() | undefined,
     %% Stored IKE_SA_INIT response bytes for AUTH signature (RFC 7296 §2.15)
     %% and retransmission (RFC 7296 §2.1).
     ike_sa_init_resp :: binary() | undefined,
+    %% IDi payload body (IDType | reserved(3) | identity data) cached from
+    %% the first IKE_AUTH request so we can recompute prf(SK_pi, IDi')
+    %% when verifying the UE's MSK-AUTH after EAP-Success.
+    idi_body         :: binary() | undefined,
     %% SWm (Diameter) session tying this UE to the AAA server; allocated
     %% on the first EAP-Response/Identity from the UE and reused across
     %% every DER/DEA round until teardown.
@@ -71,7 +79,12 @@
     eap_msk          :: binary() | undefined,
     %% True once EAP-AKA' has completed successfully and we have sent
     %% EAP-Success to the UE; we then wait for the UE's final AUTH.
-    eap_done         :: boolean()
+    eap_done         :: boolean(),
+    %% S2b session metadata returned by the PGW, cached so FSM
+    %% terminate/3 can issue a Delete-Session-Request with the right
+    %% TEID + EBI.
+    gtpu_teid_local  :: non_neg_integer() | undefined,
+    gtpu_teid_pgw    :: non_neg_integer() | undefined
 }).
 
 %%====================================================================
@@ -125,8 +138,16 @@ terminate(_Reason, _State, #data{responder_spi = RSPI, imsi = IMSI,
         _ -> ok
     end,
     case PGW of
+        #{pgw_c_teid := CTEID, ebi := EBI} ->
+            catch epdg_gtpc_client:delete_session_request(
+                    #{pgw_c_teid => CTEID, ebi => EBI});
         #{pgw_teid := TEID} ->
             catch epdg_gtpc_client:delete_session_request(#{pgw_teid => TEID});
+        _ -> ok
+    end,
+    case PGW of
+        #{local_u_teid := LocalUTEID} ->
+            catch epdg_gtpu_forwarder:unregister_ue(LocalUTEID);
         _ -> ok
     end,
     catch epdg_ue_registry:unregister(RSPI),
@@ -150,7 +171,8 @@ idle(enter, _OldState, Data) ->
     {keep_state, Data, [{state_timeout, ?IKE_SA_INIT_TIMEOUT, timeout}]};
 
 idle(cast, {ikev2, #{exchange_type := ike_sa_init} = Header, RawData}, Data) ->
-    handle_ike_sa_init_request(Header, RawData, Data);
+    handle_ike_sa_init_request(Header, RawData,
+                               Data#data{ike_sa_init_req = RawData});
 
 idle(cast, {ikev2, _, _}, Data) ->
     {keep_state, Data};
@@ -208,6 +230,12 @@ ike_auth(cast, {ikev2, #{exchange_type := ike_auth} = Header, RawData}, Data) ->
 ike_auth(cast, disconnect, _Data) ->
     {stop, normal};
 
+%% The GTP-C client saw the PGW restart (Recovery IE change) or lost
+%% its Echo heartbeat — every ongoing session is invalid, so tear down
+%% cleanly and the UE will redial.
+ike_auth(cast, pgw_restart, _Data) -> {stop, {shutdown, pgw_restart}};
+ike_auth(cast, pgw_down,    _Data) -> {stop, {shutdown, pgw_unreachable}};
+
 ike_auth(state_timeout, timeout, #data{peer_ip = PeerIP, imsi = IMSI} = _Data) ->
     logger:warning("UE FSM ike_auth timeout (EAP exchange abandoned) "
                    "peer=~p IMSI=~p", [PeerIP, IMSI]),
@@ -235,6 +263,9 @@ established(cast, {ikev2, #{exchange_type := create_child_sa} = _Header, _RawDat
 
 established(cast, disconnect, _Data) ->
     {stop, normal};
+
+established(cast, pgw_restart, _Data) -> {stop, {shutdown, pgw_restart}};
+established(cast, pgw_down,    _Data) -> {stop, {shutdown, pgw_unreachable}};
 
 established(state_timeout, dpd, #data{peer_ip = _PeerIP} = Data) ->
     %% Dead Peer Detection: send empty INFORMATIONAL
@@ -529,7 +560,7 @@ handle_ike_auth_request(Header, RawData,
                         {ok, #{payloads := InnerPayloads}} ->
                             logger:info("IKE_AUTH decrypted: ~p inner payloads",
                                         [length(InnerPayloads)]),
-                            {IDiType, UeNai} = extract_idi(InnerPayloads),
+                            {IDiType, UeNai, IDiBody} = extract_idi(InnerPayloads),
                             IMSI = parse_imsi_from_nai(UeNai),
                             logger:info("IKE_AUTH IDi type=~p data=~p IMSI=~p",
                                         [IDiType, UeNai, IMSI]),
@@ -588,6 +619,7 @@ handle_ike_auth_request(Header, RawData,
                                         keys_params  = KeyParams,
                                         ike_keys     = Keys,
                                         idr_body     = IDrPayload,
+                                        idi_body     = IDiBody,
                                         imsi         = IMSI,
                                         ue_nai       = UeNai,
                                         eap_next_id  = (EapId + 1) rem 256
@@ -614,15 +646,17 @@ prerequisites_ok(#data{ike_sa_init_resp = undefined}) -> {error, no_ike_sa_init_
 prerequisites_ok(_) -> ok.
 
 %% Locate the IDi payload in the decrypted inner chain and normalise it to
-%% {IdType, IdData}. Returns {undefined, <<>>} if absent/unparseable.
+%% {IdType, IdData, IdBody} where IdBody = IDType(1) | reserved(3) |
+%% IdData, i.e. the full payload body (RFC 7296 §2.15 "IDi'"). Returns
+%% {undefined, <<>>, <<>>} if absent/unparseable.
 extract_idi(Payloads) ->
     case epdg_ikev2_codec:find_payload(idi, Payloads) of
         {ok, #{data := D}} ->
             case epdg_ikev2_codec:decode_id_payload(D) of
-                {ok, {T, Raw}} -> {T, Raw};
-                _              -> {undefined, <<>>}
+                {ok, {T, Raw}} -> {T, Raw, D};
+                _              -> {undefined, <<>>, <<>>}
             end;
-        _ -> {undefined, <<>>}
+        _ -> {undefined, <<>>, <<>>}
     end.
 
 %% Extract IMSI from a 3GPP permanent identity NAI of the form
@@ -732,7 +766,7 @@ dispatch_ike_auth_cont(MsgId, InFlags, InnerPayloads, ISPI, RSPI,
 %% response. Returns a gen_statem transition tuple.
 relay_eap_via_swm(MsgId, InFlags, EapBytes, ISPI, RSPI,
                   #data{imsi = IMSI, ue_nai = UeNai,
-                        peer_ip = PeerIP, peer_port = PeerPort,
+                        peer_ip = PeerIP, peer_port = _PeerPort,
                         swm_session_id = SessionId0,
                         swm_dest_host  = DestHost0} = Data) ->
     SessionId = case SessionId0 of
@@ -811,23 +845,415 @@ handle_dea(RC, Dea, MsgId, InFlags, ISPI, RSPI, Data) ->
     send_eap_to_ue(EapOut, MsgId, InFlags, ISPI, RSPI, Data),
     {stop, normal, Data}.
 
-%% Placeholder for the post-EAP final AUTH exchange. We log the UE's
-%% AUTH payload, verify it against MSK (when the helper lands in
-%% epdg_ikev2_crypto), and then send our responder AUTH plus the CP /
-%% SAr2 / TSi / TSr payloads. The child SA install (xfrm) follows in the
-%% next patch — for now we just keep the FSM alive so the UE doesn't
-%% see an RST-style IKE tear down while we wire the remainder.
-handle_post_eap_auth(MsgId, _InFlags, AuthRaw, _InnerPayloads,
-                     _ISPI, _RSPI, Data) ->
+%% Final IKE_AUTH message post-EAP-Success (TS 33.402 §7.2.2 steps
+%% 14-17): the UE sends its own AUTH over the MSK. We verify it,
+%% request an S2b PDN connection from the PGW, install the kernel
+%% ESP SAs for the negotiated child SA, then answer with
+%%   IDr | AUTH | CFG_REPLY | SAr2 | TSi | TSr
+%% and transition to `established`.
+handle_post_eap_auth(MsgId, InFlags, AuthRaw, InnerPayloads,
+                     ISPI, RSPI,
+                     #data{eap_msk = MSK,
+                           keys_params = KeyParams,
+                           ike_keys = Keys,
+                           nonce_r = NonceR, nonce_i = NonceI,
+                           ike_sa_init_req = IkeSaInitReqBytes,
+                           ike_sa_init_resp = IkeSaInitRespBytes,
+                           idi_body = IDiBody,
+                           idr_body = IDrBody,
+                           imsi = IMSI, ue_nai = UeNai,
+                           peer_ip = PeerIP, peer_port = PeerPort,
+                           apn = Apn0} = Data0) ->
     logger:notice("IKE_AUTH(cont) post-EAP-Success AUTH received "
-                  "(~B bytes); child-SA setup pending in next patch",
-                  [byte_size(AuthRaw)]),
+                  "(~B bytes) IMSI=~p", [byte_size(AuthRaw), IMSI]),
     % #region agent log
     write_fsm_log(<<"epdg_ue_fsm:handle_post_eap_auth">>, <<"B2">>,
                   #{auth_len => byte_size(AuthRaw),
-                    msg_id => MsgId}),
+                    msg_id => MsgId,
+                    imsi   => IMSI}),
     % #endregion
-    {keep_state, Data}.
+
+    #{prf := PRF} = KeyParams,
+    {_AuthMethod, PeerAuth} = case epdg_ikev2_codec:decode_auth_payload(AuthRaw) of
+        {ok, Pair} -> Pair;
+        _ -> {0, <<>>}
+    end,
+
+    case epdg_ikev2_crypto:verify_initiator_psk_auth(
+           PRF, MSK, IkeSaInitReqBytes, NonceR,
+           maps:get(sk_pi, Keys), IDiBody, PeerAuth) of
+        false ->
+            logger:warning("IKE_AUTH AUTH verify failed IMSI=~p "
+                           "auth_len=~B", [IMSI, byte_size(PeerAuth)]),
+            send_ike_notify_and_stop(MsgId, InFlags, ISPI, RSPI,
+                                     24, Data0);  %% AUTHENTICATION_FAILED
+        true ->
+            logger:info("IKE_AUTH AUTH verified (MSK-based, RFC 5998)"),
+            Apn = case Apn0 of undefined -> default_apn(); A -> A end,
+            proceed_with_s2b(MsgId, InFlags, ISPI, RSPI,
+                              InnerPayloads, UeNai, IMSI, IDrBody,
+                              NonceI, NonceR,
+                              IkeSaInitRespBytes, Apn,
+                              PeerIP, PeerPort, Data0#data{apn = Apn})
+    end.
+
+default_apn() ->
+    list_to_binary(epdg_config:get(default_apn, "ims")).
+
+%%--------------------------------------------------------------------
+%% Request an S2b PDN connection, set up the child SA, then send the
+%% final IKE_AUTH response.
+%%--------------------------------------------------------------------
+
+proceed_with_s2b(MsgId, InFlags, ISPI, RSPI,
+                 InnerPayloads, _UeNai, IMSI, IDrBody,
+                 NonceI, NonceR,
+                 IkeSaInitRespBytes, Apn,
+                 PeerIP, PeerPort,
+                 #data{keys_params = KeyParams, ike_keys = Keys,
+                       eap_msk = MSK} = Data0) ->
+    LocalCTeid = new_teid(),
+    LocalUTeid = new_teid(),
+    case epdg_gtpc_client:create_session_request(#{
+            imsi         => IMSI,
+            apn          => Apn,
+            rat_type     => 3,           %% WLAN
+            pdn_type     => 1,           %% IPv4
+            ebi          => 5,
+            local_c_teid => LocalCTeid,
+            local_u_teid => LocalUTeid
+        }) of
+        {ok, #{cause := Cause} = Resp} when Cause =:= 16 orelse Cause =:= undefined ->
+            finalize_ike_auth(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
+                               IDrBody, NonceI, NonceR,
+                               IkeSaInitRespBytes, MSK,
+                               KeyParams, Keys,
+                               LocalCTeid, LocalUTeid, Resp,
+                               PeerIP, PeerPort, Data0);
+        {ok, #{cause := Cause}} ->
+            logger:warning("S2b Create-Session rejected cause=~B IMSI=~p",
+                           [Cause, IMSI]),
+            send_ike_notify_and_stop(MsgId, InFlags, ISPI, RSPI,
+                                     37, Data0); %% NO_ADDITIONAL_SAS
+        {error, Reason} ->
+            logger:warning("S2b Create-Session failed: ~p IMSI=~p",
+                           [Reason, IMSI]),
+            send_ike_notify_and_stop(MsgId, InFlags, ISPI, RSPI,
+                                     37, Data0)
+    end.
+
+finalize_ike_auth(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
+                   IDrBody, NonceI, NonceR,
+                   IkeSaInitRespBytes, MSK, KeyParams, Keys,
+                   LocalCTeid, LocalUTeid, GtpcResp,
+                   PeerIP, PeerPort, Data0) ->
+    #{prf := PRF} = KeyParams,
+
+    %% Pick child-SA proposal from SAi2 offered by the UE
+    ChildSuite = case epdg_ikev2_codec:find_payload(sa, InnerPayloads) of
+        {ok, #{data := SaiBin}} ->
+            case epdg_ikev2_codec:decode_child_sa_payload(SaiBin) of
+                {ok, S} -> S;
+                _       -> default_child_suite()
+            end;
+        _ -> default_child_suite()
+    end,
+
+    EncKeyLen   = epdg_ikev2_codec:child_enc_key_len(maps:get(encr, ChildSuite)),
+    IntegKeyLen = epdg_ikev2_codec:child_integ_key_len(maps:get(integ, ChildSuite, none)),
+    Needed      = 2 * (EncKeyLen + IntegKeyLen),
+
+    %% RFC 7296 §2.17: KEYMAT = prf+(SK_d, Ni|Nr). Split into:
+    %%   SK_ei_child | SK_ai_child | SK_er_child | SK_ar_child
+    #{key_material := KeyMat} =
+        epdg_ikev2_crypto:derive_child_keys(PRF, maps:get(sk_d, Keys),
+                                             NonceI, NonceR, Needed),
+    {SkEiChild, SkAiChild, SkErChild, SkArChild} =
+        split_child_keymat(KeyMat, EncKeyLen, IntegKeyLen),
+
+    %% Allocate our (responder) ESP SPI.
+    <<ResponderSPIInt:32>> = crypto:strong_rand_bytes(4),
+    ResponderSPI = <<ResponderSPIInt:32>>,
+
+    %% Peer SPI (initiator) from the UE's SA payload
+    PeerSPI = maps:get(peer_spi, ChildSuite, <<0:32>>),
+
+    %% CP/TS from UE
+    {UeInnerIp, PdnDns, PdnPcscf, _CpAttrsIn} =
+        extract_pdn_attrs(GtpcResp),
+    {UeTsi, UeTsr} = extract_ts_in(InnerPayloads),
+
+    install_child_sas(PeerIP, PeerPort, PeerSPI, ResponderSPI,
+                       ChildSuite,
+                       SkEiChild, SkAiChild, SkErChild, SkArChild,
+                       UeInnerIp),
+
+    %% Register this UE's bearer with the GTP-U forwarder so the
+    %% inbound GTP-U packets from PGW-U can be demuxed to the right
+    %% TUN device.
+    {PgwUIp, PgwUTeid} = pgw_u_from_resp(GtpcResp),
+    catch epdg_gtpu_forwarder:register_ue(#{
+        pgw_u_teid   => PgwUTeid,
+        pgw_u_ip     => PgwUIp,
+        ue_inner_ip  => UeInnerIp,
+        imsi         => Data0#data.imsi,
+        owner_pid    => self(),
+        local_teid_hint => LocalUTeid}),
+
+    %% Responder AUTH (MSK-based, method 2 = Shared Key MIC)
+    AuthSig = epdg_ikev2_crypto:build_responder_psk_auth(
+                PRF, MSK, IkeSaInitRespBytes, NonceI,
+                maps:get(sk_pr, Keys), IDrBody),
+    AuthBin = epdg_ikev2_codec:encode_auth_payload(2, AuthSig),
+
+    %% CFG_REPLY from the PGW's PAA + PCO
+    CpReplyBin = build_cfg_reply(UeInnerIp, PdnDns, PdnPcscf),
+
+    %% SAr2: advertise chosen child suite with our SPI
+    ChildRespSuite = ChildSuite#{responder_spi => ResponderSPI},
+    SaBin = epdg_ikev2_codec:encode_child_sa_response(ChildRespSuite),
+    %% TSi/TSr mirror what the UE proposed.
+    TsiBin = encode_ts_or_default(UeTsi),
+    TsrBin = encode_ts_or_default(UeTsr),
+
+    %% IDrBody is already the RFC 7296 §3.5 ID payload body (IDType |
+    %% reserved | IDdata) we encoded in the first IKE_AUTH response;
+    %% encode_payloads_chain/1 re-wraps it with the generic 4-byte
+    %% payload header on its way out.
+    InnerChain = [
+        {idr,  IDrBody},
+        {auth, AuthBin},
+        {cp,   CpReplyBin},
+        {sa,   SaBin},
+        {tsi,  TsiBin},
+        {tsr,  TsrBin}
+    ],
+
+    RespFlags = (InFlags band (bnot 16#08)) bor 16#20,
+    Hdr = #{initiator_spi     => ISPI,
+            responder_spi     => RSPI,
+            exchange_type_raw => 35,
+            flags             => RespFlags,
+            message_id        => MsgId},
+
+    case epdg_ikev2_crypto:encode_encrypted_message(
+           KeyParams, Keys, responder, Hdr, InnerChain) of
+        {ok, RespBytes} ->
+            catch epdg_ikev2_listener:send(PeerIP, PeerPort, RespBytes),
+            logger:info("IKE_AUTH final response sent (~B bytes) IMSI=~p "
+                        "ue_inner_ip=~p pcscf=~p dns=~p",
+                        [byte_size(RespBytes), Data0#data.imsi,
+                         UeInnerIp, PdnPcscf, PdnDns]),
+            epdg_metrics:inc(ike_auth_success_total),
+            Data1 = Data0#data{
+                child_sa = #{spi_in  => ResponderSPIInt,
+                             spi_out => binary_to_int(PeerSPI),
+                             suite   => ChildRespSuite},
+                pgw_session = GtpcResp#{ue_inner_ip => UeInnerIp,
+                                          local_c_teid => LocalCTeid,
+                                          local_u_teid => LocalUTeid},
+                ue_inner_ip = UeInnerIp,
+                gtpu_teid_local = LocalUTeid,
+                gtpu_teid_pgw = PgwUTeid
+            },
+            {next_state, established, Data1};
+        {error, EErr} ->
+            logger:warning("IKE_AUTH final response encrypt failed: ~p",
+                           [EErr]),
+            epdg_metrics:inc(ike_auth_failure_total),
+            {stop, normal, Data0}
+    end.
+
+%% Default transforms fallback if the UE didn't send an SAi2 we can
+%% understand — stick to the same IKE suite we already agreed on.
+default_child_suite() ->
+    #{encr   => #{type => encr, type_raw => 1, id => 12,
+                  attrs => #{key_length => 128}},
+      integ  => #{type => integ, type_raw => 3, id => 12, attrs => #{}},
+      esn    => #{type => esn, type_raw => 5, id => 0, attrs => #{}},
+      proposal_number => 1,
+      protocol_id => 3,
+      peer_spi    => <<0:32>>}.
+
+split_child_keymat(Mat, E, I) ->
+    <<SKei:E/binary, Rest1/binary>> = Mat,
+    <<SKai:I/binary, Rest2/binary>> = Rest1,
+    <<SKer:E/binary, Rest3/binary>> = Rest2,
+    <<SKar:I/binary, _/binary>> = Rest3,
+    {SKei, SKai, SKer, SKar}.
+
+%% Pull UE inner IP / DNS / P-CSCF out of the GTP-C Create-Session-Resp
+%% map that our codec returns.
+extract_pdn_attrs(#{paa := #{ipv4 := Ip4}, pco := Pco}) ->
+    {Ip4, maps:get(dns_v4, Pco, []), maps:get(pcscf_v4, Pco, []), Pco};
+extract_pdn_attrs(#{paa := #{ipv4 := Ip4}}) ->
+    {Ip4, [], [], #{}};
+extract_pdn_attrs(_) ->
+    {{0,0,0,0}, [], [], #{}}.
+
+pgw_u_from_resp(#{pgw_u_fteid := #{ip := IP, teid := T}}) -> {IP, T};
+pgw_u_from_resp(_) -> {{0,0,0,0}, 0}.
+
+extract_ts_in(InnerPayloads) ->
+    Tsi = case epdg_ikev2_codec:find_payload(tsi, InnerPayloads) of
+        {ok, #{data := D1}} ->
+            case epdg_ikev2_codec:decode_ts_payload(D1) of
+                {ok, Ts} -> Ts;
+                _ -> []
+            end;
+        _ -> []
+    end,
+    Tsr = case epdg_ikev2_codec:find_payload(tsr, InnerPayloads) of
+        {ok, #{data := D2}} ->
+            case epdg_ikev2_codec:decode_ts_payload(D2) of
+                {ok, Ts2} -> Ts2;
+                _ -> []
+            end;
+        _ -> []
+    end,
+    {Tsi, Tsr}.
+
+encode_ts_or_default([]) ->
+    %% Fallback: 0.0.0.0 - 255.255.255.255 full traffic selector
+    epdg_ikev2_codec:encode_ts_payload([
+        #{ts_type => ipv4_addr_range, ip_protocol => 0,
+          start_port => 0, end_port => 65535,
+          start_addr => {0,0,0,0}, end_addr => {255,255,255,255}}]);
+encode_ts_or_default(List) when is_list(List), List /= [] ->
+    epdg_ikev2_codec:encode_ts_payload(List).
+
+%% Build a CFG_REPLY with the PDN attributes returned by the PGW.
+build_cfg_reply(Ip4, DnsList, PcscfList) ->
+    {A,B,C,D} = Ip4,
+    Base = [{internal_ip4_address, <<A:8,B:8,C:8,D:8>>},
+            {internal_ip4_netmask, <<255:8,255:8,255:8,255:8>>}],
+    Dns = [{internal_ip4_dns, encode_ip4(X)} || X <- DnsList],
+    Pcf = [{p_cscf_ip4_address, encode_ip4(X)} || X <- PcscfList],
+    epdg_ikev2_codec:encode_cp_payload(2, Base ++ Dns ++ Pcf).
+
+encode_ip4({A,B,C,D}) -> <<A:8,B:8,C:8,D:8>>.
+
+%%--------------------------------------------------------------------
+%% Install IPsec SAs + policies for the freshly-negotiated Child SA.
+%% Error handling is best-effort: if xfrm fails the UE won't be able
+%% to send/receive traffic but IKE signalling still stays up so the
+%% operator sees the failure via logs/metrics.
+%%--------------------------------------------------------------------
+
+install_child_sas({U_A, U_B, U_C, U_D} = UeOuter, PeerPort, PeerSPI, RespSPI,
+                   Suite,
+                   SkEiChild, SkAiChild, SkErChild, SkArChild,
+                   UeInnerIp) ->
+    LocalOuter = local_outer_ip(),
+    SpiInInt   = binary_to_int(RespSPI),
+    SpiOutInt  = binary_to_int(PeerSPI),
+    EncAlgIn   = child_enc_alg(maps:get(encr, Suite)),
+    IntegAlgIn = child_integ_alg(maps:get(integ, Suite, none)),
+
+    %% Inbound SA: UE → ePDG (SPI = responder SPI we picked)
+    InboundParams0 = #{spi => SpiInInt,
+                        src_ip => UeOuter,
+                        dst_ip => LocalOuter,
+                        enc_alg => EncAlgIn,
+                        enc_key => SkEiChild,
+                        auth_alg => IntegAlgIn,
+                        auth_key => SkAiChild},
+    InboundParams = maybe_nat_t(InboundParams0, UeOuter, PeerPort),
+    catch epdg_xfrm:create_sa(InboundParams),
+
+    %% Outbound SA: ePDG → UE (SPI = UE's initiator SPI)
+    OutboundParams0 = #{spi => SpiOutInt,
+                         src_ip => LocalOuter,
+                         dst_ip => UeOuter,
+                         enc_alg => EncAlgIn,
+                         enc_key => SkErChild,
+                         auth_alg => IntegAlgIn,
+                         auth_key => SkArChild},
+    OutboundParams = maybe_nat_t(OutboundParams0, UeOuter, PeerPort),
+    catch epdg_xfrm:create_sa(OutboundParams),
+
+    UeCidr  = ip4_cidr(UeInnerIp, 32),
+    AnyCidr = "0.0.0.0/0",
+
+    catch epdg_xfrm:create_policy(#{src => UeCidr, dst => AnyCidr,
+                                      direction => in,
+                                      tmpl_src => UeOuter,
+                                      tmpl_dst => LocalOuter}),
+    catch epdg_xfrm:create_policy(#{src => AnyCidr, dst => UeCidr,
+                                      direction => out,
+                                      tmpl_src => LocalOuter,
+                                      tmpl_dst => UeOuter}),
+    _ = {U_A, U_B, U_C, U_D},  %% silence unused
+    ok.
+
+maybe_nat_t(Params, PeerOuter, PeerPort) ->
+    %% We infer NAT-T from the peer port: if the UE is sending from
+    %% UDP/4500 the IKE_SA_INIT NAT_DETECTION exchange asserted that
+    %% one end is behind a NAT, so turn on espinudp. 500 → plain ESP.
+    case PeerPort of
+        4500 ->
+            Params#{nat_t => true,
+                    peer_outer_ip => PeerOuter,
+                    peer_udp_port => PeerPort,
+                    local_udp_port => 4500};
+        _ -> Params
+    end.
+
+local_outer_ip() ->
+    %% Best-effort: parse configured outer IP or fall back to 0.0.0.0.
+    case epdg_config:get(ike_bind_addr, "0.0.0.0") of
+        Str when is_list(Str) ->
+            case inet:parse_address(Str) of
+                {ok, IP} -> IP;
+                _ -> {0,0,0,0}
+            end;
+        _ -> {0,0,0,0}
+    end.
+
+child_enc_alg(#{id := 20, attrs := #{key_length := 256}}) -> aes_gcm_256;
+child_enc_alg(#{id := 20, attrs := #{key_length := 128}}) -> aes_gcm_128;
+child_enc_alg(#{id := 12, attrs := #{key_length := 256}}) -> aes_cbc_256;
+child_enc_alg(#{id := 12, attrs := #{key_length := 128}}) -> aes_cbc_128;
+child_enc_alg(_) -> aes_cbc_128.
+
+child_integ_alg(none)          -> none;
+child_integ_alg(#{id := 12})   -> hmac_sha256;
+child_integ_alg(#{id := 13})   -> hmac_sha384;
+child_integ_alg(#{id := 14})   -> hmac_sha512;
+child_integ_alg(_)             -> hmac_sha256.
+
+ip4_cidr({A,B,C,D}, Prefix) ->
+    lists:flatten(io_lib:format("~B.~B.~B.~B/~B", [A,B,C,D,Prefix])).
+
+binary_to_int(<<N:32>>) -> N;
+binary_to_int(<<N:64>>) -> N;
+binary_to_int(B) when is_binary(B) ->
+    Sz = byte_size(B) * 8,
+    <<N:Sz>> = B, N;
+binary_to_int(N) when is_integer(N) -> N.
+
+new_teid() ->
+    <<N:32>> = crypto:strong_rand_bytes(4),
+    N band 16#FFFFFFFF.
+
+%% Send an IKE_AUTH response carrying a Notify and tear down cleanly.
+send_ike_notify_and_stop(MsgId, InFlags, ISPI, RSPI, NotifyType,
+                          #data{keys_params = KeyParams, ike_keys = Keys,
+                                peer_ip = PeerIP, peer_port = PeerPort} = Data) ->
+    NotifyBin = epdg_ikev2_codec:encode_notify_payload(0, NotifyType, <<>>, <<>>),
+    RespFlags = (InFlags band (bnot 16#08)) bor 16#20,
+    Hdr = #{initiator_spi     => ISPI,
+            responder_spi     => RSPI,
+            exchange_type_raw => 35,
+            flags             => RespFlags,
+            message_id        => MsgId},
+    case epdg_ikev2_crypto:encode_encrypted_message(
+           KeyParams, Keys, responder, Hdr, [{notify, NotifyBin}]) of
+        {ok, RespBytes} ->
+            catch epdg_ikev2_listener:send(PeerIP, PeerPort, RespBytes);
+        _ -> ok
+    end,
+    {stop, normal, Data}.
 
 send_eap_to_ue(EapOut, MsgId, InFlags, ISPI, RSPI,
                #data{keys_params = KeyParams, ike_keys = Keys,

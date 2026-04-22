@@ -102,18 +102,39 @@ do_create_sa(#{spi := SPI, src_ip := Src, dst_ip := Dst,
                enc_alg := EncAlg, enc_key := EncKey} = Params,
              #state{offload_mode = Offload, iface = Iface}) ->
     AuthPart = case maps:find(auth_alg, Params) of
+        {ok, none} -> "";
         {ok, AuthAlg} ->
-            AuthKey = maps:get(auth_key, Params),
+            AuthKey = maps:get(auth_key, Params, <<>>),
             io_lib:format(" auth ~s 0x~s",
                           [auth_alg_str(AuthAlg), bin2hex(AuthKey)]);
         error -> ""
     end,
 
+    %% NAT-T encapsulation (RFC 3948): when the peer is behind a NAT
+    %% (detected during IKE_SA_INIT via NAT_DETECTION_*_IP payloads)
+    %% ESP packets ride inside UDP/4500. Pass nat_t=true with the UE's
+    %% outer UDP source port (the NAT-mapped port) + local UDP port
+    %% (4500 unless customised).
+    EncapPart = case maps:get(nat_t, Params, false) of
+        true ->
+            %% Direction of the SA determines which port is ours and
+            %% which is the UE's. We always write the "UE side" port
+            %% first — that matches `ip xfrm` expectations: the first
+            %% port is the peer port (sport on outbound, dport on
+            %% inbound) and the second is ours.
+            LocalPort = maps:get(local_udp_port, Params, 4500),
+            PeerPort  = maps:get(peer_udp_port,  Params, 4500),
+            PeerOuter = maps:get(peer_outer_ip,  Params, Src),
+            io_lib:format(" encap espinudp ~B ~B ~s",
+                          [PeerPort, LocalPort, ip_str(PeerOuter)]);
+        false -> ""
+    end,
+
     Cmd = io_lib:format(
         "ip xfrm state add src ~s dst ~s proto esp spi 0x~.16B "
-        "enc ~s 0x~s~s mode tunnel",
+        "enc ~s 0x~s~s~s mode tunnel",
         [ip_str(Src), ip_str(Dst), SPI,
-         enc_alg_str(EncAlg), bin2hex(EncKey), AuthPart]),
+         enc_alg_str(EncAlg), bin2hex(EncKey), AuthPart, EncapPart]),
 
     OffloadPart = case Offload of
         inline -> io_lib:format(" offload packet dev ~s", [Iface]);
@@ -121,7 +142,13 @@ do_create_sa(#{spi := SPI, src_ip := Src, dst_ip := Dst,
         none   -> ""
     end,
 
-    run_cmd(lists:flatten([Cmd, OffloadPart]));
+    case run_cmd(lists:flatten([Cmd, OffloadPart])) of
+        ok ->
+            epdg_metrics:inc(xfrm_sa_created_total),
+            epdg_metrics:gauge_inc(xfrm_sa_active),
+            ok;
+        E -> E
+    end;
 
 do_create_sa(_, _) ->
     {error, invalid_params}.
@@ -130,10 +157,16 @@ do_delete_sa(#{spi := SPI, src_ip := Src, dst_ip := Dst}) ->
     Cmd = io_lib:format(
         "ip xfrm state delete src ~s dst ~s proto esp spi 0x~.16B",
         [ip_str(Src), ip_str(Dst), SPI]),
-    run_cmd(lists:flatten(Cmd));
+    _ = run_cmd(lists:flatten(Cmd)),
+    epdg_metrics:inc(xfrm_sa_deleted_total),
+    epdg_metrics:gauge_dec(xfrm_sa_active),
+    ok;
 do_delete_sa(#{spi := SPI}) ->
     Cmd = io_lib:format("ip xfrm state deleteall spi 0x~.16B 2>/dev/null", [SPI]),
-    run_cmd(lists:flatten(Cmd));
+    _ = run_cmd(lists:flatten(Cmd)),
+    epdg_metrics:inc(xfrm_sa_deleted_total),
+    epdg_metrics:gauge_dec(xfrm_sa_active),
+    ok;
 do_delete_sa(_) ->
     {error, invalid_params}.
 

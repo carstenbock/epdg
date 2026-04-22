@@ -11,7 +11,7 @@
          register/3, unregister/1,
          register_initiator/3, lookup_by_initiator/2, unregister_initiator/2,
          lookup_by_spi/1, lookup_by_imsi/1,
-         count/0, all/0]).
+         count/0, all/0, broadcast/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
@@ -82,6 +82,21 @@ count() ->
 -spec all() -> [{non_neg_integer(), pid(), binary() | undefined}].
 all() ->
     ets:tab2list(?TAB_SPI).
+
+%% Cast a message to every live UE FSM. Used by infrastructure services
+%% (e.g. epdg_gtpc_client on pgw_restart / peer_down) to trigger an
+%% orderly tunnel teardown across every session.
+-spec broadcast(term()) -> ok.
+broadcast(Msg) ->
+    lists:foreach(
+      fun({_SPI, Pid, _IMSI}) when is_pid(Pid) ->
+              case is_process_alive(Pid) of
+                  true  -> gen_statem:cast(Pid, Msg);
+                  false -> ok
+              end;
+         (_) -> ok
+      end, ets:tab2list(?TAB_SPI)),
+    ok.
 
 %%====================================================================
 %% gen_server callbacks

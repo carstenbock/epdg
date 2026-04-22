@@ -32,11 +32,27 @@ init() ->
     set_from_env("EPDG_IPSEC_OFFLOAD", ipsec_offload, "auto"),
     set_from_env("EPDG_IPSEC_IFACE", ipsec_iface, "eth0"),
 
-    %% GTP-C S2b toward PGW-C/SMF
+    %% GTP-C S2b toward PGW-C/SMF.
+    %%
+    %% `PGW_FQDN` is the preferred setting: the GTP-C client re-resolves
+    %% the FQDN on TTL expiry, on send failure, and after Echo timeouts,
+    %% so the ePDG survives PGW pod restarts / rescheduling in K8s without
+    %% config changes. `PGW_ADDR` is kept as a fallback for bare-metal /
+    %% single-node deployments but logs a warning at startup.
+    set_from_env("PGW_FQDN", pgw_fqdn, ""),
     set_from_env("PGW_ADDR", pgw_addr, "127.0.0.1"),
     set_from_env_int("PGW_PORT", pgw_port, 2123),
     set_from_env("EPDG_GTPC_BIND_ADDR", gtpc_bind_addr, "0.0.0.0"),
     set_from_env_int("EPDG_GTPC_PORT", gtpc_port, 2123),
+    %% GTP-C Echo heartbeat & reconnect tunables (TS 29.274 §7.1)
+    set_from_env_int("EPDG_GTPC_ECHO_INTERVAL_SEC", gtpc_echo_interval_sec, 60),
+    set_from_env_int("EPDG_GTPC_ECHO_TIMEOUT_SEC", gtpc_echo_timeout_sec, 3),
+    set_from_env_int("EPDG_GTPC_ECHO_MAX_MISSES", gtpc_echo_max_misses, 3),
+    set_from_env_int("EPDG_GTPC_BACKOFF_MAX_SEC", gtpc_backoff_max_sec, 30),
+    set_from_env_int("EPDG_GTPC_MAX_DOWN_SEC", gtpc_max_down_sec, 30),
+    set_from_env_int("EPDG_GTPC_PENDING_LIMIT", gtpc_pending_limit, 16),
+    set_from_env_int("EPDG_DNS_MIN_TTL_SEC", dns_min_ttl_sec, 5),
+    set_from_env_int("EPDG_DNS_MAX_TTL_SEC", dns_max_ttl_sec, 60),
 
     %% Diameter SWm (toward AAA Server via DRA)
     %% DRA_HOSTS takes precedence (comma-separated); falls back to DRA_HOST

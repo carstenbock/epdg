@@ -16,7 +16,11 @@
          encode_encrypted_message/5, decode_encrypted_message/4,
          derive_aka_prime_keys/4,
          load_certificate/1, load_private_key/1,
-         sign_auth_data/5, auth_method/1]).
+         sign_auth_data/5, auth_method/1,
+         build_psk_auth/5,
+         build_initiator_psk_auth/6,
+         build_responder_psk_auth/6,
+         verify_initiator_psk_auth/7]).
 
 -define(NONCE_LEN, 32).
 
@@ -511,6 +515,75 @@ auth_method(#'ECPrivateKey'{parameters = {namedCurve, Curve}})
   when Curve =:= ?'secp384r1' -> 10;      %% ECDSA with SHA-384 on P-384
 auth_method(#'ECPrivateKey'{}) -> 9;       %% default ECDSA
 auth_method(_) -> 1.
+
+%%====================================================================
+%% Shared-secret MIC AUTH (RFC 7296 §2.15) / EAP-MSK AUTH (RFC 5998 §2.1)
+%%
+%% AUTH = prf(prf(SharedSecret, "Key Pad for IKEv2"), SignedOctets)
+%%
+%% For EAP methods that export an MSK, SharedSecret is the MSK (64 bytes
+%% for EAP-AKA/AKA'); for pre-shared-key auth it is the PSK.
+%%
+%% SignedOctets per §2.15 depend on direction:
+%%   Initiator: IKE_SA_INIT_request_bytes | NonceR | prf(SK_pi, IDi')
+%%   Responder: IKE_SA_INIT_response_bytes | NonceI | prf(SK_pr, IDr')
+%%
+%% IDi'/IDr' are the ID payload body octets (IDType | 3-byte reserved |
+%% identity data) — i.e. the full decoded payload body excluding the
+%% 4-byte generic payload header.
+%%====================================================================
+
+-define(PSK_AUTH_KEY_PAD, <<"Key Pad for IKEv2">>).
+
+-spec build_psk_auth(atom(), binary(), binary(), binary(), binary()) -> binary().
+build_psk_auth(PRF, SharedSecret, RealMessage, NonceOther, MacOverId)
+  when is_binary(SharedSecret), is_binary(RealMessage),
+       is_binary(NonceOther), is_binary(MacOverId) ->
+    Inner = prf(PRF, SharedSecret, ?PSK_AUTH_KEY_PAD),
+    SignedOctets = <<RealMessage/binary, NonceOther/binary, MacOverId/binary>>,
+    prf(PRF, Inner, SignedOctets).
+
+%% Compute the AUTH payload that an IKEv2 initiator (UE) would produce,
+%% given the MSK, its original IKE_SA_INIT request bytes, the responder's
+%% nonce, and the SK_pi half of the IKE SA keys.
+-spec build_initiator_psk_auth(atom(), binary(), binary(), binary(),
+                                binary(), binary()) -> binary().
+build_initiator_psk_auth(PRF, MSK, IkeSaInitReqBytes, NonceR,
+                         SK_pi, IDiBody) ->
+    MacOverId = prf(PRF, SK_pi, IDiBody),
+    build_psk_auth(PRF, MSK, IkeSaInitReqBytes, NonceR, MacOverId).
+
+%% Compute the AUTH payload that the IKEv2 responder (ePDG) emits after
+%% EAP-Success, as defined by RFC 5998 §2.1 (MSK-based variant of §2.15).
+-spec build_responder_psk_auth(atom(), binary(), binary(), binary(),
+                                binary(), binary()) -> binary().
+build_responder_psk_auth(PRF, MSK, IkeSaInitRespBytes, NonceI,
+                         SK_pr, IDrBody) ->
+    MacOverId = prf(PRF, SK_pr, IDrBody),
+    build_psk_auth(PRF, MSK, IkeSaInitRespBytes, NonceI, MacOverId).
+
+%% Verify the UE's AUTH payload against the MSK we received from the AAA
+%% (TS 33.402 §7.2.2 step 14). Returns true on match, false otherwise.
+%% Uses a constant-time comparison so we don't leak timing info.
+-spec verify_initiator_psk_auth(atom(), binary(), binary(), binary(),
+                                 binary(), binary(), binary()) -> boolean().
+verify_initiator_psk_auth(PRF, MSK, IkeSaInitReqBytes, NonceR, SK_pi,
+                          IDiBody, ReceivedAuth)
+  when is_binary(ReceivedAuth) ->
+    Expected = build_initiator_psk_auth(PRF, MSK, IkeSaInitReqBytes,
+                                         NonceR, SK_pi, IDiBody),
+    constant_time_equal(Expected, ReceivedAuth).
+
+constant_time_equal(A, B) when is_binary(A), is_binary(B),
+                                byte_size(A) =:= byte_size(B) ->
+    constant_time_equal_bytes(A, B, 0);
+constant_time_equal(_, _) ->
+    false.
+
+constant_time_equal_bytes(<<>>, <<>>, Acc) ->
+    Acc =:= 0;
+constant_time_equal_bytes(<<A:8, RestA/binary>>, <<B:8, RestB/binary>>, Acc) ->
+    constant_time_equal_bytes(RestA, RestB, Acc bor (A bxor B)).
 
 %%====================================================================
 %% Internal

@@ -40,7 +40,18 @@ init() ->
         diameter_swm_peers,
         xfrm_sa_created_total,
         xfrm_sa_deleted_total,
-        xfrm_sa_active
+        xfrm_sa_active,
+        gtpc_echo_sent_total,
+        gtpc_echo_timeouts_total,
+        gtpc_dns_resolves_total,
+        gtpc_dns_resolve_errors_total,
+        gtpc_peer_down_total,
+        gtpc_peer_restarts_total,
+        gtpu_tx_bytes,
+        gtpu_rx_bytes,
+        gtpu_tx_pkts,
+        gtpu_rx_pkts,
+        gtpu_peer_down_total
     ]),
     ok.
 

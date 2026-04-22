@@ -22,12 +22,22 @@ init([]) ->
           start => {epdg_ue_registry, start_link, []},
           restart => permanent, shutdown => 5000, type => worker},
 
+        %% DNS cache MUST come up before the GTP-C client so the first
+        %% PGW-C resolution can hit the cache on subsequent sends.
+        #{id => epdg_dns_cache,
+          start => {epdg_dns_cache, start_link, []},
+          restart => permanent, shutdown => 5000, type => worker},
+
         #{id => epdg_xfrm,
           start => {epdg_xfrm, start_link, []},
           restart => permanent, shutdown => 5000, type => worker},
 
         #{id => epdg_gtpc_client,
           start => {epdg_gtpc_client, start_link, []},
+          restart => permanent, shutdown => 5000, type => worker},
+
+        #{id => epdg_gtpu_forwarder,
+          start => {epdg_gtpu_forwarder, start_link, []},
           restart => permanent, shutdown => 5000, type => worker},
 
         #{id => epdg_diameter_swm,
