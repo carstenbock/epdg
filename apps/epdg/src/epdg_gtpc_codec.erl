@@ -84,7 +84,7 @@ encode_create_session_request(#{seq_num := Seq,
         ie_opt(MSISDN /= <<>>,  encode_ie(?IE_MSISDN, encode_tbcd(MSISDN))),
         ie_opt(MEI /= <<>>,     encode_ie(?IE_MEI, encode_tbcd(MEI))),
         encode_ie(?IE_RAT_TYPE, <<RAT:8>>),
-        ie_opt(SN /= undefined,     encode_serving_network_ie(SN)),
+        encode_serving_network_ie(SN),
         encode_fteid_ie(0, ?IFACE_S2B_EPDG_GTPC, LocalCTeid, LIP),
         encode_ie(?IE_APN, encode_apn_labels(APN)),
         encode_ie(?IE_SELECTION_MODE, <<0:8>>),
@@ -93,9 +93,14 @@ encode_create_session_request(#{seq_num := Seq,
         encode_apn_ambr_ie(AmbrUl, AmbrDl),
         encode_pco_request_ie(),
         encode_bearer_context_req_ie(EBI, LocalUTeid, LIP),
-        ie_opt(UeTZ /= undefined,   encode_ie(?IE_UE_TIME_ZONE, UeTZ)),
-        ie_opt(Recovery /= undefined,
-               encode_ie(?IE_RECOVERY, <<Recovery:8>>))
+        case UeTZ of
+            undefined -> <<>>;
+            _         -> encode_ie(?IE_UE_TIME_ZONE, UeTZ)
+        end,
+        case Recovery of
+            undefined -> <<>>;
+            _         -> encode_ie(?IE_RECOVERY, <<Recovery:8>>)
+        end
     ]),
     encode_gtpv2_header(?CREATE_SESSION_REQ, 0, Seq,
                         iolist_to_binary(IEs)).
@@ -274,6 +279,10 @@ encode_apn_ambr_ie(UlKbps, DlKbps) ->
     encode_ie(?IE_AMBR, <<UlKbps:32, DlKbps:32>>).
 
 %% Serving Network — TS 29.274 §8.18 (TBCD MCC+MNC, 3 octets)
+%% Optional in a CSR on S2b; omit the IE when the caller has not supplied
+%% a PLMN. TS 29.274 §7.2.1 lists Serving Network as Conditional-Optional.
+encode_serving_network_ie(undefined) ->
+    <<>>;
 encode_serving_network_ie({MCC, MNC}) when is_binary(MCC), is_binary(MNC) ->
     encode_ie(?IE_SERVING_NET, encode_plmn(MCC, MNC));
 encode_serving_network_ie(Bin) when is_binary(Bin), byte_size(Bin) == 3 ->
@@ -294,9 +303,16 @@ c2n(C) when C >= $0, C =< $9 -> C - $0.
 
 %% Bearer Context IE (93) — grouped, contains EBI + Bearer QoS
 %% + ePDG S2b-U F-TEID (iface 31).
+%%
+%% F-TEID Instance inside the Bearer Context on a CSR is per
+%% TS 29.274 Table 7.2.1-3: for RAT=WLAN / S2b the "S2b-U ePDG F-TEID"
+%% row is Instance 5 (Open5GS SMF looks it up as
+%% `bearer_contexts_to_be_created[0].s2b_u_epdg_f_teid_5.presence`).
+%% Using any other instance makes the PGW-C reject the request with
+%% "No S2b ePDG GTP-U TEID" / cause=70 (Mandatory IE Missing).
 encode_bearer_context_req_ie(EBI, LocalUTeid, LIP) ->
     EBIBin  = encode_ie(?IE_EBI, <<0:4, EBI:4>>),
-    FTeid   = encode_fteid_ie(2, ?IFACE_S2B_EPDG_GTPU, LocalUTeid, LIP),
+    FTeid   = encode_fteid_ie(5, ?IFACE_S2B_EPDG_GTPU, LocalUTeid, LIP),
     %% TS 29.274 §8.15 Bearer QoS: PCI(1)|PL(4)|PVI(1) | Label(8) |
     %% MBR UL(40) | MBR DL(40) | GBR UL(40) | GBR DL(40)
     QoS = <<0:1, 15:4, 0:1, 0:2,  %% reserved bits around ARP

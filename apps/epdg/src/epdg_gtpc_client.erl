@@ -264,7 +264,16 @@ send_create_session(Params, From,
     MSISDN   = maps:get(msisdn,  Params, <<>>),
     MEI      = maps:get(mei,     Params, <<>>),
     PdnType  = maps:get(pdn_type,Params, 1),
-    SN       = maps:get(serving_network, Params, undefined),
+    %% Serving Network IE is Conditional on S2b CSR (TS 29.274 §7.2.1,
+    %% §8.18) and Open5GS SMF enforces its presence — data != NULL,
+    %% len == OGS_PLMN_ID_LEN (3 bytes). Default to the ePDG's own PLMN
+    %% from the MCC/MNC env vars so the IE is always emitted even when
+    %% the caller (e.g. `epdg_ue_fsm:proceed_with_s2b/15`) does not
+    %% supply one.
+    SN       = case maps:get(serving_network, Params, undefined) of
+                   undefined -> default_serving_network();
+                   Other     -> Other
+               end,
     AmbrUl   = maps:get(ambr_ul_kbps, Params, 500000),
     AmbrDl   = maps:get(ambr_dl_kbps, Params, 1000000),
     EBI      = maps:get(ebi, Params, 5),
@@ -290,6 +299,18 @@ send_create_session(Params, From,
     }),
 
     deliver_and_pend(Msg, create_session, Params, Seq, Epoch, From, State).
+
+%% Serving Network default: the ePDG's own PLMN from env/config
+%% (`MCC` / `MNC` in `epdg_config:init/0`). Encoded per TS 24.008
+%% §10.5.1.3 (TBCD MCC+MNC, 3 octets) by `epdg_gtpc_codec`.
+default_serving_network() ->
+    MCC = to_binary(epdg_config:get(mcc, "001")),
+    MNC = to_binary(epdg_config:get(mnc, "01")),
+    {MCC, MNC}.
+
+to_binary(B) when is_binary(B) -> B;
+to_binary(L) when is_list(L)   -> list_to_binary(L);
+to_binary(A) when is_atom(A)   -> atom_to_binary(A, utf8).
 
 %%====================================================================
 %% Delete Session
