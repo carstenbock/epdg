@@ -56,6 +56,9 @@
     by_teid    :: #{non_neg_integer() => #ue_ent{}},
     %% pid() -> local_teid for cleanup on owner DOWN
     by_owner   :: #{pid() => non_neg_integer()},
+    %% port() -> local_teid so we can route TUN-read packets to their
+    %% bearer without scanning by_teid on the hot path.
+    by_port    :: #{port() => non_neg_integer()},
     next_teid  :: non_neg_integer(),
     last_rx_ts :: integer()
 }).
@@ -115,6 +118,7 @@ init([]) ->
                         bind_port = Port,
                         by_teid = #{},
                         by_owner = #{},
+                        by_port = #{},
                         next_teid = 16#1000,
                         last_rx_ts = erlang:system_time(second)}};
         {error, eaddrinuse} ->
@@ -124,14 +128,14 @@ init([]) ->
                            "forwarder disabled", [BindIp, Port]),
             {ok, #state{socket = undefined, bind_ip = BindIp,
                         bind_port = Port, by_teid = #{}, by_owner = #{},
-                        next_teid = 16#1000,
+                        by_port = #{}, next_teid = 16#1000,
                         last_rx_ts = erlang:system_time(second)}};
         {error, Reason} ->
             logger:warning("GTP-U: bind ~p:~p failed: ~p; forwarder disabled",
                            [BindIp, Port, Reason]),
             {ok, #state{socket = undefined, bind_ip = BindIp,
                         bind_port = Port, by_teid = #{}, by_owner = #{},
-                        next_teid = 16#1000,
+                        by_port = #{}, next_teid = 16#1000,
                         last_rx_ts = erlang:system_time(second)}}
     end.
 
@@ -147,11 +151,9 @@ handle_cast({send, Teid, Pkt}, State) ->
     {noreply, do_send_inner(Teid, Pkt, State)};
 handle_cast({pgw_restart, _}, State) ->
     logger:warning("GTP-U: pgw_restart received — flushing all TEID registrations"),
-    NewByTeid = maps:fold(fun(_, Ent, Acc) ->
-        close_tun(Ent#ue_ent.tun_port),
-        Acc
-    end, #{}, State#state.by_teid),
-    {noreply, State#state{by_teid = NewByTeid, by_owner = #{}}};
+    maps:fold(fun(_, Ent, _) -> close_tun_ent(Ent), ok end,
+              ok, State#state.by_teid),
+    {noreply, State#state{by_teid = #{}, by_owner = #{}, by_port = #{}}};
 handle_cast(_Msg, State) -> {noreply, State}.
 
 handle_info({udp, _Sock, _FromIP, _FromPort, Packet},
@@ -172,6 +174,24 @@ handle_info({udp, _Sock, _FromIP, _FromPort, Packet},
     end;
 handle_info({tun_packet, LocalTeid, Pkt}, State) ->
     {noreply, do_send_inner(LocalTeid, Pkt, State)};
+%% Packet read from a per-UE TUN by the C port helper — forward uplink.
+handle_info({Port, {data, Pkt}}, #state{by_port = PMap} = State)
+  when is_port(Port) ->
+    case maps:find(Port, PMap) of
+        {ok, Teid} -> {noreply, do_send_inner(Teid, Pkt, State)};
+        error      -> {noreply, State}
+    end;
+%% Port helper exited — treat as TUN loss for the bearer.
+handle_info({'EXIT', Port, Reason}, #state{by_port = PMap} = State)
+  when is_port(Port) ->
+    case maps:find(Port, PMap) of
+        {ok, Teid} ->
+            logger:warning("GTP-U: tun port exited teid=~B reason=~p",
+                           [Teid, Reason]),
+            {noreply, do_unregister_teid(Teid, State)};
+        error ->
+            {noreply, State}
+    end;
 handle_info({'DOWN', _MRef, process, Pid, _Reason},
             #state{by_owner = Owners} = State) ->
     case maps:find(Pid, Owners) of
@@ -181,8 +201,7 @@ handle_info({'DOWN', _MRef, process, Pid, _Reason},
 handle_info(_Info, State) -> {noreply, State}.
 
 terminate(_Reason, #state{socket = S, by_teid = Map}) ->
-    maps:fold(fun(_, #ue_ent{tun_port = TP}, _) -> close_tun(TP), ok end,
-              ok, Map),
+    maps:fold(fun(_, Ent, _) -> close_tun_ent(Ent), ok end, ok, Map),
     case S of undefined -> ok; _ -> gen_udp:close(S) end,
     ok.
 
@@ -194,8 +213,19 @@ code_change(_OldVsn, State, _Extra) -> {ok, State}.
 
 do_register_ue(#{pgw_u_teid := PgwTeid, pgw_u_ip := PgwIP,
                  ue_inner_ip := InnerIP} = P,
-               #state{by_teid = Map, next_teid = N, by_owner = Owners} = State) ->
-    LocalTeid = N,
+               #state{by_teid = Map, next_teid = N,
+                      by_owner = Owners, by_port = PMap} = State) ->
+    %% The FSM generates a 32-bit TEID in new_teid/0, advertises it to
+    %% the PGW-U in the Create-Session F-TEID IE, and passes it in
+    %% here as `local_teid_hint`. The PGW-U then uses THAT value as
+    %% the TEID on every downlink GTP-U T-PDU. If we key the `by_teid`
+    %% map on an internally-assigned counter instead, every downlink
+    %% PDU misses the lookup and gets silently dropped. Always prefer
+    %% the hint when present.
+    LocalTeid = case maps:get(local_teid_hint, P, undefined) of
+                    I when is_integer(I), I > 0 -> I;
+                    _                           -> N
+                end,
     TunName   = tun_name_for(P),
     TunPort   = maybe_open_tun(TunName, InnerIP, LocalTeid),
     Owner     = maps:get(owner_pid, P, undefined),
@@ -214,20 +244,30 @@ do_register_ue(#{pgw_u_teid := PgwTeid, pgw_u_ip := PgwIP,
         undefined -> Owners;
         _         -> Owners#{Owner => LocalTeid}
     end,
+    PMap1 = case is_port(TunPort) of
+        true  -> PMap#{TunPort => LocalTeid};
+        false -> PMap
+    end,
     {{ok, #{local_teid => LocalTeid, tun_name => TunName}},
      State#state{by_teid = Map#{LocalTeid => Ent},
                  by_owner = Owners1,
+                 by_port = PMap1,
                  next_teid = N + 1}}.
 
-do_unregister_teid(Teid, #state{by_teid = Map, by_owner = Owners} = State) ->
+do_unregister_teid(Teid, #state{by_teid = Map, by_owner = Owners,
+                                 by_port = PMap} = State) ->
     case maps:take(Teid, Map) of
-        {#ue_ent{tun_port = TP, owner_pid = Owner}, Rest} ->
-            close_tun(TP),
+        {#ue_ent{tun_port = TP, owner_pid = Owner} = Ent, Rest} ->
+            close_tun_ent(Ent),
             Owners1 = case Owner of
                 undefined -> Owners;
                 _         -> maps:remove(Owner, Owners)
             end,
-            State#state{by_teid = Rest, by_owner = Owners1};
+            PMap1 = case is_port(TP) of
+                true  -> maps:remove(TP, PMap);
+                false -> PMap
+            end,
+            State#state{by_teid = Rest, by_owner = Owners1, by_port = PMap1};
         error ->
             State
     end.
@@ -295,42 +335,182 @@ skip_ext_hdrs(Bin) -> Bin.
 %%====================================================================
 %% TUN device plumbing
 %%
-%% A full production path would open `/dev/net/tun` via a port driver
-%% and wire the fd into an active `{active, true}` port. That requires
-%% a small NIF/port binary which we do not build in-tree yet. The stub
-%% below attempts `ip tuntap add` with the right naming and mirrors
-%% the interface config; the actual packet pump is a TODO marked by
-%% the "tun_port = undefined" state — forwarding still works in the
-%% outbound direction if the UE FSM calls `send/2` directly, and the
-%% UDP listener drops inbound packets for unknown TEIDs cleanly.
+%% Each per-UE bearer owns one Linux TUN device (IFF_TUN | IFF_NO_PI).
+%% The device is created via `ip tuntap add`, addressed with the UE's
+%% inner IP, and brought up. A small C helper (`epdg_tun_port`, see
+%% c_src/epdg_tun_port.c) is spawned to own the /dev/net/tun fd and
+%% bridge it to the BEAM over stdio using the standard `{packet, 2}`
+%% framing. We talk to it via `port_command/2` (downlink: GTP-U payload
+%% → TUN) and receive `{Port, {data, Pkt}}` messages (uplink: UE-originated
+%% IP packet → GTP-U to PGW).
+%%
+%% With this plumbing in place, after the kernel XFRM subsystem
+%% decrypts inbound ESP from the UE, the cleartext packet is routed
+%% toward `dst = ue_inner_ip` — which lives on our TUN — so the C
+%% helper reads it on /dev/net/tun and hands it up. The reverse path
+%% (PGW T-PDU → TUN write) triggers the kernel's outbound XFRM policy
+%% for `src 0.0.0.0/0 dst UE_IP/32`, which encrypts and emits ESP-in-UDP
+%% toward the UE.
 %%====================================================================
 
-maybe_open_tun(Name, {A,B,C,D} = _Ip, _LocalTeid) ->
-    Add  = io_lib:format("ip tuntap add dev ~s mode tun 2>/dev/null", [Name]),
-    AddR = io_lib:format("ip addr add ~B.~B.~B.~B/32 dev ~s 2>/dev/null",
-                         [A,B,C,D, Name]),
-    Up   = io_lib:format("ip link set dev ~s up 2>/dev/null", [Name]),
-    _ = os:cmd(lists:flatten(Add)),
-    _ = os:cmd(lists:flatten(AddR)),
-    _ = os:cmd(lists:flatten(Up)),
-    undefined;
+maybe_open_tun(Name, {A,B,C,D} = _Ip, LocalTeid) ->
+    %% Linux IFNAMSIZ = 16 bytes incl. trailing NUL: interface names
+    %% must be <= 15 chars. Guard here so that upstream generation
+    %% mistakes surface as explicit log warnings instead of silent
+    %% "ip tuntap add" failures ("dev not a valid ifname") that used
+    %% to leave the pod without a TUN.
+    case length(Name) =< 15 of
+        false ->
+            logger:warning("TUN: refusing to create device with name ~s "
+                           "(~B chars > IFNAMSIZ-1=15)",
+                           [Name, length(Name)]),
+            undefined;
+        true ->
+            ensure_forwarding_sysctls(),
+            UeIp = io_lib:format("~B.~B.~B.~B", [A,B,C,D]),
+            Table = ue_route_table(LocalTeid),
+            %% NOTE: we intentionally do NOT assign the UE's inner IP to
+            %% the TUN — that would make the kernel treat UE_IP as local
+            %% and deliver downlink packets to us instead of forwarding
+            %% them through the XFRM OUT policy back out to the UE.
+            Cmds = [
+                io_lib:format("ip tuntap add dev ~s mode tun", [Name]),
+                io_lib:format("ip link set dev ~s up", [Name]),
+                %% Loose rp_filter on the TUN so decrypted uplink with
+                %% src=UE_IP isn't dropped as a martian (asymmetric path).
+                io_lib:format("sysctl -wq net.ipv4.conf.~s.rp_filter=2", [Name]),
+                %% Main table downlink route: lets FIB lookup for dst=UE_IP
+                %% succeed; the XFRM OUT bundle (dst=UE_IP/32 tmpl tunnel esp)
+                %% overrides and actually emits ESP via eth0.
+                io_lib:format("ip route add ~s/32 dev ~s", [UeIp, Name]),
+                %% Uplink policy table: after XFRM decrypt, packets with
+                %% src=UE_IP are sent out the UE's own TUN for the BEAM
+                %% to pick up and wrap into GTP-U.
+                io_lib:format("ip rule add from ~s/32 lookup ~B priority ~B",
+                              [UeIp, Table, Table]),
+                io_lib:format("ip route add default dev ~s table ~B",
+                              [Name, Table])
+            ],
+            case run_cmds_or_warn(Name, Cmds) of
+                ok    -> open_tun_port(Name);
+                error -> undefined
+            end
+    end;
 maybe_open_tun(_Name, _, _) ->
     undefined.
 
-close_tun(undefined) -> ok;
-close_tun(_Port) -> ok.
+%% Route-table / rule priority derived from the per-pod local TEID.
+%%
+%% CRITICAL: the returned value is used for BOTH the table id and the
+%% `ip rule ... priority` value. iproute2 orders rules by priority
+%% (lowest first). The main table is consulted at priority 32766, and
+%% since the pod's main table has a default route (`default via
+%% eth0`), any rule with priority >= 32766 is never reached for
+%% uplink traffic — the main lookup wins first. We therefore clamp to
+%% the 1000..31000 range so every per-UE rule sits strictly before
+%% main, regardless of which 32-bit TEID the FSM hands us.
+ue_route_table(LocalTeid) ->
+    1000 + (LocalTeid rem 30000).
+
+run_cmds_or_warn(Name, Cmds) ->
+    lists:foldl(
+      fun(C, Acc) ->
+              Out = os:cmd(lists:flatten(C) ++ " 2>&1"),
+              case string:trim(Out) of
+                  "" -> Acc;
+                  _  ->
+                      logger:warning("TUN ~s: cmd=~s out=~s",
+                                     [Name, lists:flatten(C), Out]),
+                      Acc
+              end
+      end, ok, Cmds).
+
+%% Enable forwarding once per pod. Cheap to repeat if called again.
+ensure_forwarding_sysctls() ->
+    _ = os:cmd("sysctl -wq net.ipv4.ip_forward=1 2>&1"),
+    _ = os:cmd("sysctl -wq net.ipv4.conf.all.rp_filter=2 2>&1"),
+    ok.
+
+open_tun_port(Name) ->
+    case locate_tun_helper() of
+        {ok, Exec} ->
+            try
+                Port = erlang:open_port(
+                    {spawn_executable, Exec},
+                    [{args, [Name]}, {packet, 2}, binary, exit_status, use_stdio]),
+                Port
+            catch
+                error:Reason ->
+                    logger:error("TUN: failed to spawn port helper for ~s: ~p",
+                                 [Name, Reason]),
+                    undefined
+            end;
+        error ->
+            logger:error("TUN: helper binary epdg_tun_port not found for ~s "
+                         "— uplink/downlink forwarding will be inactive",
+                         [Name]),
+            undefined
+    end.
+
+%% Prefer the binary shipped alongside the release (see Dockerfile); fall
+%% back to PATH so local dev builds that put the helper on $PATH keep
+%% working without rebuilding the whole image.
+locate_tun_helper() ->
+    Release = filename:join([code:root_dir(), "bin", "epdg_tun_port"]),
+    case filelib:is_regular(Release) of
+        true  -> {ok, Release};
+        false ->
+            case os:find_executable("epdg_tun_port") of
+                false -> error;
+                Path  -> {ok, Path}
+            end
+    end.
+
+close_tun_ent(#ue_ent{tun_port = TP, tun_name = Name,
+                      local_teid = Teid, ue_inner_ip = Ip}) ->
+    case TP of
+        undefined -> ok;
+        Port when is_port(Port) -> catch erlang:port_close(Port), ok
+    end,
+    teardown_ue_routing(Ip, Teid),
+    delete_tun_dev(Name).
+
+teardown_ue_routing(undefined, _Teid) -> ok;
+teardown_ue_routing({A,B,C,D}, Teid) ->
+    UeIp = io_lib:format("~B.~B.~B.~B", [A,B,C,D]),
+    Table = ue_route_table(Teid),
+    _ = os:cmd(lists:flatten(
+        io_lib:format("ip rule del from ~s/32 lookup ~B priority ~B 2>&1",
+                      [UeIp, Table, Table]))),
+    _ = os:cmd(lists:flatten(
+        io_lib:format("ip route flush table ~B 2>&1", [Table]))),
+    ok.
+
+delete_tun_dev(undefined) -> ok;
+delete_tun_dev(Name) ->
+    _ = os:cmd(lists:flatten(
+                 io_lib:format("ip tuntap del dev ~s mode tun 2>&1", [Name]))),
+    ok.
 
 tun_write(undefined, _Pkt) -> ok;
-tun_write(_Port, _Pkt)     -> ok.
+tun_write(Port, Pkt) when is_port(Port), is_binary(Pkt) ->
+    try erlang:port_command(Port, Pkt, [nosuspend]) of
+        true  -> ok;
+        false -> ok  %% busy / hi-watermark — drop; UE will retransmit
+    catch
+        error:_ -> ok
+    end.
 
+%% Build a Linux interface name for a UE's TUN device.
+%% IFNAMSIZ limits us to 15 usable chars; a 15-digit IMSI would make
+%% "ue" ++ IMSI = 17 chars and `ip tuntap add` silently rejects it. We
+%% instead use the 32-bit local GTP-U TEID (<= 10 decimal digits) with
+%% an "ue" prefix, giving at most 12 chars and guaranteeing uniqueness
+%% per session within this pod. IMSI stays available in logs for
+%% correlation.
 tun_name_for(P) ->
-    IMSI = maps:get(imsi, P, <<>>),
     Teid = maps:get(local_teid_hint, P, 0),
-    Base = case IMSI of
-        <<>> -> io_lib:format("~B", [Teid]);
-        _    -> binary_to_list(IMSI)
-    end,
-    lists:flatten(io_lib:format("ue~s", [Base])).
+    lists:flatten(io_lib:format("ue~B", [Teid])).
 
 %%====================================================================
 %% Helpers

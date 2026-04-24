@@ -3,12 +3,19 @@ FROM erlang:26-alpine
 WORKDIR /app
 COPY . .
 
-RUN apk add --no-cache bash git build-base wget iproute2 ethtool libcap lksctp-tools \
+RUN apk add --no-cache bash git build-base wget iproute2 ethtool libcap lksctp-tools linux-headers \
   && adduser -D -u 1000 epdg-user \
   && wget -qO- https://github.com/erlang/rebar3/releases/download/3.23.0/rebar3 \
        | install -m 0755 /dev/stdin /usr/local/bin/rebar3 \
   && rebar3 clean \
   && rebar3 as prod release
+
+# Compile the TUN port-driver helper used by epdg_gtpu_forwarder to
+# bridge per-UE TUN devices to the GTP-U socket. The binary is a tiny
+# stdio bridge; see apps/epdg/c_src/epdg_tun_port.c for the protocol.
+RUN cc -O2 -Wall -Wextra \
+        -o /app/_build/prod/rel/epdg/bin/epdg_tun_port \
+        /app/apps/epdg/c_src/epdg_tun_port.c
 
 # Diameter identity
 ENV EPDG_ORIGIN_REALM="mnc001.mcc001.3gppnetwork.org"
@@ -44,13 +51,32 @@ ENV MNC="01"
 # HTTP API
 ENV EPDG_API_PORT="8080"
 
-# Grant NET_ADMIN to the release binary so we can manage XFRM without root
-RUN setcap cap_net_admin,cap_net_raw=eip /app/_build/prod/rel/epdg/erts-*/bin/beam.smp \
-    || true
-
-RUN mkdir -p /data && chown epdg-user:epdg-user /data
+# The XFRM / TUN data plane is driven from Erlang via `os:cmd("ip …")`,
+# which execs `/bin/sh -c "ip …"`. We need CAP_NET_ADMIN / CAP_NET_RAW to
+# survive across that exec chain. Two approaches were tried:
+#
+#   (a) `setcap cap_net_admin,cap_net_raw=eip` on beam.smp + uid=1000.
+#       File caps on beam give the beam those caps, but on execve() of
+#       `/bin/sh` (no file caps, non-root uid) the kernel resets
+#       P'(permitted) = (P(inh) & F(inh)) | (F(perm) & bset) = 0, so
+#       the `ip` grandchild ends up with CapPrm=CapEff=0.
+#   (b) `setcap =ep` on /sbin/ip itself. On this kernel / containerd /
+#       overlayfs combination the `security.capability` xattr is
+#       preserved by `getcap` but *not* honored at exec time for the
+#       non-root user — the `ip` process still starts with CapPrm=0 and
+#       `ip xfrm state add` returns `RTNETLINK answers: Operation not
+#       permitted`.
+#
+# The robust path — and the standard pattern for telco pods that drive
+# kernel IPsec — is to run the container as root (uid=0) with only
+# NET_ADMIN / NET_RAW in the bounding set. For a root process execing a
+# "capability-dumb" binary (no file caps xattr) the kernel treats
+# F(permitted) as the bounding set, so every child `exec` keeps
+# CapPrm=CapEff covering NET_ADMIN + NET_RAW — exactly what `ip xfrm`
+# and `ip tuntap` need. The container is still unprivileged (everything
+# outside those two caps is dropped via the pod securityContext).
+RUN mkdir -p /data
 
 EXPOSE 500/udp 4500/udp 3868 2123/udp 8080
 
-USER epdg-user
 CMD ["/app/_build/prod/rel/epdg/bin/epdg", "foreground"]

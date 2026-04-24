@@ -51,6 +51,20 @@ init([]) ->
         {ok, S500} ->
             case gen_udp:open(NATTPort, Opts) of
                 {ok, S4500} ->
+                    %% Enable UDP_ENCAP=UDP_ENCAP_ESPINUDP on the NAT-T
+                    %% socket (RFC 3948). Without this the kernel delivers
+                    %% ESP-in-UDP frames to this gen_udp socket as plain
+                    %% UDP data; with it set the kernel peeks the first
+                    %% 4 bytes: zeroes → IKE (delivered to userspace),
+                    %% anything else → ESP (stripped and handed to XFRM
+                    %% for decryption). Linux: IPPROTO_UDP=17,
+                    %% UDP_ENCAP=100, UDP_ENCAP_ESPINUDP=2.
+                    case inet:setopts(S4500, [{raw, 17, 100, <<2:32/native>>}]) of
+                        ok -> ok;
+                        EncapErr ->
+                            logger:warning("UDP_ENCAP_ESPINUDP setopt failed on 4500: ~p",
+                                           [EncapErr])
+                    end,
                     logger:info("IKEv2 listening on ~p:~p / ~p:~p (~p)",
                                 [BindAddr, Port, BindAddr, NATTPort, InetFamily]),
                     {ok, #state{socket_500 = S500, socket_4500 = S4500,
@@ -123,8 +137,14 @@ handle_ikev2_packet(Data, FromIP, FromPort, _RecvPort) ->
                          [ExType, FromIP, FromPort, ISPI]),
             dispatch(ISPI, RSPI, Header, Data, FromIP, FromPort);
         {error, Reason} ->
-            logger:warning("IKEv2 decode error: ~p from ~p:~p",
-                           [Reason, FromIP, FromPort])
+            %% #region agent log
+            Prefix = case Data of
+                <<P:64/binary, _/binary>> -> P;
+                _ -> Data
+            end,
+            logger:warning("IKEv2 decode error: ~p from ~p:~p first_bytes=~w",
+                           [Reason, FromIP, FromPort, Prefix])
+            %% #endregion agent log
     end.
 
 dispatch(ISPI, 0, Header, Data, FromIP, FromPort) ->
@@ -133,20 +153,20 @@ dispatch(ISPI, 0, Header, Data, FromIP, FromPort) ->
     %% retransmit there instead of spawning a zombie duplicate.
     case epdg_ue_registry:lookup_by_initiator(FromIP, ISPI) of
         {ok, Pid} ->
-            epdg_ue_fsm:handle_ikev2(Pid, Header, Data);
+            epdg_ue_fsm:handle_ikev2(Pid, Header, Data, FromPort);
         error ->
             case epdg_ue_sup:start_ue_fsm(#{peer_ip => FromIP,
                                              peer_port => FromPort}) of
                 {ok, Pid} ->
-                    epdg_ue_fsm:handle_ikev2(Pid, Header, Data);
+                    epdg_ue_fsm:handle_ikev2(Pid, Header, Data, FromPort);
                 {error, Reason} ->
                     logger:error("Failed to start UE FSM: ~p", [Reason])
             end
     end;
-dispatch(_ISPI, RSPI, Header, Data, _FromIP, _FromPort) ->
+dispatch(_ISPI, RSPI, Header, Data, _FromIP, FromPort) ->
     case epdg_ue_registry:lookup_by_spi(RSPI) of
         {ok, Pid} ->
-            epdg_ue_fsm:handle_ikev2(Pid, Header, Data);
+            epdg_ue_fsm:handle_ikev2(Pid, Header, Data, FromPort);
         error ->
             logger:warning("IKEv2 for unknown RSPI ~.16B", [RSPI])
     end.

@@ -285,19 +285,6 @@ send_der(#{session_id := SessionId, eap_payload := EAPPayload} = Opts) ->
     %% the AAA that anchored the first DEA. The DRA honours Destination-Host
     %% over load-balancing realm-based routing.
     Msg  = maybe_add(Msg1, 'Destination-Host', DestHost),
-    % #region agent log
-    write_log(<<"epdg_diameter_swm:send_der">>, <<"A1">>,
-              #{session_id => SessionId,
-                user_name  => UserName,
-                eap_len    => byte_size(EAPPayload),
-                apn        => APN,
-                rat_type   => RATType,
-                auth_req_t => AuthReqT,
-                dest_realm => DestRealm,
-                dest_host  => DestHost,
-                msg_shape  => [element(1, as_tuple(K)) ||
-                                {_, _} = K <- tl(Msg)] ++ ['DER']}),
-    % #endregion
     do_call(Msg, fun parse_dea/1);
 
 send_der(_Opts) ->
@@ -346,24 +333,8 @@ send_str(_Opts) ->
     {error, missing_session_id}.
 
 do_call(Msg, ParseFun) ->
-    %% #region agent log
-    logger:notice("SWm do_call: sending ~p", [msg_head(Msg)]),
-    %% #endregion
-    T0 = erlang:monotonic_time(millisecond),
-    Ret = diameter:call(?SVC_NAME, ?APP_ALIAS, Msg, [{timeout, ?DIAM_CALL_TIMEOUT}]),
-    T1 = erlang:monotonic_time(millisecond),
-    %% #region agent log
-    logger:notice("SWm do_call: returned after ~Bms: ~P",
-                  [T1 - T0, Ret, 12]),
-    %% #endregion
-    case Ret of
+    case diameter:call(?SVC_NAME, ?APP_ALIAS, Msg, [{timeout, ?DIAM_CALL_TIMEOUT}]) of
         {ok, Answer} ->
-            %% #region agent log
-            logger:notice("SWm do_call: ok answer shape=~p head=~p sample=~P",
-                          [classify_answer(Answer),
-                           answer_head(Answer),
-                           Answer, 10]),
-            %% #endregion
             {ok, ParseFun(Answer)};
         {error, Reason} = Err ->
             logger:warning("SWm do_call: error ~p", [Reason]),
@@ -372,17 +343,6 @@ do_call(Msg, ParseFun) ->
             logger:warning("SWm do_call: unexpected return ~P", [Other, 10]),
             {error, Other}
     end.
-
-%% #region agent log helpers
-msg_head([Cmd | _]) -> Cmd;
-msg_head(M) -> M.
-
-classify_answer(A) when is_tuple(A) -> {tuple, element(1, A), tuple_size(A)};
-classify_answer([H | _]) when is_atom(H) -> {list_cmd, H};
-classify_answer([H | _]) when is_binary(H) -> {list_cmd_bin, H};
-classify_answer(L) when is_list(L) -> {list_plain, length(L)};
-classify_answer(Other) -> {other, Other}.
-%% #endregion
 
 %%====================================================================
 %% Answer parsers — tolerant of both the generated record form and the
@@ -433,17 +393,6 @@ parse_swm_dea(Answer) ->
     %% session must carry this as Destination-Host so the DRA routes
     %% them back to the AAA that holds the EAP state.
     OriginHost = first_binary(avp_value('Origin-Host', Answer, undefined)),
-    % #region agent log
-    write_log(<<"epdg_diameter_swm:parse_dea">>, <<"A5">>,
-              #{session_id => SId,
-                result_code => RC,
-                origin_host => OriginHost,
-                eap_len => eap_len(EapPl),
-                msk_len => msk_len(MSK),
-                session_timeout => Timeout,
-                has_user_data => UserData =/= undefined,
-                apn_cfg_count => apn_count(APNCfg)}),
-    % #endregion
     #{session_id         => SId,
       result_code        => RC,
       origin_host        => OriginHost,
@@ -480,18 +429,7 @@ peer_up(_SvcName, {_PeerRef, Caps}, State) ->
         #diameter_caps{origin_host = {_, RH}} -> RH;
         _ -> <<"unknown">>
     end,
-    %% #region agent log
-    RemoteAuthApps = case Caps of
-        #diameter_caps{auth_application_id = {_, RAuth}} -> RAuth;
-        _ -> undefined
-    end,
-    RemoteVSA = case Caps of
-        #diameter_caps{vendor_specific_application_id = {_, RVsa}} -> RVsa;
-        _ -> undefined
-    end,
-    logger:notice("SWm peer up: ~s auth_apps=~p vsa=~P",
-                  [RemoteHost, RemoteAuthApps, RemoteVSA, 8]),
-    %% #endregion
+    logger:notice("SWm peer up: ~s", [RemoteHost]),
     epdg_metrics:gauge_inc(diameter_swm_peers),
     State.
 
@@ -506,11 +444,6 @@ peer_down(_SvcName, {PeerRef, Caps}, State) ->
     State.
 
 pick_peer(LocalCandidates, RemoteCandidates, _SvcName, _State) ->
-    %% #region agent log
-    logger:notice("SWm pick_peer: local=~p remote=~p",
-                  [length(ensure_list(LocalCandidates)),
-                   length(ensure_list(RemoteCandidates))]),
-    %% #endregion
     case LocalCandidates of
         [Peer | _] -> {ok, Peer};
         _ ->
@@ -530,12 +463,7 @@ prepare_request(#diameter_packet{msg = Msg} = Pkt, _SvcName, {_, Caps}) ->
 prepare_retransmit(Pkt, SvcName, Peer) ->
     prepare_request(Pkt, SvcName, Peer).
 
-handle_answer(#diameter_packet{msg = Msg, errors = Errors, header = Hdr},
-              _Req, _SvcName, _Peer) ->
-    %% #region agent log
-    logger:notice("SWm handle_answer: hdr=~P errors=~P msg=~P",
-                  [Hdr, 8, Errors, 8, Msg, 12]),
-    %% #endregion
+handle_answer(#diameter_packet{msg = Msg}, _Req, _SvcName, _Peer) ->
     {ok, Msg}.
 
 handle_error(Reason, _Req, _SvcName, _Peer) ->
@@ -779,19 +707,6 @@ ensure_list(L) when is_list(L) -> L;
 ensure_list(undefined) -> [];
 ensure_list(V) -> [V].
 
-answer_head(Ans) when is_list(Ans), length(Ans) > 0 -> hd(Ans);
-answer_head(Ans) when is_tuple(Ans) -> element(1, Ans);
-answer_head(_) -> unknown.
-
-eap_len(B) when is_binary(B) -> byte_size(B);
-eap_len(_) -> 0.
-
-msk_len(B) when is_binary(B) -> byte_size(B);
-msk_len(_) -> 0.
-
-apn_count(L) when is_list(L) -> length(L);
-apn_count(_) -> 0.
-
 %%====================================================================
 %% Misc helpers
 %%====================================================================
@@ -804,34 +719,3 @@ to_list(B) when is_binary(B) -> binary_to_list(B).
 
 maybe_add(Msg, _K, undefined) -> Msg;
 maybe_add(Msg, K, V) -> Msg ++ [{K, V}].
-
-as_tuple({K, V}) -> {K, V};
-as_tuple(V) -> {V, undefined}.
-
-% #region agent log helpers
-write_log(Location, HypothesisId, Data) ->
-    Entry = jsx:encode(#{
-        sessionId    => <<"35d02f">>,
-        runId        => <<"swm-wiring">>,
-        hypothesisId => HypothesisId,
-        location     => Location,
-        message      => Location,
-        data         => sanitize(Data),
-        timestamp    => erlang:system_time(millisecond)}),
-    catch file:write_file(
-            "/home/carsten/Schreibtisch/volte.io/helm/.cursor/debug-35d02f.log",
-            <<Entry/binary, "\n">>, [append]),
-    ok.
-
-sanitize(M) when is_map(M) ->
-    maps:map(fun(_K, V) -> sanitize(V) end, M);
-sanitize(L) when is_list(L) ->
-    case io_lib:printable_list(L) of
-        true  -> iolist_to_binary(L);
-        false -> [sanitize(X) || X <- L]
-    end;
-sanitize(T) when is_tuple(T) -> sanitize(tuple_to_list(T));
-sanitize(B) when is_binary(B), byte_size(B) > 64 ->
-    <<B:64/binary>>;
-sanitize(V) -> V.
-% #endregion
