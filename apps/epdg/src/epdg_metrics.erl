@@ -40,6 +40,7 @@ init() ->
         diameter_swm_peers,
         xfrm_sa_created_total,
         xfrm_sa_deleted_total,
+        xfrm_sa_errors_total,
         xfrm_sa_active,
         gtpc_echo_sent_total,
         gtpc_echo_timeouts_total,

@@ -101,12 +101,30 @@ code_change(_OldVsn, State, _Extra) -> {ok, State}.
 do_create_sa(#{spi := SPI, src_ip := Src, dst_ip := Dst,
                enc_alg := EncAlg, enc_key := EncKey} = Params,
              #state{offload_mode = Offload, iface = Iface}) ->
+    %% Algorithm names like `cbc(aes)` and `hmac(sha256)` contain `(` / `)`
+    %% which are shell metacharacters. Wrap them in single quotes so that
+    %% `os:cmd/1` (which invokes `/bin/sh -c`) passes them verbatim to
+    %% `ip xfrm`. Without the quoting the shell aborts with a "syntax
+    %% error: unexpected (" before `ip` is ever spawned and the SA silently
+    %% never installs — the UE would then complete IKE_AUTH but all ESP
+    %% packets would be dropped by the kernel (no matching state).
+    %% Use `auth-trunc` with the explicit truncation length mandated by
+    %% the IKEv2 integrity transform. `ip xfrm ... auth ALGO KEY` defaults
+    %% to a hard-coded 96-bit ICV for every algorithm, which is correct
+    %% for `hmac(sha1)` but WRONG for the SHA-2 family:
+    %%   AUTH_HMAC_SHA2_256_128 (RFC 4868) wants 128-bit ICV
+    %%   AUTH_HMAC_SHA2_384_192                   192-bit ICV
+    %%   AUTH_HMAC_SHA2_512_256                   256-bit ICV
+    %% With a wrong ICV length the kernel drops every inbound ESP packet
+    %% (`XfrmInStateProtoError`) and produces outbound ESP the UE cannot
+    %% authenticate — IKE succeeds, data plane silently breaks.
     AuthPart = case maps:find(auth_alg, Params) of
         {ok, none} -> "";
         {ok, AuthAlg} ->
-            AuthKey = maps:get(auth_key, Params, <<>>),
-            io_lib:format(" auth ~s 0x~s",
-                          [auth_alg_str(AuthAlg), bin2hex(AuthKey)]);
+            AuthKey  = maps:get(auth_key, Params, <<>>),
+            TruncLen = auth_trunc_bits(AuthAlg),
+            io_lib:format(" auth-trunc '~s' 0x~s ~B",
+                          [auth_alg_str(AuthAlg), bin2hex(AuthKey), TruncLen]);
         error -> ""
     end,
 
@@ -132,7 +150,7 @@ do_create_sa(#{spi := SPI, src_ip := Src, dst_ip := Dst,
 
     Cmd = io_lib:format(
         "ip xfrm state add src ~s dst ~s proto esp spi 0x~.16B "
-        "enc ~s 0x~s~s~s mode tunnel",
+        "enc '~s' 0x~s~s~s mode tunnel",
         [ip_str(Src), ip_str(Dst), SPI,
          enc_alg_str(EncAlg), bin2hex(EncKey), AuthPart, EncapPart]),
 
@@ -224,10 +242,19 @@ enc_alg_str(aes_gcm_256)       -> "rfc4106(gcm(aes))";
 enc_alg_str(chacha20_poly1305) -> "rfc7539esp(chacha20,poly1305)";
 enc_alg_str(_)                 -> "cbc(aes)".
 
+auth_alg_str(hmac_sha1)   -> "hmac(sha1)";
 auth_alg_str(hmac_sha256) -> "hmac(sha256)";
 auth_alg_str(hmac_sha384) -> "hmac(sha384)";
 auth_alg_str(hmac_sha512) -> "hmac(sha512)";
 auth_alg_str(_)           -> "hmac(sha256)".
+
+%% Kernel ICV truncation length (in bits) for each IKEv2 integrity
+%% transform, per RFC 4868 / RFC 2404.
+auth_trunc_bits(hmac_sha1)   -> 96;
+auth_trunc_bits(hmac_sha256) -> 128;
+auth_trunc_bits(hmac_sha384) -> 192;
+auth_trunc_bits(hmac_sha512) -> 256;
+auth_trunc_bits(_)           -> 128.
 
 dir_str(in)  -> "in";
 dir_str(out) -> "out";

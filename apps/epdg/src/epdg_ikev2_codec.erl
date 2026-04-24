@@ -164,6 +164,13 @@ decode_proposals(<<Last:8, _Res:8, PropLen:16, PropNum:8,
     case Rest of
         <<SPIAndTrans:SPIAndTransLen/binary, Remaining/binary>> ->
             <<SPI:SPISize/binary, TransData/binary>> = SPIAndTrans,
+            %% #region agent log
+            logger:warning("DEBUG h-sai2 decode_proposal: last=~p proplen=~p "
+                           "propnum=~p proto_id=~p spi_size=~p "
+                           "num_transforms=~p spi=~p",
+                           [Last, PropLen, PropNum, ProtoId, SPISize,
+                            NumTransforms, SPI]),
+            %% #endregion agent log
             Proposal = #{number => PropNum,
                          protocol_id => ProtoId,
                          spi => SPI,

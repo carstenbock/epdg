@@ -9,7 +9,7 @@
 
 -behaviour(gen_statem).
 
--export([start_link/1, handle_ikev2/3, get_state/1, disconnect/1]).
+-export([start_link/1, handle_ikev2/4, get_state/1, disconnect/1]).
 -export([init/1, callback_mode/0, terminate/3, code_change/4]).
 -export([idle/3, ike_sa_init/3, ike_auth/3, established/3]).
 
@@ -84,7 +84,18 @@
     %% terminate/3 can issue a Delete-Session-Request with the right
     %% TEID + EBI.
     gtpu_teid_local  :: non_neg_integer() | undefined,
-    gtpu_teid_pgw    :: non_neg_integer() | undefined
+    gtpu_teid_pgw    :: non_neg_integer() | undefined,
+    %% RFC 7296 §2.16 (IKE_AUTH with EAP): SAi2 / TSi / TSr are carried in
+    %% the *first* IKE_AUTH message (alongside IDi) — the post-EAP-Success
+    %% AUTH message only contains AUTH. We cache the raw payload bodies
+    %% here when we decrypt that first message so finalize_ike_auth/N can
+    %% pick the child-SA proposal + TS selectors from them once the AUTH
+    %% round completes. If these stay `undefined` we end up falling back
+    %% to default_child_suite() with peer_spi=0, which installs an
+    %% outbound XFRM SA with SPI 0 and silently kills the downlink.
+    sai2_body        :: binary() | undefined,
+    tsi_body         :: binary() | undefined,
+    tsr_body         :: binary() | undefined
 }).
 
 %%====================================================================
@@ -94,9 +105,9 @@
 start_link(InitContext) ->
     gen_statem:start_link(?MODULE, InitContext, []).
 
--spec handle_ikev2(pid(), map(), binary()) -> ok.
-handle_ikev2(Pid, Header, RawData) ->
-    gen_statem:cast(Pid, {ikev2, Header, RawData}).
+-spec handle_ikev2(pid(), map(), binary(), inet:port_number() | undefined) -> ok.
+handle_ikev2(Pid, Header, RawData, FromPort) ->
+    gen_statem:cast(Pid, {ikev2, Header, RawData, FromPort}).
 
 -spec get_state(pid()) -> {ok, atom()}.
 get_state(Pid) ->
@@ -170,11 +181,12 @@ code_change(_OldVsn, State, Data, _Extra) ->
 idle(enter, _OldState, Data) ->
     {keep_state, Data, [{state_timeout, ?IKE_SA_INIT_TIMEOUT, timeout}]};
 
-idle(cast, {ikev2, #{exchange_type := ike_sa_init} = Header, RawData}, Data) ->
+idle(cast, {ikev2, #{exchange_type := ike_sa_init} = Header, RawData, FromPort}, Data) ->
     handle_ike_sa_init_request(Header, RawData,
-                               Data#data{ike_sa_init_req = RawData});
+                               (refresh_peer_port(Data, FromPort))
+                                   #data{ike_sa_init_req = RawData});
 
-idle(cast, {ikev2, _, _}, Data) ->
+idle(cast, {ikev2, _, _, _}, Data) ->
     {keep_state, Data};
 
 idle(state_timeout, timeout, #data{peer_ip = PeerIP} = _Data) ->
@@ -191,21 +203,23 @@ idle({call, From}, get_state, Data) ->
 ike_sa_init(enter, _OldState, Data) ->
     {keep_state, Data, [{state_timeout, ?IKE_AUTH_TIMEOUT, timeout}]};
 
-ike_sa_init(cast, {ikev2, #{exchange_type := ike_auth} = Header, RawData}, Data) ->
-    handle_ike_auth_request(Header, RawData, Data);
+ike_sa_init(cast, {ikev2, #{exchange_type := ike_auth} = Header, RawData, FromPort}, Data) ->
+    handle_ike_auth_request(Header, RawData, refresh_peer_port(Data, FromPort));
 
 %% IKE_SA_INIT retransmit from the initiator: re-send our cached response bytes
 %% (RFC 7296 §2.1 - responder MUST retransmit the same response, not regenerate).
-ike_sa_init(cast, {ikev2, #{exchange_type := ike_sa_init}, _RawData},
-            #data{peer_ip = PeerIP, peer_port = PeerPort,
-                  ike_sa_init_resp = Resp} = Data)
+ike_sa_init(cast, {ikev2, #{exchange_type := ike_sa_init}, _RawData, FromPort},
+            #data{peer_ip = PeerIP,
+                  ike_sa_init_resp = Resp} = Data0)
   when is_binary(Resp), byte_size(Resp) > 0 ->
+    Data = refresh_peer_port(Data0, FromPort),
+    #data{peer_port = PeerPort} = Data,
     logger:info("IKE_SA_INIT retransmit detected, re-sending cached response "
                 "(~p bytes) to ~p:~p", [byte_size(Resp), PeerIP, PeerPort]),
     catch epdg_ikev2_listener:send(PeerIP, PeerPort, Resp),
     {keep_state, Data};
 
-ike_sa_init(cast, {ikev2, _, _}, Data) ->
+ike_sa_init(cast, {ikev2, _, _, _}, Data) ->
     {keep_state, Data};
 
 ike_sa_init(state_timeout, timeout,
@@ -224,8 +238,8 @@ ike_sa_init({call, From}, get_state, Data) ->
 ike_auth(enter, _OldState, Data) ->
     {keep_state, Data, [{state_timeout, ?IKE_AUTH_TIMEOUT, timeout}]};
 
-ike_auth(cast, {ikev2, #{exchange_type := ike_auth} = Header, RawData}, Data) ->
-    handle_ike_auth_eap(Header, RawData, Data);
+ike_auth(cast, {ikev2, #{exchange_type := ike_auth} = Header, RawData, FromPort}, Data) ->
+    handle_ike_auth_eap(Header, RawData, refresh_peer_port(Data, FromPort));
 
 ike_auth(cast, disconnect, _Data) ->
     {stop, normal};
@@ -254,12 +268,12 @@ established(enter, _OldState, #data{responder_spi = RSPI, imsi = IMSI} = Data) -
     epdg_metrics:inc(ike_tunnels_established_total),
     {keep_state, Data, [{state_timeout, ?DPD_INTERVAL, dpd}]};
 
-established(cast, {ikev2, #{exchange_type := informational} = Header, RawData}, Data) ->
-    handle_informational(Header, RawData, Data);
+established(cast, {ikev2, #{exchange_type := informational} = Header, RawData, FromPort}, Data) ->
+    handle_informational(Header, RawData, refresh_peer_port(Data, FromPort));
 
-established(cast, {ikev2, #{exchange_type := create_child_sa} = _Header, _RawData}, Data) ->
+established(cast, {ikev2, #{exchange_type := create_child_sa} = _Header, _RawData, FromPort}, Data) ->
     %% MOBIKE or rekey
-    {keep_state, Data};
+    {keep_state, refresh_peer_port(Data, FromPort)};
 
 established(cast, disconnect, _Data) ->
     {stop, normal};
@@ -418,14 +432,44 @@ send_sa_init_response(ISPI, MsgId,
     KEPayload    = epdg_ikev2_codec:encode_ke_payload(DHGroupId, DHPub),
     NoncePayload = epdg_ikev2_codec:encode_nonce_payload(NonceR),
 
-    Payloads0 = [{sa, SAPayload}, {ke, KEPayload}, {nonce, NoncePayload}],
-    Payloads  = case CertDer of
-        undefined -> Payloads0;
+    %% RFC 7296 §2.23: responder MUST include NAT_DETECTION_SOURCE_IP and
+    %% NAT_DETECTION_DESTINATION_IP notifies in the IKE_SA_INIT response.
+    %% Each hash = SHA1(SPIi || SPIr || IP || Port), with SPIs as 8-byte
+    %% values and port as 2 bytes. The UE compares our
+    %% NAT_DETECTION_DESTINATION_IP against SHA1(SPIi||SPIr||dst_it_sent_to
+    %% || port) — in a K8s pod we hash our internal pod IP (e.g.
+    %% 10.0.4.49), while the UE sends to our public/NATed IP, so the
+    %% hashes inevitably differ and the UE recognises the ePDG is behind
+    %% a NAT and switches subsequent IKE + ESP to UDP/4500. Without these
+    %% notifies strongSwan/iOS/Android stay on port 500 and emit pure
+    %% ESP (IP proto 50), which Kubernetes CNIs/LBs drop, so no ESP ever
+    %% reaches the pod's XFRM.
+    %% Per RFC 7296 §2.23: SOURCE hash = hash of IP/port the packet is
+    %% SENT FROM (us, the responder); DESTINATION hash = hash of IP/port
+    %% the packet is SENT TO (the UE). An earlier iteration had these
+    %% swapped — correct now.
+    OurIpBin = ip_bytes(local_hash_ip()),
+    UeIpBin  = ip_bytes(PeerIP),
+    OurPort  = 500,
+    UePort   = PeerPort,
+    NatSourceHash =
+        crypto:hash(sha, <<ISPI:64, RSPI:64, OurIpBin/binary, OurPort:16>>),
+    NatDestHash =
+        crypto:hash(sha, <<ISPI:64, RSPI:64, UeIpBin/binary,  UePort:16>>),
+    NatSourceNotify = epdg_ikev2_codec:encode_notify_payload(0, 16388, <<>>, NatSourceHash),
+    NatDestNotify   = epdg_ikev2_codec:encode_notify_payload(0, 16389, <<>>, NatDestHash),
+
+    %% Standard ordering (matches strongSwan / cisco / RFC §1.2 example):
+    %% SA, KE, Nonce, [CERTREQ], N(NAT_SOURCE), N(NAT_DESTINATION).
+    Payloads1 = [{sa, SAPayload}, {ke, KEPayload}, {nonce, NoncePayload}],
+    Payloads2 = case CertDer of
+        undefined -> Payloads1;
         _ ->
-            %% Hint the peer we authenticate via certificate (RFC 7296 §3.7).
             CertReq = epdg_ikev2_codec:encode_certreq_payload(<<>>),
-            Payloads0 ++ [{certreq, CertReq}]
+            Payloads1 ++ [{certreq, CertReq}]
     end,
+    Payloads = Payloads2 ++ [{notify, NatSourceNotify},
+                             {notify, NatDestNotify}],
 
     {FirstPL, PayloadBin} = epdg_ikev2_codec:encode_payloads(Payloads),
 
@@ -440,11 +484,7 @@ send_sa_init_response(ISPI, MsgId,
           payload_bin       => PayloadBin}),
 
     case epdg_ikev2_listener:send(PeerIP, PeerPort, RespBytes) of
-        ok ->
-            logger:info("IKE_SA_INIT response sent to ~p:~p (~p bytes) "
-                        "ISPI=~.16B RSPI=~.16B DH=~p",
-                        [PeerIP, PeerPort, byte_size(RespBytes), ISPI, RSPI,
-                         DHGroupId]);
+        ok -> ok;
         {error, SendErr} ->
             logger:warning("Failed to send IKE_SA_INIT response to ~p:~p: ~p",
                            [PeerIP, PeerPort, SendErr])
@@ -561,6 +601,13 @@ handle_ike_auth_request(Header, RawData,
                             logger:info("IKE_AUTH decrypted: ~p inner payloads",
                                         [length(InnerPayloads)]),
                             {IDiType, UeNai, IDiBody} = extract_idi(InnerPayloads),
+                            %% RFC 7296 §2.16: SAi2 / TSi / TSr arrive in
+                            %% this first IKE_AUTH request together with IDi
+                            %% (not in the post-EAP-Success AUTH message),
+                            %% so capture them now for finalize_ike_auth/N.
+                            Sai2Body = stash_payload_body(sa,  InnerPayloads),
+                            TsiBody  = stash_payload_body(tsi, InnerPayloads),
+                            TsrBody  = stash_payload_body(tsr, InnerPayloads),
                             IMSI = parse_imsi_from_nai(UeNai),
                             logger:info("IKE_AUTH IDi type=~p data=~p IMSI=~p",
                                         [IDiType, UeNai, IMSI]),
@@ -622,7 +669,10 @@ handle_ike_auth_request(Header, RawData,
                                         idi_body     = IDiBody,
                                         imsi         = IMSI,
                                         ue_nai       = UeNai,
-                                        eap_next_id  = (EapId + 1) rem 256
+                                        eap_next_id  = (EapId + 1) rem 256,
+                                        sai2_body    = Sai2Body,
+                                        tsi_body     = TsiBody,
+                                        tsr_body     = TsrBody
                                     },
                                     {next_state, ike_auth, NewData};
                                 {error, EErr} ->
@@ -781,16 +831,6 @@ relay_eap_via_swm(MsgId, InFlags, EapBytes, ISPI, RSPI,
         undefined -> Base;
         DH        -> Base#{destination_host => DH}
     end,
-    % #region agent log
-    write_fsm_log(<<"epdg_ue_fsm:relay_eap_via_swm">>, <<"B1">>,
-                  #{session_id => SessionId,
-                    imsi => IMSI,
-                    ue_nai => UeNai,
-                    eap_bytes_len => byte_size(EapBytes),
-                    peer_ip => format_ip(PeerIP),
-                    dest_host => DestHost0,
-                    msg_id => MsgId}),
-    % #endregion
     logger:notice("SWm DER send session_id=~s eap_len=~B IMSI=~p dest_host=~p",
                   [SessionId, byte_size(EapBytes), IMSI, DestHost0]),
     case epdg_diameter_swm:diameter_eap_request(DERArgs) of
@@ -866,12 +906,6 @@ handle_post_eap_auth(MsgId, InFlags, AuthRaw, InnerPayloads,
                            apn = Apn0} = Data0) ->
     logger:notice("IKE_AUTH(cont) post-EAP-Success AUTH received "
                   "(~B bytes) IMSI=~p", [byte_size(AuthRaw), IMSI]),
-    % #region agent log
-    write_fsm_log(<<"epdg_ue_fsm:handle_post_eap_auth">>, <<"B2">>,
-                  #{auth_len => byte_size(AuthRaw),
-                    msg_id => MsgId,
-                    imsi   => IMSI}),
-    % #endregion
 
     #{prf := PRF} = KeyParams,
     {_AuthMethod, PeerAuth} = case epdg_ikev2_codec:decode_auth_payload(AuthRaw) of
@@ -949,14 +983,27 @@ finalize_ike_auth(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
                    PeerIP, PeerPort, Data0) ->
     #{prf := PRF} = KeyParams,
 
-    %% Pick child-SA proposal from SAi2 offered by the UE
-    ChildSuite = case epdg_ikev2_codec:find_payload(sa, InnerPayloads) of
-        {ok, #{data := SaiBin}} ->
+    %% RFC 7296 §2.16: in the EAP flow, SAi2 / TSi / TSr arrive in the
+    %% FIRST IKE_AUTH message together with IDi — the post-EAP-Success
+    %% AUTH message only carries AUTH. We stashed those payload bodies
+    %% into #data{} in handle_ike_auth_request/3; prefer them here, and
+    %% only fall back to the current (post-EAP) InnerPayloads for the
+    %% corner case where a non-EAP UE sent SAi2 alongside AUTH.
+    SaiBin = case Data0#data.sai2_body of
+                 undefined ->
+                     case epdg_ikev2_codec:find_payload(sa, InnerPayloads) of
+                         {ok, #{data := SB}} -> SB;
+                         _                   -> undefined
+                     end;
+                 SB2 -> SB2
+             end,
+    ChildSuite = case SaiBin of
+        undefined -> default_child_suite();
+        _ ->
             case epdg_ikev2_codec:decode_child_sa_payload(SaiBin) of
                 {ok, S} -> S;
                 _       -> default_child_suite()
-            end;
-        _ -> default_child_suite()
+            end
     end,
 
     EncKeyLen   = epdg_ikev2_codec:child_enc_key_len(maps:get(encr, ChildSuite)),
@@ -981,7 +1028,10 @@ finalize_ike_auth(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
     %% CP/TS from UE
     {UeInnerIp, PdnDns, PdnPcscf, _CpAttrsIn} =
         extract_pdn_attrs(GtpcResp),
-    {UeTsi, UeTsr} = extract_ts_in(InnerPayloads),
+    %% Same reasoning as SAi2 above — TSi/TSr were stashed from the
+    %% first IKE_AUTH. Fall back to whatever the post-EAP AUTH message
+    %% happens to carry only if the stash is empty (defensive).
+    {UeTsi, UeTsr} = extract_ts_stashed_or(Data0, InnerPayloads),
 
     install_child_sas(PeerIP, PeerPort, PeerSPI, ResponderSPI,
                        ChildSuite,
@@ -1113,6 +1163,31 @@ extract_ts_in(InnerPayloads) ->
     end,
     {Tsi, Tsr}.
 
+%% Cache helper for the first IKE_AUTH payloads we need later in
+%% finalize_ike_auth/N (RFC 7296 §2.16 EAP flow carries SAi2/TSi/TSr in
+%% the initial IKE_AUTH, not in the post-EAP-Success AUTH message).
+stash_payload_body(Kind, Payloads) ->
+    case epdg_ikev2_codec:find_payload(Kind, Payloads) of
+        {ok, #{data := B}} -> B;
+        _                  -> undefined
+    end.
+
+decode_ts_body(undefined) -> [];
+decode_ts_body(Body) ->
+    case epdg_ikev2_codec:decode_ts_payload(Body) of
+        {ok, Ts} -> Ts;
+        _        -> []
+    end.
+
+%% Prefer stashed TSi/TSr from the first IKE_AUTH; fall back to the
+%% current inner payloads only if both are missing (e.g. non-EAP UE that
+%% sent TS alongside AUTH).
+extract_ts_stashed_or(#data{tsi_body = TsiB, tsr_body = TsrB}, InnerPayloads)
+  when TsiB =/= undefined orelse TsrB =/= undefined ->
+    {decode_ts_body(TsiB), decode_ts_body(TsrB)};
+extract_ts_stashed_or(_Data, InnerPayloads) ->
+    extract_ts_in(InnerPayloads).
+
 encode_ts_or_default([]) ->
     %% Fallback: 0.0.0.0 - 255.255.255.255 full traffic selector
     epdg_ikev2_codec:encode_ts_payload([
@@ -1159,7 +1234,12 @@ install_child_sas({U_A, U_B, U_C, U_D} = UeOuter, PeerPort, PeerSPI, RespSPI,
                         auth_alg => IntegAlgIn,
                         auth_key => SkAiChild},
     InboundParams = maybe_nat_t(InboundParams0, UeOuter, PeerPort),
-    catch epdg_xfrm:create_sa(InboundParams),
+    %% Surface the real return of the xfrm call instead of swallowing it.
+    %% A silent failure here (EPERM, shell syntax error, etc.) leaves the
+    %% kernel without an IPsec SA while IKE_AUTH still completes, and the
+    %% UE data plane breaks with no on-box error trail.
+    log_xfrm_result(sa_in, SpiInInt,
+                    catch epdg_xfrm:create_sa(InboundParams)),
 
     %% Outbound SA: ePDG → UE (SPI = UE's initiator SPI)
     OutboundParams0 = #{spi => SpiOutInt,
@@ -1170,21 +1250,50 @@ install_child_sas({U_A, U_B, U_C, U_D} = UeOuter, PeerPort, PeerSPI, RespSPI,
                          auth_alg => IntegAlgIn,
                          auth_key => SkArChild},
     OutboundParams = maybe_nat_t(OutboundParams0, UeOuter, PeerPort),
-    catch epdg_xfrm:create_sa(OutboundParams),
+    log_xfrm_result(sa_out, SpiOutInt,
+                    catch epdg_xfrm:create_sa(OutboundParams)),
 
     UeCidr  = ip4_cidr(UeInnerIp, 32),
     AnyCidr = "0.0.0.0/0",
 
-    catch epdg_xfrm:create_policy(#{src => UeCidr, dst => AnyCidr,
-                                      direction => in,
-                                      tmpl_src => UeOuter,
-                                      tmpl_dst => LocalOuter}),
-    catch epdg_xfrm:create_policy(#{src => AnyCidr, dst => UeCidr,
-                                      direction => out,
-                                      tmpl_src => LocalOuter,
-                                      tmpl_dst => UeOuter}),
+    log_xfrm_result(pol_in, 0,
+        catch epdg_xfrm:create_policy(#{src => UeCidr, dst => AnyCidr,
+                                          direction => in,
+                                          tmpl_src => UeOuter,
+                                          tmpl_dst => LocalOuter})),
+    %% `dir fwd` is REQUIRED for the uplink data path: after XFRM
+    %% decrypts an inbound ESP frame, the Linux kernel checks an
+    %% inbound policy matching the *decrypted* inner packet. If that
+    %% inner packet is destined for forwarding (dst is not local to
+    %% the pod, which is the common case for ePDG → PGW), the kernel
+    %% consults `dir fwd`, NOT `dir in`. Without it, every decrypted
+    %% packet is dropped with XfrmInNoPols and never reaches the
+    %% routing / TUN layer. See xfrm(8) and net/xfrm/xfrm_policy.c.
+    log_xfrm_result(pol_fwd, 0,
+        catch epdg_xfrm:create_policy(#{src => UeCidr, dst => AnyCidr,
+                                          direction => fwd,
+                                          tmpl_src => UeOuter,
+                                          tmpl_dst => LocalOuter})),
+    log_xfrm_result(pol_out, 0,
+        catch epdg_xfrm:create_policy(#{src => AnyCidr, dst => UeCidr,
+                                          direction => out,
+                                          tmpl_src => LocalOuter,
+                                          tmpl_dst => UeOuter})),
     _ = {U_A, U_B, U_C, U_D},  %% silence unused
     ok.
+
+%% Log the return of an xfrm mutation. Keeps IKE signalling up on
+%% failure (historical behaviour) but leaves a clear audit trail when
+%% the kernel refuses the op (EPERM, shell parse, unknown algo, …).
+log_xfrm_result(_Kind, _Spi, ok) -> ok;
+log_xfrm_result(Kind, Spi, {error, Reason}) ->
+    logger:warning("XFRM ~p spi=~.16B FAILED: ~p", [Kind, Spi, Reason]),
+    epdg_metrics:inc(xfrm_sa_errors_total),
+    error;
+log_xfrm_result(Kind, Spi, Other) ->
+    logger:warning("XFRM ~p spi=~.16B unexpected: ~p", [Kind, Spi, Other]),
+    epdg_metrics:inc(xfrm_sa_errors_total),
+    error.
 
 maybe_nat_t(Params, PeerOuter, PeerPort) ->
     %% We infer NAT-T from the peer port: if the UE is sending from
@@ -1199,6 +1308,21 @@ maybe_nat_t(Params, PeerOuter, PeerPort) ->
         _ -> Params
     end.
 
+%% When the UE completes the NAT_DETECTION_*_IP exchange during
+%% IKE_SA_INIT and one end is behind a NAT, both peers move subsequent
+%% IKE traffic to UDP/4500 (RFC 3948). Our FSM stored peer_port from
+%% whatever port the very first packet arrived on (usually 500), so
+%% without this refresh `maybe_nat_t/3` later sees 500 and installs a
+%% plain-ESP XFRM state with no `encap espinudp`. That breaks decryption
+%% of the UE's ESP-in-UDP packets silently (XfrmInNoStates stays 0).
+refresh_peer_port(#data{peer_port = P} = Data, P) -> Data;
+refresh_peer_port(#data{peer_port = Old} = Data, New)
+  when is_integer(New), New > 0 ->
+    logger:info("UE FSM peer_port updated ~p -> ~p (NAT-T switch)",
+                [Old, New]),
+    Data#data{peer_port = New};
+refresh_peer_port(Data, _Other) -> Data.
+
 local_outer_ip() ->
     %% Best-effort: parse configured outer IP or fall back to 0.0.0.0.
     case epdg_config:get(ike_bind_addr, "0.0.0.0") of
@@ -1209,6 +1333,43 @@ local_outer_ip() ->
             end;
         _ -> {0,0,0,0}
     end.
+
+%% IP to choose for the NAT_DETECTION_DESTINATION_IP hash. We want an
+%% address that (a) is the one the UE's IKE arrives on internally, and
+%% (b) differs from whatever public/NATed IP the UE originally connected
+%% to — that's what forces the UE to conclude the ePDG is behind a NAT
+%% and migrate to UDP/4500. Use the configured bind addr if it is a
+%% concrete IP, otherwise scan interfaces for the first non-loopback
+%% IPv4. Falling back to {0,0,0,0} is still safe: the hash will simply
+%% differ from the UE's (UE hashes its destination IP), which is exactly
+%% what we want.
+local_hash_ip() ->
+    case local_outer_ip() of
+        {0,0,0,0} -> first_non_loopback_v4();
+        IP        -> IP
+    end.
+
+first_non_loopback_v4() ->
+    case inet:getifaddrs() of
+        {ok, IFs} -> scan_ifaddrs(IFs);
+        _         -> {0,0,0,0}
+    end.
+
+scan_ifaddrs([]) -> {0,0,0,0};
+scan_ifaddrs([{"lo", _} | Rest]) -> scan_ifaddrs(Rest);
+scan_ifaddrs([{_Name, Opts} | Rest]) ->
+    case lists:filtermap(fun({addr, {A,B,C,D}}) when A =/= 127 ->
+                                 {true, {A,B,C,D}};
+                            (_) -> false
+                         end, Opts) of
+        [IP | _] -> IP;
+        []       -> scan_ifaddrs(Rest)
+    end.
+
+ip_bytes({A,B,C,D}) -> <<A:8, B:8, C:8, D:8>>;
+ip_bytes({A,B,C,D,E,F,G,H}) ->
+    <<A:16, B:16, C:16, D:16, E:16, F:16, G:16, H:16>>;
+ip_bytes(_) -> <<0,0,0,0>>.
 
 child_enc_alg(#{id := 20, attrs := #{key_length := 256}}) -> aes_gcm_256;
 child_enc_alg(#{id := 20, attrs := #{key_length := 128}}) -> aes_gcm_128;
@@ -1304,34 +1465,6 @@ format_ip({A,B,C,D}) ->
     iolist_to_binary(io_lib:format("~B.~B.~B.~B",[A,B,C,D]));
 format_ip(Other) ->
     iolist_to_binary(io_lib:format("~p",[Other])).
-
-% #region agent log helpers
-write_fsm_log(Location, HypothesisId, Data) ->
-    Entry = jsx:encode(#{
-        sessionId    => <<"35d02f">>,
-        runId        => <<"swm-wiring">>,
-        hypothesisId => HypothesisId,
-        location     => Location,
-        message      => Location,
-        data         => sanitize_log(Data),
-        timestamp    => erlang:system_time(millisecond)}),
-    catch file:write_file(
-            "/home/carsten/Schreibtisch/volte.io/helm/.cursor/debug-35d02f.log",
-            <<Entry/binary, "\n">>, [append]),
-    ok.
-
-sanitize_log(M) when is_map(M) ->
-    maps:map(fun(_K, V) -> sanitize_log(V) end, M);
-sanitize_log(L) when is_list(L) ->
-    case io_lib:printable_list(L) of
-        true  -> iolist_to_binary(L);
-        false -> [sanitize_log(X) || X <- L]
-    end;
-sanitize_log(T) when is_tuple(T) -> sanitize_log(tuple_to_list(T));
-sanitize_log(B) when is_binary(B), byte_size(B) > 64 ->
-    <<B:64/binary>>;
-sanitize_log(V) -> V.
-% #endregion
 
 %% Dump just enough of an EAP packet to identify what the UE sent.
 %% EAP header (RFC 3748 §4): Code(1) | Id(1) | Length(2) | Type(1) | Data...
