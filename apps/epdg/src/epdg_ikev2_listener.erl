@@ -137,14 +137,12 @@ handle_ikev2_packet(Data, FromIP, FromPort, _RecvPort) ->
                          [ExType, FromIP, FromPort, ISPI]),
             dispatch(ISPI, RSPI, Header, Data, FromIP, FromPort);
         {error, Reason} ->
-            %% #region agent log
             Prefix = case Data of
                 <<P:64/binary, _/binary>> -> P;
                 _ -> Data
             end,
             logger:warning("IKEv2 decode error: ~p from ~p:~p first_bytes=~w",
                            [Reason, FromIP, FromPort, Prefix])
-            %% #endregion agent log
     end.
 
 dispatch(ISPI, 0, Header, Data, FromIP, FromPort) ->

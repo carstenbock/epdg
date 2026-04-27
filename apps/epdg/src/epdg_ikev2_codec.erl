@@ -12,6 +12,7 @@
          decode_ke_payload/1, encode_ke_payload/2,
          decode_nonce_payload/1, encode_nonce_payload/1,
          encode_notify_payload/4,
+         encode_delete_ike_payload/0,
          encode_cert_payload/1, encode_auth_payload/2,
          encode_certreq_payload/1,
          encode_id_payload/2, decode_id_payload/1,
@@ -56,6 +57,7 @@
 -define(PL_AUTH,    39).
 -define(PL_NONCE, 40).
 -define(PL_NOTIFY,41).
+-define(PL_DELETE,42).
 -define(PL_TSI,   44).
 -define(PL_TSR,   45).
 -define(PL_SK,    46).
@@ -164,13 +166,6 @@ decode_proposals(<<Last:8, _Res:8, PropLen:16, PropNum:8,
     case Rest of
         <<SPIAndTrans:SPIAndTransLen/binary, Remaining/binary>> ->
             <<SPI:SPISize/binary, TransData/binary>> = SPIAndTrans,
-            %% #region agent log
-            logger:warning("DEBUG h-sai2 decode_proposal: last=~p proplen=~p "
-                           "propnum=~p proto_id=~p spi_size=~p "
-                           "num_transforms=~p spi=~p",
-                           [Last, PropLen, PropNum, ProtoId, SPISize,
-                            NumTransforms, SPI]),
-            %% #endregion agent log
             Proposal = #{number => PropNum,
                          protocol_id => ProtoId,
                          spi => SPI,
@@ -227,6 +222,7 @@ payload_type_atom(?PL_CERTREQ) -> certreq;
 payload_type_atom(?PL_AUTH)    -> auth;
 payload_type_atom(?PL_NONCE)  -> nonce;
 payload_type_atom(?PL_NOTIFY) -> notify;
+payload_type_atom(?PL_DELETE) -> delete;
 payload_type_atom(?PL_TSI)    -> tsi;
 payload_type_atom(?PL_TSR)    -> tsr;
 payload_type_atom(?PL_SK)     -> sk;
@@ -243,6 +239,7 @@ payload_type_raw(certreq) -> ?PL_CERTREQ;
 payload_type_raw(auth)    -> ?PL_AUTH;
 payload_type_raw(nonce)  -> ?PL_NONCE;
 payload_type_raw(notify) -> ?PL_NOTIFY;
+payload_type_raw(delete) -> ?PL_DELETE;
 payload_type_raw(tsi)    -> ?PL_TSI;
 payload_type_raw(tsr)    -> ?PL_TSR;
 payload_type_raw(sk)     -> ?PL_SK;
@@ -490,6 +487,13 @@ encode_nonce_payload(Nonce) -> Nonce.
 encode_notify_payload(ProtocolId, NotifyType, SPI, Data) ->
     SPISize = byte_size(SPI),
     <<ProtocolId:8, SPISize:8, NotifyType:16, SPI/binary, Data/binary>>.
+
+%% Delete payload for the IKE SA itself (RFC 7296 §3.11):
+%% Protocol ID = 1 (IKE), SPI Size = 0, Num SPIs = 0. The IKE SPIs
+%% already live in the IKE header, so the payload body carries no SPIs.
+-spec encode_delete_ike_payload() -> binary().
+encode_delete_ike_payload() ->
+    <<1:8, 0:8, 0:16>>.
 
 %%====================================================================
 %% Identification payload (RFC 7296 §3.5) — used for IDi and IDr

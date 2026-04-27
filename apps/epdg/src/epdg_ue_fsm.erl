@@ -17,6 +17,12 @@
 -define(IKE_AUTH_TIMEOUT,    60000).
 -define(DPD_INTERVAL,       120000).
 
+%% Maximum jitter for graceful-drain teardown. Broadcast {drain, _} fans
+%% out to every live UE FSM simultaneously; each FSM picks a random delay
+%% in [0, ?DRAIN_MAX_JITTER_MS) before tearing its tunnel down so N UEs
+%% don't all reconnect to a sibling pod in the same millisecond.
+-define(DRAIN_MAX_JITTER_MS, 30000).
+
 -record(data, {
     peer_ip          :: inet:ip_address() | undefined,
     peer_port        :: inet:port_number() | undefined,
@@ -189,6 +195,11 @@ idle(cast, {ikev2, #{exchange_type := ike_sa_init} = Header, RawData, FromPort},
 idle(cast, {ikev2, _, _, _}, Data) ->
     {keep_state, Data};
 
+idle(cast, {drain, Reason}, Data) ->
+    handle_drain(idle, Reason, Data);
+idle(info, drain_stop, _Data) ->
+    {stop, {shutdown, drained}};
+
 idle(state_timeout, timeout, #data{peer_ip = PeerIP} = _Data) ->
     logger:warning("UE FSM idle timeout (no IKE_SA_INIT received) peer=~p", [PeerIP]),
     {stop, normal};
@@ -222,6 +233,11 @@ ike_sa_init(cast, {ikev2, #{exchange_type := ike_sa_init}, _RawData, FromPort},
 ike_sa_init(cast, {ikev2, _, _, _}, Data) ->
     {keep_state, Data};
 
+ike_sa_init(cast, {drain, Reason}, Data) ->
+    handle_drain(ike_sa_init, Reason, Data);
+ike_sa_init(info, drain_stop, _Data) ->
+    {stop, {shutdown, drained}};
+
 ike_sa_init(state_timeout, timeout,
             #data{peer_ip = PeerIP, initiator_spi = ISPI} = _Data) ->
     logger:warning("UE FSM ike_sa_init timeout (no IKE_AUTH received) "
@@ -249,6 +265,11 @@ ike_auth(cast, disconnect, _Data) ->
 %% cleanly and the UE will redial.
 ike_auth(cast, pgw_restart, _Data) -> {stop, {shutdown, pgw_restart}};
 ike_auth(cast, pgw_down,    _Data) -> {stop, {shutdown, pgw_unreachable}};
+
+ike_auth(cast, {drain, Reason}, Data) ->
+    handle_drain(ike_auth, Reason, Data);
+ike_auth(info, drain_stop, _Data) ->
+    {stop, {shutdown, drained}};
 
 ike_auth(state_timeout, timeout, #data{peer_ip = PeerIP, imsi = IMSI} = _Data) ->
     logger:warning("UE FSM ike_auth timeout (EAP exchange abandoned) "
@@ -280,6 +301,16 @@ established(cast, disconnect, _Data) ->
 
 established(cast, pgw_restart, _Data) -> {stop, {shutdown, pgw_restart}};
 established(cast, pgw_down,    _Data) -> {stop, {shutdown, pgw_unreachable}};
+
+established(cast, {drain, Reason}, Data) ->
+    handle_drain(established, Reason, Data);
+established(info, drain_stop, Data) ->
+    %% Best-effort: tell the UE to abandon this IKE SA so it can redial
+    %% a sibling pod immediately rather than waiting for DPD. Any failure
+    %% (missing keys, listener down) is logged and swallowed — we still
+    %% tear the FSM down so the preStop deadline is honoured.
+    _ = try_send_delete_informational(Data),
+    {stop, {shutdown, drained}};
 
 established(state_timeout, dpd, #data{peer_ip = _PeerIP} = Data) ->
     %% Dead Peer Detection: send empty INFORMATIONAL
@@ -1524,6 +1555,83 @@ eap_aka_subtype_name(_)  -> "?".
 handle_informational(_Header, _RawData, Data) ->
     %% Handle DPD (empty INFORMATIONAL) or DELETE payloads
     {keep_state, Data}.
+
+%%====================================================================
+%% Graceful drain helpers
+%%
+%% On a rolling upgrade the preStop hook POSTs /admin/drain; that handler
+%% flips the readiness flag (so the LoadBalancer de-registers this pod)
+%% and casts {drain, Reason} to every live UE FSM via
+%% epdg_ue_registry:broadcast/1. Each FSM picks a random jitter in
+%% [0, ?DRAIN_MAX_JITTER_MS) so N UEs don't all reconnect to a sibling
+%% pod at the same millisecond, then terminates when the jitter fires.
+%%====================================================================
+
+handle_drain(State, Reason, #data{peer_ip = PeerIP, imsi = IMSI} = Data) ->
+    case get(drain_scheduled) of
+        true ->
+            {keep_state, Data};
+        _ ->
+            Jitter = rand:uniform(?DRAIN_MAX_JITTER_MS + 1) - 1,
+            erlang:send_after(Jitter, self(), drain_stop),
+            put(drain_scheduled, true),
+            logger:info("UE FSM drain scheduled state=~p reason=~p peer=~p "
+                        "IMSI=~p jitter_ms=~B",
+                        [State, Reason, PeerIP, IMSI, Jitter]),
+            {keep_state, Data}
+    end.
+
+%% Best-effort IKEv2 INFORMATIONAL(DELETE) from the established state.
+%% Requires the IKE keys to have been derived; silently no-ops otherwise.
+%% The pod is about to terminate anyway, so any failure here is logged
+%% at info level and swallowed — the UE will notice via DPD after its
+%% next interval.
+try_send_delete_informational(#data{ike_keys = Keys,
+                                    keys_params = KeyParams,
+                                    initiator_spi = ISPI,
+                                    responder_spi = RSPI,
+                                    peer_ip = PeerIP,
+                                    peer_port = PeerPort,
+                                    message_id = MsgId})
+  when is_map(Keys), is_map(KeyParams),
+       is_integer(ISPI), is_integer(RSPI),
+       is_tuple(PeerIP), is_integer(PeerPort) ->
+    %% We are the IKE SA responder initiating an INFORMATIONAL exchange
+    %% to gracefully tear down the SA (RFC 7296 §1.4.1). Per §2.2 each
+    %% side uses its own SK_e*/SK_a* regardless of exchange role; the
+    %% encoder we pass `responder` to selects the responder-half keys,
+    %% which is correct here. Flags: Initiator(1)=1 because we initiate
+    %% this exchange; Response(5)=0 because it's a request. Exchange
+    %% type 37 = INFORMATIONAL.
+    DeletePayload = epdg_ikev2_codec:encode_delete_ike_payload(),
+    Hdr = #{initiator_spi     => ISPI,
+            responder_spi     => RSPI,
+            exchange_type_raw => 37,
+            flags             => 16#08,
+            message_id        => MsgId},
+    try
+        case epdg_ikev2_crypto:encode_encrypted_message(
+               KeyParams, Keys, responder, Hdr, [{delete, DeletePayload}]) of
+            {ok, Bytes} ->
+                catch epdg_ikev2_listener:send(PeerIP, PeerPort, Bytes),
+                logger:info("Drain: IKEv2 DELETE informational sent "
+                            "(~B bytes) peer=~p:~p",
+                            [byte_size(Bytes), PeerIP, PeerPort]),
+                ok;
+            {error, EncErr} ->
+                logger:info("Drain: IKEv2 DELETE encode skipped: ~p", [EncErr]),
+                ok
+        end
+    catch
+        Class:CReason:_ ->
+            logger:info("Drain: IKEv2 DELETE best-effort send failed: ~p:~p",
+                        [Class, CReason]),
+            ok
+    end;
+try_send_delete_informational(_Data) ->
+    %% No keys yet (pre-auth) — nothing we can encrypt. The UE will
+    %% time out its half-open IKE SA naturally.
+    ok.
 
 %%====================================================================
 %% Internal: certificate loading
