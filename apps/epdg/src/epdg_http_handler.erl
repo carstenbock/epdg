@@ -9,7 +9,7 @@
 %%%-------------------------------------------------------------------
 -module(epdg_http_handler).
 
--export([init/2, is_draining/0]).
+-export([init/2, is_draining/0, set_draining/1]).
 
 %% persistent_term key used to signal graceful drain. Absent/undefined
 %% means "serving"; any truthy value means "drain in progress".

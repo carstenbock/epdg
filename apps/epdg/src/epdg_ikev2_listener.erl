@@ -95,6 +95,18 @@ handle_call(get_local_ip, _From, #state{local_ip = IP} = State) ->
 handle_call(_Req, _From, State) ->
     {reply, {error, unknown_request}, State}.
 
+handle_cast(stop_accepting,
+            #state{socket_500 = S500, socket_4500 = S4500} = State) ->
+    %% Called from `epdg_app:prep_stop/1' during graceful shutdown.
+    %% Close the UDP sockets immediately so no new IKE_SA_INIT can land
+    %% and spawn a UE FSM during the supervisor walk. The gen_server
+    %% itself stays alive until its supervisor shutdown so any in-flight
+    %% `send/3' calls still get a reply (with `{error, einval}' once the
+    %% socket is gone, which the FSM `catch'es).
+    close_if_open(S500),
+    close_if_open(S4500),
+    logger:info("IKEv2 listener sockets closed (stop_accepting)"),
+    {noreply, State#state{socket_500 = undefined, socket_4500 = undefined}};
 handle_cast(_Msg, State) ->
     {noreply, State}.
 

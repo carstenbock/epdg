@@ -250,7 +250,19 @@ handle_info(health_check, State) ->
 handle_info(_Info, State) -> {noreply, State}.
 
 terminate(_Reason, #state{service_started = true}) ->
-    diameter:stop_service(?SVC_NAME),
+    %% `epdg_app:prep_stop/1' already calls `diameter:stop_service/1'
+    %% before the supervisor walks the tree, so by the time this
+    %% gen_server's `terminate/2' fires the service is normally gone.
+    %% Probe `diameter:services/0' first so we only invoke
+    %% `stop_service/1' once -- the second call against an
+    %% already-stopped service can block on stale transport state and
+    %% blow past the 5 s supervisor shutdown window, leaving diameter
+    %% app state half-cleaned for the later `application:stop(diameter)'
+    %% in `init:stop/0' to hang on.
+    case lists:member(?SVC_NAME, diameter:services()) of
+        true  -> catch diameter:stop_service(?SVC_NAME);
+        false -> ok
+    end,
     ok;
 terminate(_Reason, _State) ->
     ok.
