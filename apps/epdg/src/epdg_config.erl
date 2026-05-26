@@ -14,7 +14,10 @@ init() ->
     set_from_env("EPDG_ORIGIN_REALM", origin_realm, "localdomain"),
 
     %% IKEv2
-    set_from_env("EPDG_IKE_BIND_ADDR", ike_bind_addr, "0.0.0.0"),
+    set_from_env_resolved_addr("EPDG_IKE_BIND_ADDR",
+                               "EPDG_IKE_BIND_ADDR_BY_POD",
+                               "EPDG_IKE_BIND_ADDR_BY_NODE",
+                               ike_bind_addr, "0.0.0.0"),
     set_from_env_int("EPDG_IKE_PORT", ike_port, 500),
     set_from_env_int("EPDG_IKE_NATT_PORT", ike_natt_port, 4500),
 
@@ -44,6 +47,17 @@ init() ->
     set_from_env_int("PGW_PORT", pgw_port, 2123),
     set_from_env("EPDG_GTPC_BIND_ADDR", gtpc_bind_addr, "0.0.0.0"),
     set_from_env_int("EPDG_GTPC_PORT", gtpc_port, 2123),
+    %% GTP-U (TS 29.281) bind and advertised S2b-U F-TEID address.
+    %% `gtpu_advertise_addr` defaults to "same as local GTP-C IP" when empty.
+    set_from_env_resolved_addr("EPDG_GTPU_BIND_ADDR",
+                               "EPDG_GTPU_BIND_ADDR_BY_POD",
+                               "EPDG_GTPU_BIND_ADDR_BY_NODE",
+                               gtpu_bind_addr, "0.0.0.0"),
+    set_from_env_resolved_addr("EPDG_GTPU_ADVERTISE_ADDR",
+                               "EPDG_GTPU_ADVERTISE_ADDR_BY_POD",
+                               "EPDG_GTPU_ADVERTISE_ADDR_BY_NODE",
+                               gtpu_advertise_addr, ""),
+    set_from_env_int("EPDG_GTPU_PORT", gtpu_port, 2152),
     %% GTP-C Echo heartbeat & reconnect tunables (TS 29.274 §7.1)
     set_from_env_int("EPDG_GTPC_ECHO_INTERVAL_SEC", gtpc_echo_interval_sec, 60),
     set_from_env_int("EPDG_GTPC_ECHO_TIMEOUT_SEC", gtpc_echo_timeout_sec, 3),
@@ -115,6 +129,38 @@ set_from_env_int(EnvVar, AppKey, Default) ->
         Val -> list_to_integer(Val)
     end,
     application:set_env(?APP, AppKey, Value).
+
+set_from_env_resolved_addr(PrimaryEnv, ByPodEnv, ByNodeEnv, AppKey, Default) ->
+    Primary = os:getenv(PrimaryEnv, Default),
+    Hostname = os:getenv("HOSTNAME", ""),
+    NodeName = os:getenv("NODE_NAME", ""),
+    ByPodMap = parse_addr_map(os:getenv(ByPodEnv, "")),
+    ByNodeMap = parse_addr_map(os:getenv(ByNodeEnv, "")),
+    Value = case maps:get(Hostname, ByPodMap, undefined) of
+        undefined -> case maps:get(NodeName, ByNodeMap, undefined) of
+            undefined -> Primary;
+            NodeVal -> NodeVal
+        end;
+        PodVal -> PodVal
+    end,
+    application:set_env(?APP, AppKey, Value).
+
+parse_addr_map(false) -> #{};
+parse_addr_map("") -> #{};
+parse_addr_map(Csv) when is_list(Csv) ->
+    lists:foldl(
+      fun(Ent, Acc) ->
+              Parts = string:split(string:trim(Ent), "=", all),
+              case Parts of
+                  [K, V] when K =/= "", V =/= "" ->
+                      Acc#{K => V};
+                  _ ->
+                      Acc
+              end
+      end,
+      #{},
+      string:split(Csv, ",", all)
+    ).
 
 set_dra_hosts() ->
     Hosts = case os:getenv("DRA_HOSTS") of

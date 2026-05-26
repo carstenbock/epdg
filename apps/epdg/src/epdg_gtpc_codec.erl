@@ -77,6 +77,7 @@ encode_create_session_request(#{seq_num := Seq,
     EBI      = maps:get(ebi, Params, 5),
     LocalCTeid = maps:get(local_c_teid, Params, 0),
     LocalUTeid = maps:get(local_u_teid, Params, 0),
+    LocalUIP = maps:get(local_u_ip, Params, LIP),
     PdnType  = maps:get(pdn_type, Params, 1), %% 1=IPv4 2=IPv6 3=IPv4v6
 
     IEs = lists:flatten([
@@ -92,7 +93,7 @@ encode_create_session_request(#{seq_num := Seq,
         encode_paa_ie(PdnType),
         encode_apn_ambr_ie(AmbrUl, AmbrDl),
         encode_pco_request_ie(),
-        encode_bearer_context_req_ie(EBI, LocalUTeid, LIP),
+        encode_bearer_context_req_ie(EBI, LocalUTeid, LocalUIP),
         case UeTZ of
             undefined -> <<>>;
             _         -> encode_ie(?IE_UE_TIME_ZONE, UeTZ)

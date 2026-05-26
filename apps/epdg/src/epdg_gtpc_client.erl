@@ -52,6 +52,7 @@
 -record(state, {
     socket        :: gen_udp:socket() | undefined,
     local_ip      :: inet:ip_address() | undefined,
+    local_u_ip    :: inet:ip_address() | undefined,
     pgw_fqdn      :: string() | undefined,
     pgw_ip        :: inet:ip_address() | undefined,
     pgw_port      :: inet:port_number(),
@@ -122,11 +123,14 @@ init([]) ->
                               {reuseaddr, true}, InetFamily]) of
         {ok, Socket} ->
             {ok, {LIP, _}} = inet:sockname(Socket),
+            LocalUIP = resolve_local_u_ip(epdg_config:get(gtpu_advertise_addr, ""),
+                                          LIP),
             logger:info("GTP-C S2b on ~p:~p → PGW FQDN=~p port=~p",
                         [LIP, Port, PgwFqdn, PgwPort]),
             State0 = #state{
                 socket        = Socket,
                 local_ip      = LIP,
+                local_u_ip    = LocalUIP,
                 pgw_fqdn      = PgwFqdn,
                 pgw_ip        = undefined,
                 pgw_port      = PgwPort,
@@ -255,7 +259,7 @@ send_call(delete_session, Params, From, State) ->
 %%====================================================================
 
 send_create_session(Params, From,
-                    #state{seq_num = Seq, local_ip = LIP,
+                    #state{seq_num = Seq, local_ip = LIP, local_u_ip = LUIP,
                            local_recovery = Rec,
                            epoch = Epoch} = State) ->
     APN      = maps:get(apn,     Params, <<"ims">>),
@@ -289,6 +293,7 @@ send_create_session(Params, From,
         rat_type      => RAT,
         pdn_type      => PdnType,
         local_ip      => LIP,
+        local_u_ip    => LUIP,
         local_c_teid  => LCT,
         local_u_teid  => LUT,
         recovery      => Rec,
@@ -570,6 +575,20 @@ parse_ip_or_any(Str) when is_list(Str) ->
         _        -> {0,0,0,0}
     end;
 parse_ip_or_any(T) when is_tuple(T) -> T.
+
+resolve_local_u_ip(undefined, Default) -> Default;
+resolve_local_u_ip("", Default) -> Default;
+resolve_local_u_ip("0.0.0.0", Default) -> Default;
+resolve_local_u_ip(Str, Default) when is_list(Str) ->
+    case inet:parse_address(Str) of
+        {ok, IP} -> IP;
+        _        -> Default
+    end;
+resolve_local_u_ip(Bin, Default) when is_binary(Bin) ->
+    resolve_local_u_ip(binary_to_list(Bin), Default);
+resolve_local_u_ip({0,0,0,0}, Default) -> Default;
+resolve_local_u_ip(T, _Default) when is_tuple(T) -> T;
+resolve_local_u_ip(_, Default) -> Default.
 
 %% Enforce that the PGW configuration is an FQDN, not an IP literal.
 %% Pod IPs and ClusterIPs in Kubernetes change under our feet; binding
