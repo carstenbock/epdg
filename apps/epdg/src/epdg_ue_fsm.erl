@@ -296,6 +296,16 @@ established(cast, {ikev2, #{exchange_type := create_child_sa} = _Header, _RawDat
     %% MOBIKE or rekey
     {keep_state, refresh_peer_port(Data, FromPort)};
 
+established(cast, {ikev2, #{exchange_type := ike_auth, message_id := MsgId} = _Header,
+                   _RawData, FromPort}, #data{imsi = IMSI} = Data) ->
+    %% Some UEs send an additional IKE_AUTH after SA establishment
+    %% (e.g. second CHILD SA for a different traffic selector).
+    %% RFC 7296 §2.2: a non-piggybacked CHILD SA should use
+    %% CREATE_CHILD_SA, but real-world VoWiFi handsets deviate.
+    logger:warning("established: ignoring unexpected ike_auth msg_id=~B "
+                   "IMSI=~p", [MsgId, IMSI]),
+    {keep_state, refresh_peer_port(Data, FromPort)};
+
 established(cast, disconnect, _Data) ->
     {stop, normal};
 

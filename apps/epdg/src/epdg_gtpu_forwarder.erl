@@ -378,11 +378,13 @@ maybe_open_tun(Name, {A,B,C,D} = _Ip, LocalTeid) ->
                 io_lib:format("ip link set dev ~s up", [Name]),
                 %% Loose rp_filter on the TUN so decrypted uplink with
                 %% src=UE_IP isn't dropped as a martian (asymmetric path).
-                %% When default.rp_filter=2 is set via pod sysctls, new
-                %% interfaces inherit the value and this is a no-op.
+                %% Values 0 (none) and 2 (loose) are both safe; only 1
+                %% (strict) drops asymmetric-path packets. The host or
+                %% pod-level sysctls may already set default.rp_filter
+                %% to 0 or 2, in which case new interfaces inherit it.
                 io_lib:format(
-                    "[ \"$(cat /proc/sys/net/ipv4/conf/~s/rp_filter "
-                    "2>/dev/null)\" = 2 ] || "
+                    "val=$(cat /proc/sys/net/ipv4/conf/~s/rp_filter "
+                    "2>/dev/null); [ \"$val\" != 1 ] || "
                     "sysctl -wq net.ipv4.conf.~s.rp_filter=2", [Name, Name]),
                 %% Main table downlink route: lets FIB lookup for dst=UE_IP
                 %% succeed; the XFRM OUT bundle (dst=UE_IP/32 tmpl tunnel esp)
@@ -431,29 +433,44 @@ run_cmds_or_warn(Name, Cmds) ->
       end, ok, Cmds).
 
 %% Verify forwarding sysctls are in effect. When set via pod-level
-%% securityContext.sysctls the values are already correct and the
-%% write attempts below are harmless no-ops (or fail on a read-only
-%% /proc/sys — the verification catch that).
+%% securityContext.sysctls or host-level /etc/sysctl.d/ the values
+%% are already correct and the write attempts are harmless no-ops
+%% (or fail on a read-only /proc/sys).
 ensure_forwarding_sysctls() ->
     _ = os:cmd("sysctl -wq net.ipv4.ip_forward=1 2>&1"),
-    _ = os:cmd("sysctl -wq net.ipv4.conf.all.rp_filter=2 2>&1"),
-    verify_sysctl("net.ipv4.ip_forward", "1"),
-    verify_sysctl("net.ipv4.conf.all.rp_filter", "2"),
+    verify_sysctl_exact("net.ipv4.ip_forward", "1"),
+    verify_rp_filter("net.ipv4.conf.all.rp_filter"),
     ok.
 
-verify_sysctl(Key, Expected) ->
+verify_sysctl_exact(Key, Expected) ->
+    case read_sysctl(Key) of
+        Expected -> ok;
+        {error, Reason} ->
+            logger:warning("sysctl ~s: ~s", [Key, Reason]);
+        Actual ->
+            logger:error("sysctl ~s=~s (need ~s); add to pod "
+                         "securityContext.sysctls or run in "
+                         "privileged mode", [Key, Actual, Expected])
+    end.
+
+%% rp_filter: 0 (none) and 2 (loose) are both safe for the ePDG's
+%% asymmetric TUN path. Only 1 (strict) drops uplink packets.
+verify_rp_filter(Key) ->
+    case read_sysctl(Key) of
+        "1" ->
+            logger:error("sysctl ~s=1 (strict); uplink will be dropped "
+                         "— set to 0 or 2 via host sysctl or pod "
+                         "securityContext.sysctls", [Key]);
+        {error, Reason} ->
+            logger:warning("sysctl ~s: ~s", [Key, Reason]);
+        _ -> ok
+    end.
+
+read_sysctl(Key) ->
     Path = "/proc/sys/" ++ re:replace(Key, "\\.", "/", [global, {return, list}]),
     case file:read_file(list_to_binary(Path)) of
-        {ok, Bin} ->
-            case string:trim(binary_to_list(Bin)) of
-                Expected -> ok;
-                Actual ->
-                    logger:error("sysctl ~s=~s (need ~s); add to pod "
-                                 "securityContext.sysctls or run in "
-                                 "privileged mode", [Key, Actual, Expected])
-            end;
-        {error, _} ->
-            logger:warning("sysctl ~s: cannot read ~s", [Key, Path])
+        {ok, Bin} -> string:trim(binary_to_list(Bin));
+        {error, _} -> {error, "cannot read " ++ Path}
     end.
 
 open_tun_port(Name) ->
