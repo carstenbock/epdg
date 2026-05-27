@@ -378,7 +378,12 @@ maybe_open_tun(Name, {A,B,C,D} = _Ip, LocalTeid) ->
                 io_lib:format("ip link set dev ~s up", [Name]),
                 %% Loose rp_filter on the TUN so decrypted uplink with
                 %% src=UE_IP isn't dropped as a martian (asymmetric path).
-                io_lib:format("sysctl -wq net.ipv4.conf.~s.rp_filter=2", [Name]),
+                %% When default.rp_filter=2 is set via pod sysctls, new
+                %% interfaces inherit the value and this is a no-op.
+                io_lib:format(
+                    "[ \"$(cat /proc/sys/net/ipv4/conf/~s/rp_filter "
+                    "2>/dev/null)\" = 2 ] || "
+                    "sysctl -wq net.ipv4.conf.~s.rp_filter=2", [Name, Name]),
                 %% Main table downlink route: lets FIB lookup for dst=UE_IP
                 %% succeed; the XFRM OUT bundle (dst=UE_IP/32 tmpl tunnel esp)
                 %% overrides and actually emits ESP via eth0.
@@ -425,11 +430,31 @@ run_cmds_or_warn(Name, Cmds) ->
               end
       end, ok, Cmds).
 
-%% Enable forwarding once per pod. Cheap to repeat if called again.
+%% Verify forwarding sysctls are in effect. When set via pod-level
+%% securityContext.sysctls the values are already correct and the
+%% write attempts below are harmless no-ops (or fail on a read-only
+%% /proc/sys — the verification catch that).
 ensure_forwarding_sysctls() ->
     _ = os:cmd("sysctl -wq net.ipv4.ip_forward=1 2>&1"),
     _ = os:cmd("sysctl -wq net.ipv4.conf.all.rp_filter=2 2>&1"),
+    verify_sysctl("net.ipv4.ip_forward", "1"),
+    verify_sysctl("net.ipv4.conf.all.rp_filter", "2"),
     ok.
+
+verify_sysctl(Key, Expected) ->
+    Path = "/proc/sys/" ++ re:replace(Key, "\\.", "/", [global, {return, list}]),
+    case file:read_file(list_to_binary(Path)) of
+        {ok, Bin} ->
+            case string:trim(binary_to_list(Bin)) of
+                Expected -> ok;
+                Actual ->
+                    logger:error("sysctl ~s=~s (need ~s); add to pod "
+                                 "securityContext.sysctls or run in "
+                                 "privileged mode", [Key, Actual, Expected])
+            end;
+        {error, _} ->
+            logger:warning("sysctl ~s: cannot read ~s", [Key, Path])
+    end.
 
 open_tun_port(Name) ->
     case locate_tun_helper() of
