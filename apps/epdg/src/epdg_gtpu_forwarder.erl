@@ -101,6 +101,7 @@ send(LocalTeid, InnerPkt) ->
 %%====================================================================
 
 init([]) ->
+    cleanup_stale_tun_devices(),
     BindIpStr = epdg_config:get(gtpu_bind_addr, "0.0.0.0"),
     BindIp    = parse_ip_or_any(BindIpStr),
     Port      = epdg_config:get(gtpu_port, ?GTPU_PORT),
@@ -113,6 +114,7 @@ init([]) ->
                               {reuseaddr, true}, InetFamily]) of
         {ok, Socket} ->
             logger:info("GTP-U forwarder on ~p:~p", [BindIp, Port]),
+            schedule_gc(),
             {ok, #state{socket = Socket,
                         bind_ip = BindIp,
                         bind_port = Port,
@@ -126,6 +128,7 @@ init([]) ->
             %% — start in a degraded mode so the supervisor comes up.
             logger:warning("GTP-U: bind ~p:~p failed (eaddrinuse); "
                            "forwarder disabled", [BindIp, Port]),
+            schedule_gc(),
             {ok, #state{socket = undefined, bind_ip = BindIp,
                         bind_port = Port, by_teid = #{}, by_owner = #{},
                         by_port = #{}, next_teid = 16#1000,
@@ -133,6 +136,7 @@ init([]) ->
         {error, Reason} ->
             logger:warning("GTP-U: bind ~p:~p failed: ~p; forwarder disabled",
                            [BindIp, Port, Reason]),
+            schedule_gc(),
             {ok, #state{socket = undefined, bind_ip = BindIp,
                         bind_port = Port, by_teid = #{}, by_owner = #{},
                         by_port = #{}, next_teid = 16#1000,
@@ -198,6 +202,16 @@ handle_info({'DOWN', _MRef, process, Pid, _Reason},
         {ok, Teid} -> {noreply, do_unregister_teid(Teid, State)};
         error      -> {noreply, State}
     end;
+handle_info(gc_tun, #state{by_teid = Map} = State) ->
+    Stale = find_orphaned_tuns(Map),
+    lists:foreach(fun({Name, Ip, Teid}) ->
+        teardown_ue_routing(Ip, Teid),
+        delete_tun_dev(Name),
+        epdg_metrics:inc(tun_gc_cleaned_total),
+        logger:info("GC: removed orphaned TUN ~s (teid=~B)", [Name, Teid])
+    end, Stale),
+    schedule_gc(),
+    {noreply, State};
 handle_info(_Info, State) -> {noreply, State}.
 
 terminate(_Reason, #state{socket = S, by_teid = Map}) ->
@@ -553,6 +567,79 @@ tun_write(Port, Pkt) when is_port(Port), is_binary(Pkt) ->
 tun_name_for(P) ->
     Teid = maps:get(local_teid_hint, P, 0),
     lists:flatten(io_lib:format("ue~B", [Teid])).
+
+%%====================================================================
+%% Startup orphan cleanup
+%%====================================================================
+
+cleanup_stale_tun_devices() ->
+    Raw = os:cmd("ip -o link show type tun 2>/dev/null"),
+    Lines = string:split(Raw, "\n", all),
+    Stale = [Name || L <- Lines,
+                     Name <- [extract_ue_tun_name(L)],
+                     Name =/= undefined],
+    lists:foreach(fun(Name) ->
+        Ip = tun_ip_from_route(Name),
+        Teid = teid_from_tun_name(Name),
+        teardown_ue_routing(Ip, Teid),
+        delete_tun_dev(Name),
+        epdg_metrics:inc(tun_startup_cleaned_total)
+    end, Stale),
+    case length(Stale) of
+        0 -> ok;
+        N -> logger:notice("Startup cleanup: removed ~B stale TUN device(s)", [N])
+    end.
+
+extract_ue_tun_name(Line) ->
+    case re:run(Line, "\\b(ue[0-9]+):", [{capture, [1], list}]) of
+        {match, [Name]} -> Name;
+        _               -> undefined
+    end.
+
+teid_from_tun_name("ue" ++ Digits) ->
+    try list_to_integer(Digits)
+    catch _:_ -> 0
+    end;
+teid_from_tun_name(_) -> 0.
+
+tun_ip_from_route(Name) ->
+    Cmd = lists:flatten(io_lib:format(
+        "ip route show dev ~s 2>/dev/null | head -1 | awk '{print $1}'", [Name])),
+    Raw = string:trim(os:cmd(Cmd)),
+    case parse_route_ip(Raw) of
+        {ok, Ip} -> Ip;
+        _        -> undefined
+    end.
+
+parse_route_ip(Str) ->
+    %% Strip /32 suffix if present
+    Bare = case string:split(Str, "/") of
+        [H | _] -> H;
+        _       -> Str
+    end,
+    case inet:parse_ipv4_address(Bare) of
+        {ok, Ip} -> {ok, Ip};
+        _        -> error
+    end.
+
+%%====================================================================
+%% Periodic GC reconciliation
+%%====================================================================
+
+schedule_gc() ->
+    Interval = epdg_config:get(tun_gc_interval, 300000),
+    erlang:send_after(Interval, self(), gc_tun).
+
+find_orphaned_tuns(ByTeid) ->
+    Raw = os:cmd("ip -o link show type tun 2>/dev/null"),
+    Lines = string:split(Raw, "\n", all),
+    AllNames = [Name || L <- Lines,
+                        Name <- [extract_ue_tun_name(L)],
+                        Name =/= undefined],
+    [{Name, tun_ip_from_route(Name), Teid}
+     || Name <- AllNames,
+        Teid <- [teid_from_tun_name(Name)],
+        not maps:is_key(Teid, ByTeid)].
 
 %%====================================================================
 %% Helpers

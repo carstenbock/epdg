@@ -16,6 +16,8 @@
 -define(IKE_SA_INIT_TIMEOUT, 30000).
 -define(IKE_AUTH_TIMEOUT,    60000).
 -define(DPD_INTERVAL,       120000).
+-define(DPD_TIMEOUT,         10000).
+-define(DPD_RETRIES,             3).
 
 %% Maximum jitter for graceful-drain teardown. Broadcast {drain, _} fans
 %% out to every live UE FSM simultaneously; each FSM picks a random delay
@@ -54,6 +56,8 @@
     idr_body         :: binary() | undefined,
     %% UE NAI (IDi payload data) for SWm user-name etc.
     ue_nai           :: binary() | undefined,
+    %% DPD consecutive failure counter (RFC 7296 §2.4)
+    dpd_failures     :: non_neg_integer(),
     %% EAP identifier counter (monotonic per RFC 3748)
     eap_next_id      :: non_neg_integer(),
     %% X.509 certificate for IKEv2 responder auth (TS 33.402 §7.2.1)
@@ -139,6 +143,7 @@ init(#{peer_ip := PeerIP, peer_port := PeerPort} = _Ctx) ->
         peer_port     = PeerPort,
         responder_spi = RSPI,
         message_id    = 0,
+        dpd_failures  = 0,
         eap_next_id   = 1,
         cert_der      = CertDer,
         private_key   = PrivKey,
@@ -287,7 +292,16 @@ established(enter, _OldState, #data{responder_spi = RSPI, imsi = IMSI} = Data) -
     epdg_ue_registry:register(RSPI, self(), IMSI),
     logger:info("Tunnel established IMSI=~p RSPI=~.16B", [IMSI, RSPI]),
     epdg_metrics:inc(ike_tunnels_established_total),
-    {keep_state, Data, [{state_timeout, ?DPD_INTERVAL, dpd}]};
+    Interval = epdg_config:get(dpd_interval, ?DPD_INTERVAL),
+    {keep_state, Data, [{state_timeout, Interval, dpd}]};
+
+established(cast, {ikev2, #{exchange_type := informational, flags := Flags} = _Header,
+                   _RawData, FromPort}, Data)
+  when (Flags band 16#20) =/= 0 ->
+    %% INFORMATIONAL response — this is the UE's reply to our DPD probe.
+    Interval = epdg_config:get(dpd_interval, ?DPD_INTERVAL),
+    {keep_state, (refresh_peer_port(Data, FromPort))#data{dpd_failures = 0},
+     [{state_timeout, Interval, dpd}]};
 
 established(cast, {ikev2, #{exchange_type := informational} = Header, RawData, FromPort}, Data) ->
     handle_informational(Header, RawData, refresh_peer_port(Data, FromPort));
@@ -322,10 +336,20 @@ established(info, drain_stop, Data) ->
     _ = try_send_delete_informational(Data),
     {stop, {shutdown, drained}};
 
-established(state_timeout, dpd, #data{peer_ip = _PeerIP} = Data) ->
-    %% Dead Peer Detection: send empty INFORMATIONAL
-    %% If no response within timeout, terminate
-    {keep_state, Data, [{state_timeout, ?DPD_INTERVAL, dpd}]};
+established(state_timeout, dpd, #data{dpd_failures = F, imsi = IMSI} = Data) ->
+    MaxRetries = epdg_config:get(dpd_retries, ?DPD_RETRIES),
+    case F >= MaxRetries of
+        true ->
+            logger:warning("DPD: peer unreachable after ~B probes, "
+                           "terminating IMSI=~p", [F, IMSI]),
+            epdg_metrics:inc(dpd_timeout_total),
+            {stop, {shutdown, dpd_timeout}};
+        false ->
+            Data1 = send_dpd_probe(Data),
+            Timeout = epdg_config:get(dpd_timeout, ?DPD_TIMEOUT),
+            {keep_state, Data1#data{dpd_failures = F + 1},
+             [{state_timeout, Timeout, dpd}]}
+    end;
 
 established({call, From}, get_state, Data) ->
     {keep_state, Data, [{reply, From, {ok, established}}]}.
@@ -1565,6 +1589,46 @@ eap_aka_subtype_name(_)  -> "?".
 handle_informational(_Header, _RawData, Data) ->
     %% Handle DPD (empty INFORMATIONAL) or DELETE payloads
     {keep_state, Data}.
+
+%%====================================================================
+%% DPD probe (RFC 7296 §2.4)
+%%
+%% An empty INFORMATIONAL request: the responder (us) initiates an
+%% exchange with Flags=Initiator (we start this exchange), exchange_type
+%% 37, no inner payloads. The UE must reply with an empty
+%% INFORMATIONAL response.
+%%====================================================================
+
+send_dpd_probe(#data{ike_keys = Keys, keys_params = KeyParams,
+                     initiator_spi = ISPI, responder_spi = RSPI,
+                     peer_ip = PeerIP, peer_port = PeerPort,
+                     message_id = MsgId} = Data)
+  when is_map(Keys), is_map(KeyParams),
+       is_integer(ISPI), is_integer(RSPI),
+       is_tuple(PeerIP), is_integer(PeerPort) ->
+    Hdr = #{initiator_spi     => ISPI,
+            responder_spi     => RSPI,
+            exchange_type_raw => 37,
+            flags             => 16#08,
+            message_id        => MsgId},
+    try
+        case epdg_ikev2_crypto:encode_encrypted_message(
+               KeyParams, Keys, responder, Hdr, []) of
+            {ok, Bytes} ->
+                catch epdg_ikev2_listener:send(PeerIP, PeerPort, Bytes),
+                epdg_metrics:inc(dpd_probes_sent_total),
+                Data#data{message_id = MsgId + 1};
+            {error, EncErr} ->
+                logger:info("DPD: encode failed: ~p", [EncErr]),
+                Data
+        end
+    catch
+        Class:Reason:_ ->
+            logger:info("DPD: send failed: ~p:~p", [Class, Reason]),
+            Data
+    end;
+send_dpd_probe(Data) ->
+    Data.
 
 %%====================================================================
 %% Graceful drain helpers

@@ -98,6 +98,14 @@ init() ->
     set_from_env("EPDG_ALLOWED_APNS", allowed_apns, "ims"),
     set_from_env("EPDG_DEFAULT_APN", default_apn, "ims"),
 
+    %% Dead Peer Detection (RFC 7296 §2.4)
+    set_from_env_int("EPDG_DPD_INTERVAL", dpd_interval, 120000),
+    set_from_env_int("EPDG_DPD_TIMEOUT", dpd_timeout, 10000),
+    set_from_env_int("EPDG_DPD_RETRIES", dpd_retries, 3),
+
+    %% TUN device garbage collection interval (ms)
+    set_from_env_int("EPDG_TUN_GC_INTERVAL", tun_gc_interval, 300000),
+
     %% Log level
     set_from_env("EPDG_LOG_LEVEL", log_level, "info"),
 

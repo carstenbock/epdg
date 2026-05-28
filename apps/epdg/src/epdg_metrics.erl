@@ -52,7 +52,11 @@ init() ->
         gtpu_rx_bytes,
         gtpu_tx_pkts,
         gtpu_rx_pkts,
-        gtpu_peer_down_total
+        gtpu_peer_down_total,
+        dpd_timeout_total,
+        dpd_probes_sent_total,
+        tun_gc_cleaned_total,
+        tun_startup_cleaned_total
     ]),
     ok.
 
