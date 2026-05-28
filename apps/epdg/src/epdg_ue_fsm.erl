@@ -15,7 +15,7 @@
 
 -define(IKE_SA_INIT_TIMEOUT, 30000).
 -define(IKE_AUTH_TIMEOUT,    60000).
--define(DPD_INTERVAL,       120000).
+-define(DPD_INTERVAL,        30000).
 -define(DPD_TIMEOUT,         10000).
 -define(DPD_RETRIES,             3).
 
@@ -105,7 +105,14 @@
     %% outbound XFRM SA with SPI 0 and silently kills the downlink.
     sai2_body        :: binary() | undefined,
     tsi_body         :: binary() | undefined,
-    tsr_body         :: binary() | undefined
+    tsr_body         :: binary() | undefined,
+    %% Cached final IKE_AUTH response bytes for retransmission (RFC 7296
+    %% §2.1: "If a request is retransmitted, the responder MUST send back
+    %% its last response to that request").
+    ike_auth_last_resp :: binary() | undefined,
+    %% Message ID of the last IKE_AUTH request we responded to; used to
+    %% detect retransmissions across all EAP round-trip stages.
+    ike_auth_last_msg_id :: non_neg_integer() | undefined
 }).
 
 %%====================================================================
@@ -147,7 +154,9 @@ init(#{peer_ip := PeerIP, peer_port := PeerPort} = _Ctx) ->
         eap_next_id   = 1,
         cert_der      = CertDer,
         private_key   = PrivKey,
-        eap_done      = false
+        eap_done      = false,
+        ike_auth_last_resp = undefined,
+        ike_auth_last_msg_id = undefined
     }}.
 
 terminate(_Reason, _State, #data{responder_spi = RSPI, imsi = IMSI,
@@ -232,7 +241,7 @@ ike_sa_init(cast, {ikev2, #{exchange_type := ike_sa_init}, _RawData, FromPort},
     #data{peer_port = PeerPort} = Data,
     logger:info("IKE_SA_INIT retransmit detected, re-sending cached response "
                 "(~p bytes) to ~p:~p", [byte_size(Resp), PeerIP, PeerPort]),
-    catch epdg_ikev2_listener:send(PeerIP, PeerPort, Resp),
+    catch epdg_ikev2_listener:send(PeerIP, PeerPort, 500, Resp),
     {keep_state, Data};
 
 ike_sa_init(cast, {ikev2, _, _, _}, Data) ->
@@ -258,6 +267,20 @@ ike_sa_init({call, From}, get_state, Data) ->
 
 ike_auth(enter, _OldState, Data) ->
     {keep_state, Data, [{state_timeout, ?IKE_AUTH_TIMEOUT, timeout}]};
+
+%% RFC 7296 §2.1 retransmission: if we already responded to this MsgId,
+%% retransmit the cached response instead of re-processing.
+ike_auth(cast, {ikev2, #{exchange_type := ike_auth, message_id := MsgId} = _Header,
+                _RawData, FromPort},
+         #data{ike_auth_last_msg_id = MsgId, ike_auth_last_resp = LastResp,
+               imsi = IMSI} = Data)
+  when is_binary(LastResp), byte_size(LastResp) > 0 ->
+    Data1 = refresh_peer_port(Data, FromPort),
+    #data{peer_ip = PIP, peer_port = PP} = Data1,
+    catch epdg_ikev2_listener:send(PIP, PP, LastResp),
+    logger:notice("ike_auth: retransmitting cached response (~B bytes) "
+                  "msg_id=~B IMSI=~p", [byte_size(LastResp), MsgId, IMSI]),
+    {keep_state, Data1};
 
 ike_auth(cast, {ikev2, #{exchange_type := ike_auth} = Header, RawData, FromPort}, Data) ->
     handle_ike_auth_eap(Header, RawData, refresh_peer_port(Data, FromPort));
@@ -311,14 +334,27 @@ established(cast, {ikev2, #{exchange_type := create_child_sa} = _Header, _RawDat
     {keep_state, refresh_peer_port(Data, FromPort)};
 
 established(cast, {ikev2, #{exchange_type := ike_auth, message_id := MsgId} = _Header,
-                   _RawData, FromPort}, #data{imsi = IMSI} = Data) ->
-    %% Some UEs send an additional IKE_AUTH after SA establishment
-    %% (e.g. second CHILD SA for a different traffic selector).
-    %% RFC 7296 §2.2: a non-piggybacked CHILD SA should use
-    %% CREATE_CHILD_SA, but real-world VoWiFi handsets deviate.
-    logger:warning("established: ignoring unexpected ike_auth msg_id=~B "
-                   "IMSI=~p", [MsgId, IMSI]),
-    {keep_state, refresh_peer_port(Data, FromPort)};
+                   _RawData, FromPort},
+            #data{imsi = IMSI, ike_auth_last_resp = LastResp} = Data) ->
+    %% RFC 7296 §2.1: retransmit our cached response to a retransmitted
+    %% request. Without this, a single UDP packet loss on the final
+    %% IKE_AUTH response leaves the UE stuck (never receives tunnel params).
+    Data1 = refresh_peer_port(Data, FromPort),
+    case LastResp of
+        Bin when is_binary(Bin), byte_size(Bin) > 0 ->
+            #data{peer_ip = PIP, peer_port = PP} = Data1,
+            catch epdg_ikev2_listener:send(PIP, PP, Bin),
+            logger:notice("established: retransmitting IKE_AUTH response "
+                          "(~B bytes) msg_id=~B IMSI=~p",
+                          [byte_size(Bin), MsgId, IMSI]);
+        _ ->
+            logger:warning("established: ignoring unexpected ike_auth msg_id=~B "
+                           "IMSI=~p (no cached response)", [MsgId, IMSI])
+    end,
+    %% UE is alive (it sent us a packet) — reset DPD.
+    Interval = epdg_config:get(dpd_interval, ?DPD_INTERVAL),
+    {keep_state, Data1#data{dpd_failures = 0},
+     [{state_timeout, Interval, dpd}]};
 
 established(cast, disconnect, _Data) ->
     {stop, normal};
@@ -548,7 +584,7 @@ send_sa_init_response(ISPI, MsgId,
           message_id        => MsgId,
           payload_bin       => PayloadBin}),
 
-    case epdg_ikev2_listener:send(PeerIP, PeerPort, RespBytes) of
+    case epdg_ikev2_listener:send(PeerIP, PeerPort, 500, RespBytes) of
         ok -> ok;
         {error, SendErr} ->
             logger:warning("Failed to send IKE_SA_INIT response to ~p:~p: ~p",
@@ -590,7 +626,7 @@ send_notify_and_stop(ISPI, MsgId, Reason,
           flags             => 16#20,
           message_id        => MsgId,
           payload_bin       => PayloadBin}),
-    catch epdg_ikev2_listener:send(PeerIP, PeerPort, RespBytes),
+    catch epdg_ikev2_listener:send(PeerIP, PeerPort, 500, RespBytes),
     {stop, normal, Data}.
 
 notify_type_for_reason(no_proposal_chosen) -> 14;
@@ -737,7 +773,9 @@ handle_ike_auth_request(Header, RawData,
                                         eap_next_id  = (EapId + 1) rem 256,
                                         sai2_body    = Sai2Body,
                                         tsi_body     = TsiBody,
-                                        tsr_body     = TsrBody
+                                        tsr_body     = TsrBody,
+                                        ike_auth_last_resp = RespBytes,
+                                        ike_auth_last_msg_id = MsgId
                                     },
                                     {next_state, ike_auth, NewData};
                                 {error, EErr} ->
@@ -929,8 +967,8 @@ pick_dest_host(Current, Dea) ->
 %% DIAMETER_MULTI_ROUND_AUTH (1001): another EAP round.
 handle_dea(1001, #{eap_payload := EapOut}, MsgId, InFlags, ISPI, RSPI, Data)
   when is_binary(EapOut), byte_size(EapOut) >= 4 ->
-    send_eap_to_ue(EapOut, MsgId, InFlags, ISPI, RSPI, Data),
-    {keep_state, Data};
+    Data1 = send_eap_to_ue(EapOut, MsgId, InFlags, ISPI, RSPI, Data),
+    {keep_state, Data1};
 %% DIAMETER_SUCCESS (2001): EAP has completed; DEA carries EAP-Success and
 %% the MSK for computing the final IKE AUTH.
 handle_dea(2001, #{eap_payload := EapOut, msk := MSK}, MsgId, InFlags,
@@ -938,8 +976,8 @@ handle_dea(2001, #{eap_payload := EapOut, msk := MSK}, MsgId, InFlags,
   when is_binary(EapOut), byte_size(EapOut) >= 4,
        is_binary(MSK),    byte_size(MSK)    >= 32 ->
     logger:notice("SWm auth SUCCESS: MSK=~B bytes delivered", [byte_size(MSK)]),
-    send_eap_to_ue(EapOut, MsgId, InFlags, ISPI, RSPI, Data),
-    {keep_state, Data#data{eap_msk = MSK, eap_done = true}};
+    Data1 = send_eap_to_ue(EapOut, MsgId, InFlags, ISPI, RSPI, Data),
+    {keep_state, Data1#data{eap_msk = MSK, eap_done = true}};
 %% Failure codes or missing/short AVPs in the DEA.
 handle_dea(RC, Dea, MsgId, InFlags, ISPI, RSPI, Data) ->
     EapOut = case maps:get(eap_payload, Dea, <<>>) of
@@ -947,8 +985,8 @@ handle_dea(RC, Dea, MsgId, InFlags, ISPI, RSPI, Data) ->
         _ -> build_eap_failure_for(Data)
     end,
     logger:warning("SWm auth FAILURE result_code=~B - sending EAP-Failure", [RC]),
-    send_eap_to_ue(EapOut, MsgId, InFlags, ISPI, RSPI, Data),
-    {stop, normal, Data}.
+    Data1 = send_eap_to_ue(EapOut, MsgId, InFlags, ISPI, RSPI, Data),
+    {stop, normal, Data1}.
 
 %% Final IKE_AUTH message post-EAP-Success (TS 33.402 §7.2.2 steps
 %% 14-17): the UE sends its own AUTH over the MSK. We verify it,
@@ -1169,7 +1207,9 @@ finalize_ike_auth(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
                                           local_u_teid => LocalUTeid},
                 ue_inner_ip = UeInnerIp,
                 gtpu_teid_local = LocalUTeid,
-                gtpu_teid_pgw = PgwUTeid
+                gtpu_teid_pgw = PgwUTeid,
+                ike_auth_last_resp = RespBytes,
+                ike_auth_last_msg_id = MsgId
             },
             {next_state, established, Data1};
         {error, EErr} ->
@@ -1483,7 +1523,7 @@ send_ike_notify_and_stop(MsgId, InFlags, ISPI, RSPI, NotifyType,
 
 send_eap_to_ue(EapOut, MsgId, InFlags, ISPI, RSPI,
                #data{keys_params = KeyParams, ike_keys = Keys,
-                     peer_ip = PeerIP, peer_port = PeerPort}) ->
+                     peer_ip = PeerIP, peer_port = PeerPort} = Data) ->
     EapBin = epdg_ikev2_codec:encode_eap_payload(EapOut),
     RespFlags = (InFlags band (bnot 16#08)) bor 16#20,
     Hdr = #{initiator_spi     => ISPI,
@@ -1499,17 +1539,18 @@ send_eap_to_ue(EapOut, MsgId, InFlags, ISPI, RSPI,
             logger:info("IKE_AUTH(cont) sent EAP relay (~p bytes) "
                         "MsgId=~B peer=~p:~p",
                         [byte_size(RespBytes), MsgId, PeerIP, PeerPort]),
-            ok;
+            Data#data{ike_auth_last_resp = RespBytes,
+                      ike_auth_last_msg_id = MsgId};
         {error, EErr} ->
             logger:warning("IKE_AUTH(cont) encrypt of relay-EAP failed: ~p",
                            [EErr]),
-            error
+            Data
     end.
 
 send_eap_failure_and_stop(MsgId, InFlags, ISPI, RSPI, Data) ->
     EapFailure = build_eap_failure_for(Data),
-    send_eap_to_ue(EapFailure, MsgId, InFlags, ISPI, RSPI, Data),
-    {stop, normal, Data}.
+    Data1 = send_eap_to_ue(EapFailure, MsgId, InFlags, ISPI, RSPI, Data),
+    {stop, normal, Data1}.
 
 build_eap_failure_for(#data{eap_next_id = EapId}) ->
     <<4:8, EapId:8, 4:16>>.
@@ -1586,8 +1627,30 @@ eap_aka_subtype_name(_)  -> "?".
 %% INFORMATIONAL handler
 %%====================================================================
 
+handle_informational(#{message_id := MsgId, flags := InFlags} = _Header, _RawData,
+                     #data{keys_params = KeyParams, ike_keys = Keys,
+                           initiator_spi = ISPI, responder_spi = RSPI,
+                           peer_ip = PeerIP, peer_port = PeerPort} = Data)
+  when is_map(KeyParams), is_map(Keys) ->
+    %% RFC 7296 §1.4/§2.4: respond to every INFORMATIONAL request with an
+    %% (empty) INFORMATIONAL response. This covers DPD liveness checks and
+    %% DELETE notifications from the UE.
+    RespFlags = 16#20,  %% Response=1, Initiator=0 (we are responder)
+    Hdr = #{initiator_spi     => ISPI,
+            responder_spi     => RSPI,
+            exchange_type_raw => 37,
+            flags             => RespFlags,
+            message_id        => MsgId},
+    case epdg_ikev2_crypto:encode_encrypted_message(
+           KeyParams, Keys, responder, Hdr, []) of
+        {ok, Bytes} ->
+            catch epdg_ikev2_listener:send(PeerIP, PeerPort, Bytes);
+        _ -> ok
+    end,
+    Interval = epdg_config:get(dpd_interval, ?DPD_INTERVAL),
+    {keep_state, Data#data{dpd_failures = 0},
+     [{state_timeout, Interval, dpd}]};
 handle_informational(_Header, _RawData, Data) ->
-    %% Handle DPD (empty INFORMATIONAL) or DELETE payloads
     {keep_state, Data}.
 
 %%====================================================================
@@ -1609,7 +1672,7 @@ send_dpd_probe(#data{ike_keys = Keys, keys_params = KeyParams,
     Hdr = #{initiator_spi     => ISPI,
             responder_spi     => RSPI,
             exchange_type_raw => 37,
-            flags             => 16#08,
+            flags             => 16#00,
             message_id        => MsgId},
     try
         case epdg_ikev2_crypto:encode_encrypted_message(
@@ -1674,14 +1737,14 @@ try_send_delete_informational(#data{ike_keys = Keys,
     %% to gracefully tear down the SA (RFC 7296 §1.4.1). Per §2.2 each
     %% side uses its own SK_e*/SK_a* regardless of exchange role; the
     %% encoder we pass `responder` to selects the responder-half keys,
-    %% which is correct here. Flags: Initiator(1)=1 because we initiate
-    %% this exchange; Response(5)=0 because it's a request. Exchange
-    %% type 37 = INFORMATIONAL.
+    %% RFC 7296 §2.2: Initiator flag MUST be clear when sent by the
+    %% original responder. We are the responder initiating this exchange.
+    %% Exchange type 37 = INFORMATIONAL.
     DeletePayload = epdg_ikev2_codec:encode_delete_ike_payload(),
     Hdr = #{initiator_spi     => ISPI,
             responder_spi     => RSPI,
             exchange_type_raw => 37,
-            flags             => 16#08,
+            flags             => 16#00,
             message_id        => MsgId},
     try
         case epdg_ikev2_crypto:encode_encrypted_message(

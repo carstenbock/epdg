@@ -7,7 +7,7 @@
 
 -behaviour(gen_server).
 
--export([start_link/0, send/3, get_local_ip/0]).
+-export([start_link/0, send/3, send/4, get_local_ip/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
@@ -28,7 +28,11 @@ start_link() ->
 
 -spec send(inet:ip_address(), inet:port_number(), binary()) -> ok | {error, term()}.
 send(IP, Port, Data) ->
-    gen_server:call(?SERVER, {send, IP, Port, Data}).
+    gen_server:call(?SERVER, {send, IP, Port, auto, Data}).
+
+-spec send(inet:ip_address(), inet:port_number(), 500 | 4500, binary()) -> ok | {error, term()}.
+send(IP, Port, FromPort, Data) ->
+    gen_server:call(?SERVER, {send, IP, Port, FromPort, Data}).
 
 -spec get_local_ip() -> inet:ip_address().
 get_local_ip() ->
@@ -77,15 +81,16 @@ init([]) ->
             {stop, {ike_bind_failed, R}}
     end.
 
-handle_call({send, IP, Port, Data}, _From,
+handle_call({send, IP, Port, FromPort, Data}, _From,
             #state{socket_500 = S500, socket_4500 = S4500} = State) ->
-    Sock = case Port of
-        500 -> S500;
-        _   -> S4500
+    Sock = case FromPort of
+        500  -> S500;
+        4500 -> S4500;
+        _    -> case Port of 500 -> S500; _ -> S4500 end
     end,
-    SendData = case Port of
-        4500 -> <<0,0,0,0, Data/binary>>;
-        _    -> Data
+    SendData = case Sock of
+        S4500 -> <<0,0,0,0, Data/binary>>;
+        _     -> Data
     end,
     {reply, gen_udp:send(Sock, IP, Port, SendData), State};
 
