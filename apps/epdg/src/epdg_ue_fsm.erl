@@ -161,7 +161,10 @@ init(#{peer_ip := PeerIP, peer_port := PeerPort} = _Ctx) ->
 
 terminate(_Reason, _State, #data{responder_spi = RSPI, imsi = IMSI,
                                   peer_ip = PeerIP, initiator_spi = ISPI,
-                                  child_sa = ChildSA, pgw_session = PGW}) ->
+                                  child_sa = ChildSA, pgw_session = PGW,
+                                  ue_nai = UeNai,
+                                  swm_session_id = SwmSessionId,
+                                  swm_dest_host  = SwmDestHost}) ->
     case ChildSA of
         #{spi_in := SPIIn, spi_out := SPIOut} ->
             catch epdg_xfrm:delete_sa(#{spi => SPIIn}),
@@ -176,6 +179,15 @@ terminate(_Reason, _State, #data{responder_spi = RSPI, imsi = IMSI,
             catch epdg_gtpc_client:delete_session_request(#{pgw_teid => TEID});
         _ -> ok
     end,
+    %% Release the SWm Diameter session toward the 3GPP AAA Server
+    %% (TS 29.273 clause 7 session-termination procedure). Fire-and-forget
+    %% from a detached process: session_termination_request/1 is a blocking
+    %% gen_server:call with a 10 s+ timeout, while the UE FSM only gets a
+    %% 5 s supervisor shutdown budget — blocking here would risk a brutal
+    %% kill. During a full pod drain epdg_app:prep_stop/1 has already
+    %% stopped the diameter service, so this is a harmless no-op then; it
+    %% matters for per-UE detach (UE DELETE, DPD timeout).
+    maybe_send_swm_str(SwmSessionId, SwmDestHost, IMSI, UeNai),
     case PGW of
         #{local_u_teid := LocalUTEID} ->
             catch epdg_gtpu_forwarder:unregister_ue(LocalUTEID);
@@ -193,6 +205,35 @@ terminate(_Reason, _State, #data{responder_spi = RSPI, imsi = IMSI,
 
 code_change(_OldVsn, State, Data, _Extra) ->
     {ok, State, Data}.
+
+%% Best-effort SWm Session-Termination-Request (STR, TS 29.273 clause 7).
+%% Only meaningful once the UE was anchored to an AAA (swm_session_id set
+%% on the first DER). Spawned so the blocking Diameter call never holds up
+%% the FSM's terminate/3.
+maybe_send_swm_str(undefined, _DestHost, _IMSI, _UeNai) ->
+    ok;
+maybe_send_swm_str(SessionId, DestHost, IMSI, UeNai) ->
+    UserName = pick_user_name(UeNai, IMSI),
+    Base = #{session_id => SessionId, termination_cause => 1},  %% DIAMETER_LOGOUT
+    Args0 = case UserName of
+        UN when is_binary(UN), byte_size(UN) > 0 -> Base#{user_name => UN};
+        _                                        -> Base
+    end,
+    Args = case DestHost of
+        DH when is_binary(DH), byte_size(DH) > 0 -> Args0#{destination_host => DH};
+        _                                        -> Args0
+    end,
+    spawn(fun() ->
+        case catch epdg_diameter_swm:session_termination_request(Args) of
+            {ok, #{result_code := RC}} ->
+                logger:info("SWm STR sent session_id=~s IMSI=~p result_code=~p",
+                            [SessionId, IMSI, RC]);
+            Other ->
+                logger:info("SWm STR best-effort send result session_id=~s "
+                            "IMSI=~p: ~p", [SessionId, IMSI, Other])
+        end
+    end),
+    ok.
 
 %%====================================================================
 %% State: idle
@@ -284,6 +325,12 @@ ike_auth(cast, {ikev2, #{exchange_type := ike_auth, message_id := MsgId} = _Head
 
 ike_auth(cast, {ikev2, #{exchange_type := ike_auth} = Header, RawData, FromPort}, Data) ->
     handle_ike_auth_eap(Header, RawData, refresh_peer_port(Data, FromPort));
+
+%% A UE may abandon the half-open IKE SA mid-auth with an INFORMATIONAL
+%% DELETE (RFC 7296 §1.4.1). Handle it the same way as in `established`
+%% so we ack and tear down rather than crashing on an unmatched event.
+ike_auth(cast, {ikev2, #{exchange_type := informational} = Header, RawData, FromPort}, Data) ->
+    handle_informational(Header, RawData, refresh_peer_port(Data, FromPort));
 
 ike_auth(cast, disconnect, _Data) ->
     {stop, normal};
@@ -1627,10 +1674,11 @@ eap_aka_subtype_name(_)  -> "?".
 %% INFORMATIONAL handler
 %%====================================================================
 
-handle_informational(#{message_id := MsgId, flags := InFlags} = _Header, _RawData,
+handle_informational(#{message_id := MsgId, flags := InFlags} = _Header, RawData,
                      #data{keys_params = KeyParams, ike_keys = Keys,
                            initiator_spi = ISPI, responder_spi = RSPI,
-                           peer_ip = PeerIP, peer_port = PeerPort} = Data)
+                           peer_ip = PeerIP, peer_port = PeerPort,
+                           imsi = IMSI} = Data)
   when is_map(KeyParams), is_map(Keys) ->
     %% RFC 7296 §1.4/§2.4: respond to every INFORMATIONAL request with an
     %% (empty) INFORMATIONAL response. This covers DPD liveness checks and
@@ -1647,11 +1695,39 @@ handle_informational(#{message_id := MsgId, flags := InFlags} = _Header, _RawDat
             catch epdg_ikev2_listener:send(PeerIP, PeerPort, Bytes);
         _ -> ok
     end,
-    Interval = epdg_config:get(dpd_interval, ?DPD_INTERVAL),
-    {keep_state, Data#data{dpd_failures = 0},
-     [{state_timeout, Interval, dpd}]};
+    %% RFC 7296 §1.4.1: a UE-initiated DELETE (for the IKE SA or its
+    %% Child SA) is the normal graceful VoWiFi detach. We acked it with
+    %% the empty INFORMATIONAL response above; now tear the FSM down so
+    %% terminate/3 releases the S2b GTP session (TS 29.274 Delete-Session)
+    %% and the SWm Diameter session (TS 29.273 STR). A plain DPD/keepalive
+    %% INFORMATIONAL carries no DELETE, so we just reset the DPD timer.
+    case informational_has_delete(KeyParams, Keys, RawData) of
+        true ->
+            logger:info("INFORMATIONAL DELETE received from UE IMSI=~p "
+                        "- tearing down tunnel", [IMSI]),
+            {stop, {shutdown, ue_delete}, Data};
+        false ->
+            Interval = epdg_config:get(dpd_interval, ?DPD_INTERVAL),
+            {keep_state, Data#data{dpd_failures = 0},
+             [{state_timeout, Interval, dpd}]}
+    end;
 handle_informational(_Header, _RawData, Data) ->
     {keep_state, Data}.
+
+%% Decrypt the INFORMATIONAL request and report whether it carries a
+%% DELETE payload (RFC 7296 §3.11). The UE is the initiator of this
+%% exchange so the peer-direction keys (SK_ei/SK_ai) decrypt it.
+informational_has_delete(KeyParams, Keys, RawData) ->
+    case epdg_ikev2_crypto:decode_encrypted_message(
+           KeyParams, Keys, initiator, RawData) of
+        {ok, #{payloads := Payloads}} ->
+            case epdg_ikev2_codec:find_payload(delete, Payloads) of
+                {ok, _} -> true;
+                _       -> false
+            end;
+        _ ->
+            false
+    end.
 
 %%====================================================================
 %% DPD probe (RFC 7296 §2.4)
