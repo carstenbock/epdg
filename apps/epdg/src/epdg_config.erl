@@ -98,8 +98,12 @@ init() ->
     set_from_env("EPDG_ALLOWED_APNS", allowed_apns, "ims"),
     set_from_env("EPDG_DEFAULT_APN", default_apn, "ims"),
 
-    %% Dead Peer Detection (RFC 7296 §2.4)
-    set_from_env_int("EPDG_DPD_INTERVAL", dpd_interval, 30000),
+    %% Dead Peer Detection (RFC 7296 §2.4). Default 120 s: VoWiFi UEs behind
+    %% residential CPE NAT with aggressive power-save go briefly silent while
+    %% idle; a short probe interval tears the tunnel down during those gaps.
+    %% 120 s matches the documented sys.config default and the epdg-chart
+    %% ike.dpd.intervalMs default.
+    set_from_env_int("EPDG_DPD_INTERVAL", dpd_interval, 120000),
     set_from_env_int("EPDG_DPD_TIMEOUT", dpd_timeout, 10000),
     set_from_env_int("EPDG_DPD_RETRIES", dpd_retries, 3),
 

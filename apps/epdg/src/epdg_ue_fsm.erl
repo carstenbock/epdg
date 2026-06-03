@@ -15,9 +15,13 @@
 
 -define(IKE_SA_INIT_TIMEOUT, 30000).
 -define(IKE_AUTH_TIMEOUT,    60000).
--define(DPD_INTERVAL,        30000).
+-define(DPD_INTERVAL,        120000).
 -define(DPD_TIMEOUT,         10000).
 -define(DPD_RETRIES,             3).
+
+%% MOBIKE notify message types (RFC 4555 §3.x / RFC 7296 §3.10.1).
+-define(N_MOBIKE_SUPPORTED,    16396).
+-define(N_UPDATE_SA_ADDRESSES, 16400).
 
 %% Maximum jitter for graceful-drain teardown. Broadcast {drain, _} fans
 %% out to every live UE FSM simultaneously; each FSM picks a random delay
@@ -58,6 +62,9 @@
     ue_nai           :: binary() | undefined,
     %% DPD consecutive failure counter (RFC 7296 §2.4)
     dpd_failures     :: non_neg_integer(),
+    %% True once the UE advertised N(MOBIKE_SUPPORTED) in IKE_AUTH and we
+    %% confirmed it (RFC 4555 §3.1). Gates UPDATE_SA_ADDRESSES handling.
+    mobike           :: boolean(),
     %% EAP identifier counter (monotonic per RFC 3748)
     eap_next_id      :: non_neg_integer(),
     %% X.509 certificate for IKEv2 responder auth (TS 33.402 §7.2.1)
@@ -151,6 +158,7 @@ init(#{peer_ip := PeerIP, peer_port := PeerPort} = _Ctx) ->
         responder_spi = RSPI,
         message_id    = 0,
         dpd_failures  = 0,
+        mobike        = false,
         eap_next_id   = 1,
         cert_der      = CertDer,
         private_key   = PrivKey,
@@ -162,13 +170,18 @@ init(#{peer_ip := PeerIP, peer_port := PeerPort} = _Ctx) ->
 terminate(_Reason, _State, #data{responder_spi = RSPI, imsi = IMSI,
                                   peer_ip = PeerIP, initiator_spi = ISPI,
                                   child_sa = ChildSA, pgw_session = PGW,
-                                  ue_nai = UeNai,
+                                  ue_nai = UeNai, ue_inner_ip = UeInnerIp,
                                   swm_session_id = SwmSessionId,
                                   swm_dest_host  = SwmDestHost}) ->
+    %% Tear down the kernel data plane for this session. Delete SAs by the
+    %% full (src,dst,proto,spi) tuple — the SPI-only `deleteall` path does
+    %% not reliably match espinudp SAs, which is why stale SAs accumulated
+    %% across DPD teardown / re-attach cycles. Also drop the per-UE XFRM
+    %% policies (keyed by the UE inner IP), which were never cleaned before.
     case ChildSA of
-        #{spi_in := SPIIn, spi_out := SPIOut} ->
-            catch epdg_xfrm:delete_sa(#{spi => SPIIn}),
-            catch epdg_xfrm:delete_sa(#{spi => SPIOut});
+        #{spi_in := _, spi_out := _} ->
+            delete_child_sas(PeerIP, ChildSA),
+            delete_ue_policies(UeInnerIp);
         _ -> ok
     end,
     case PGW of
@@ -359,6 +372,13 @@ ike_auth({call, From}, get_state, Data) ->
 %%====================================================================
 
 established(enter, _OldState, #data{responder_spi = RSPI, imsi = IMSI} = Data) ->
+    %% A UE that lost connectivity (e.g. CPE NAT pinhole collapse) and
+    %% re-dialled leaves its previous IKE SA + Child SAs behind until DPD
+    %% reaps them. Supersede that stale session now so we don't run two
+    %% live tunnels for one IMSI with overlapping XFRM SAs (which can make
+    %% the kernel pick a stale outbound SPI and silently black-hole the
+    %% downlink). Done BEFORE register/3 overwrites the IMSI reverse map.
+    supersede_existing_session(IMSI, RSPI),
     epdg_ue_registry:register(RSPI, self(), IMSI),
     logger:info("Tunnel established IMSI=~p RSPI=~.16B", [IMSI, RSPI]),
     epdg_metrics:inc(ike_tunnels_established_total),
@@ -756,9 +776,12 @@ handle_ike_auth_request(Header, RawData,
                             Sai2Body = stash_payload_body(sa,  InnerPayloads),
                             TsiBody  = stash_payload_body(tsi, InnerPayloads),
                             TsrBody  = stash_payload_body(tsr, InnerPayloads),
+                            %% RFC 4555 §3.1: the UE signals MOBIKE in the
+                            %% first IKE_AUTH request via N(MOBIKE_SUPPORTED).
+                            Mobike = find_notify(?N_MOBIKE_SUPPORTED, InnerPayloads),
                             IMSI = parse_imsi_from_nai(UeNai),
-                            logger:info("IKE_AUTH IDi type=~p data=~p IMSI=~p",
-                                        [IDiType, UeNai, IMSI]),
+                            logger:info("IKE_AUTH IDi type=~p data=~p IMSI=~p mobike=~p",
+                                        [IDiType, UeNai, IMSI, Mobike]),
 
                             %% Build IDr = FQDN of ePDG (RFC 7296 §3.5 ID_FQDN=2).
                             IDrFqdn = list_to_binary(
@@ -817,6 +840,7 @@ handle_ike_auth_request(Header, RawData,
                                         idi_body     = IDiBody,
                                         imsi         = IMSI,
                                         ue_nai       = UeNai,
+                                        mobike       = Mobike,
                                         eap_next_id  = (EapId + 1) rem 256,
                                         sai2_body    = Sai2Body,
                                         tsi_body     = TsiBody,
@@ -1216,6 +1240,15 @@ finalize_ike_auth(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
     TsiBin = encode_ts_or_default(UeTsi),
     TsrBin = encode_ts_or_default(UeTsr),
 
+    %% RFC 4555 §3.1: confirm MOBIKE back to the UE only if it offered it
+    %% in the first IKE_AUTH. Without this confirmation the UE will not send
+    %% UPDATE_SA_ADDRESSES on an address change.
+    MobikeChain = case Data0#data.mobike of
+        true  -> [{notify, epdg_ikev2_codec:encode_notify_payload(
+                              0, ?N_MOBIKE_SUPPORTED, <<>>, <<>>)}];
+        false -> []
+    end,
+
     %% IDrBody is already the RFC 7296 §3.5 ID payload body (IDType |
     %% reserved | IDdata) we encoded in the first IKE_AUTH response;
     %% encode_payloads_chain/1 re-wraps it with the generic 4-byte
@@ -1227,7 +1260,7 @@ finalize_ike_auth(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
         {sa,   SaBin},
         {tsi,  TsiBin},
         {tsr,  TsrBin}
-    ],
+    ] ++ MobikeChain,
 
     RespFlags = (InFlags band (bnot 16#08)) bor 16#20,
     Hdr = #{initiator_spi     => ISPI,
@@ -1248,7 +1281,19 @@ finalize_ike_auth(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
             Data1 = Data0#data{
                 child_sa = #{spi_in  => ResponderSPIInt,
                              spi_out => binary_to_int(PeerSPI),
-                             suite   => ChildRespSuite},
+                             suite   => ChildRespSuite,
+                             %% Everything needed to re-install this Child SA
+                             %% against a new outer address on a MOBIKE move
+                             %% (RFC 4555 §3.2) or to delete it precisely on
+                             %% teardown.
+                             reinstall => #{peer_spi    => PeerSPI,
+                                            resp_spi    => ResponderSPI,
+                                            suite       => ChildSuite,
+                                            sk_ei       => SkEiChild,
+                                            sk_ai       => SkAiChild,
+                                            sk_er       => SkErChild,
+                                            sk_ar       => SkArChild,
+                                            ue_inner_ip => UeInnerIp}},
                 pgw_session = GtpcResp#{ue_inner_ip => UeInnerIp,
                                           local_c_teid => LocalCTeid,
                                           local_u_teid => LocalUTeid},
@@ -1674,59 +1719,180 @@ eap_aka_subtype_name(_)  -> "?".
 %% INFORMATIONAL handler
 %%====================================================================
 
-handle_informational(#{message_id := MsgId, flags := InFlags} = _Header, RawData,
+handle_informational(#{message_id := MsgId} = Header, RawData,
                      #data{keys_params = KeyParams, ike_keys = Keys,
-                           initiator_spi = ISPI, responder_spi = RSPI,
-                           peer_ip = PeerIP, peer_port = PeerPort,
-                           imsi = IMSI} = Data)
+                           imsi = IMSI} = Data0)
   when is_map(KeyParams), is_map(Keys) ->
-    %% RFC 7296 §1.4/§2.4: respond to every INFORMATIONAL request with an
-    %% (empty) INFORMATIONAL response. This covers DPD liveness checks and
-    %% DELETE notifications from the UE.
-    RespFlags = 16#20,  %% Response=1, Initiator=0 (we are responder)
-    Hdr = #{initiator_spi     => ISPI,
-            responder_spi     => RSPI,
-            exchange_type_raw => 37,
-            flags             => RespFlags,
-            message_id        => MsgId},
-    case epdg_ikev2_crypto:encode_encrypted_message(
-           KeyParams, Keys, responder, Hdr, []) of
-        {ok, Bytes} ->
-            catch epdg_ikev2_listener:send(PeerIP, PeerPort, Bytes);
-        _ -> ok
+    %% The UE is the initiator of this exchange, so its peer-direction keys
+    %% (SK_ei/SK_ai) decrypt it. We inspect once for DELETE (RFC 7296
+    %% §3.11) and UPDATE_SA_ADDRESSES (RFC 4555 §3.2).
+    Payloads = decrypt_informational_payloads(KeyParams, Keys, RawData),
+    %% RFC 4555 §3.2: a MOBIKE UPDATE_SA_ADDRESSES means the UE's outer
+    %% address and/or NAT mapping changed (Wi-Fi roam, CPE rebind, new DSL
+    %% IP). Re-point our peer endpoint and re-key the kernel SAs/policies
+    %% to the new outer address BEFORE we answer, so the response — and all
+    %% subsequent DPD — traverse the new path instead of the dead one.
+    Data1 = case is_mobike_update(Payloads, Data0) of
+        true ->
+            %% Use the UDP source IP *and* port the listener observed on this
+            %% request: a CPE NAT rebind / Wi-Fi roam remaps both, and the
+            %% espinudp encapsulation dst port must follow the new mapping or
+            %% the downlink stays black-holed.
+            NewIP   = maps:get(from_ip,   Header, Data0#data.peer_ip),
+            NewPort = maps:get(from_port, Header, Data0#data.peer_port),
+            do_mobike_update(NewIP, NewPort, Data0);
+        false ->
+            Data0
     end,
-    %% RFC 7296 §1.4.1: a UE-initiated DELETE (for the IKE SA or its
-    %% Child SA) is the normal graceful VoWiFi detach. We acked it with
-    %% the empty INFORMATIONAL response above; now tear the FSM down so
-    %% terminate/3 releases the S2b GTP session (TS 29.274 Delete-Session)
-    %% and the SWm Diameter session (TS 29.273 STR). A plain DPD/keepalive
-    %% INFORMATIONAL carries no DELETE, so we just reset the DPD timer.
-    case informational_has_delete(KeyParams, Keys, RawData) of
+    %% RFC 7296 §1.4/§2.4: every INFORMATIONAL request gets an (empty)
+    %% INFORMATIONAL response — covers DPD liveness, DELETE and MOBIKE.
+    send_informational_response(MsgId, Data1),
+    %% RFC 7296 §1.4.1: a UE-initiated DELETE is the normal graceful VoWiFi
+    %% detach. Tear the FSM down so terminate/3 releases the S2b GTP session
+    %% (TS 29.274 Delete-Session) and the SWm Diameter session (TS 29.273
+    %% STR). A plain DPD/keepalive INFORMATIONAL carries no DELETE, so we
+    %% just reset the DPD timer.
+    case has_delete(Payloads) of
         true ->
             logger:info("INFORMATIONAL DELETE received from UE IMSI=~p "
                         "- tearing down tunnel", [IMSI]),
-            {stop, {shutdown, ue_delete}, Data};
+            {stop, {shutdown, ue_delete}, Data1};
         false ->
             Interval = epdg_config:get(dpd_interval, ?DPD_INTERVAL),
-            {keep_state, Data#data{dpd_failures = 0},
+            {keep_state, Data1#data{dpd_failures = 0},
              [{state_timeout, Interval, dpd}]}
     end;
 handle_informational(_Header, _RawData, Data) ->
     {keep_state, Data}.
 
-%% Decrypt the INFORMATIONAL request and report whether it carries a
-%% DELETE payload (RFC 7296 §3.11). The UE is the initiator of this
-%% exchange so the peer-direction keys (SK_ei/SK_ai) decrypt it.
-informational_has_delete(KeyParams, Keys, RawData) ->
+%% Decrypt an INFORMATIONAL request to its inner payload list (or [] on
+%% failure). The UE initiated the exchange, so use the initiator keys.
+decrypt_informational_payloads(KeyParams, Keys, RawData) ->
     case epdg_ikev2_crypto:decode_encrypted_message(
            KeyParams, Keys, initiator, RawData) of
-        {ok, #{payloads := Payloads}} ->
-            case epdg_ikev2_codec:find_payload(delete, Payloads) of
-                {ok, _} -> true;
-                _       -> false
-            end;
+        {ok, #{payloads := Payloads}} -> Payloads;
+        _ -> []
+    end.
+
+has_delete(Payloads) ->
+    case epdg_ikev2_codec:find_payload(delete, Payloads) of
+        {ok, _} -> true;
+        _       -> false
+    end.
+
+%% Only honour UPDATE_SA_ADDRESSES if we actually negotiated MOBIKE with
+%% this UE (RFC 4555 §3.1). The INFORMATIONAL is integrity-protected by the
+%% IKE SA, so the peer is authenticated; we update on first request.
+%% SPEC-DEVIATION: RFC 4555 §3.5 return-routability (COOKIE2) check is not
+%% implemented — acceptable in this lab, but an on-path attacker could in
+%% principle redirect the SA. Revisit before any production use.
+is_mobike_update(Payloads, #data{mobike = true}) ->
+    find_notify(?N_UPDATE_SA_ADDRESSES, Payloads);
+is_mobike_update(_Payloads, _Data) ->
+    false.
+
+%% Empty INFORMATIONAL response to the (possibly just-updated) peer.
+send_informational_response(MsgId,
+                            #data{keys_params = KeyParams, ike_keys = Keys,
+                                  initiator_spi = ISPI, responder_spi = RSPI,
+                                  peer_ip = PeerIP, peer_port = PeerPort}) ->
+    Hdr = #{initiator_spi     => ISPI,
+            responder_spi     => RSPI,
+            exchange_type_raw => 37,
+            flags             => 16#20,  %% Response=1, Initiator=0
+            message_id        => MsgId},
+    case epdg_ikev2_crypto:encode_encrypted_message(
+           KeyParams, Keys, responder, Hdr, []) of
+        {ok, Bytes} -> catch epdg_ikev2_listener:send(PeerIP, PeerPort, Bytes);
+        _ -> ok
+    end,
+    ok.
+
+%%====================================================================
+%% Session / Child-SA lifecycle helpers (dedup, cleanup, MOBIKE)
+%%====================================================================
+
+%% Scan ALL notify payloads for a given message type (RFC 7296 §3.10).
+%% find_payload/2 returns only the first notify regardless of type, so we
+%% filter explicitly here. The notify body is
+%% <<ProtocolId:8, SPISize:8, NotifyType:16, SPI/binary, Data/binary>>.
+find_notify(NotifyType, Payloads) ->
+    lists:any(
+      fun(#{type := notify,
+            data := <<_Proto:8, _SPISize:8, NType:16, _/binary>>}) ->
+              NType =:= NotifyType;
+         (_) -> false
+      end, Payloads).
+
+%% Tear down any prior live session for this IMSI before the new one
+%% registers (see established/3 enter). The old FSM's terminate/3 releases
+%% its Child SAs, policies, S2b PDN connection and SWm session. At this
+%% point the old session still holds its own (different) UE inner IP — the
+%% PGW has not yet freed it — so deleting the old session's inner-IP
+%% policies cannot disturb the new session's policies.
+supersede_existing_session(undefined, _RSPI) -> ok;
+supersede_existing_session(IMSI, RSPI) ->
+    case epdg_ue_registry:lookup_by_imsi(IMSI) of
+        {ok, OldPid} when OldPid =/= self() ->
+            logger:notice("Superseding stale session for IMSI=~p "
+                          "(new RSPI=~.16B, old pid=~p)", [IMSI, RSPI, OldPid]),
+            epdg_metrics:inc(session_superseded_total),
+            gen_statem:cast(OldPid, disconnect);
         _ ->
-            false
+            ok
+    end.
+
+%% Delete this session's inbound + outbound ESP SAs by the full
+%% (src,dst,proto,spi) tuple. OuterIP is the UE's current outer address
+%% (it changes on a MOBIKE move). The SPI-only delete path does not match
+%% espinudp SAs reliably, which is what let stale SAs pile up.
+delete_child_sas(OuterIP, #{spi_in := SPIIn, spi_out := SPIOut}) ->
+    LocalOuter = local_outer_ip(),
+    catch epdg_xfrm:delete_sa(#{spi => SPIIn,
+                                src_ip => OuterIP, dst_ip => LocalOuter}),
+    catch epdg_xfrm:delete_sa(#{spi => SPIOut,
+                                src_ip => LocalOuter, dst_ip => OuterIP}),
+    ok;
+delete_child_sas(_OuterIP, _) ->
+    ok.
+
+%% Delete the three per-UE XFRM policies (in/fwd/out) keyed by the UE inner
+%% IP. Mirrors the create_policy calls in install_child_sas/10.
+delete_ue_policies(undefined) -> ok;
+delete_ue_policies(UeInnerIp) ->
+    UeCidr  = ip4_cidr(UeInnerIp, 32),
+    AnyCidr = "0.0.0.0/0",
+    catch epdg_xfrm:delete_policy(#{src => UeCidr,  dst => AnyCidr,
+                                    direction => in}),
+    catch epdg_xfrm:delete_policy(#{src => UeCidr,  dst => AnyCidr,
+                                    direction => fwd}),
+    catch epdg_xfrm:delete_policy(#{src => AnyCidr, dst => UeCidr,
+                                    direction => out}),
+    ok.
+
+%% RFC 4555 §3.2: move the kernel data plane to the UE's new outer address.
+%% Delete the SAs/policies bound to the old address, then re-install them
+%% against the new one with the SAME Child SA keys/SPIs. Best-effort: any
+%% xfrm error is logged by install_child_sas/10, and if the move does not
+%% take the UE will redial via DPD as before.
+do_mobike_update(NewIP, NewPort,
+                 #data{peer_ip = OldIP, child_sa = CS, imsi = IMSI} = Data) ->
+    case maps:get(reinstall, CS, undefined) of
+        #{peer_spi := PeerSPI, resp_spi := RespSPI, suite := Suite,
+          sk_ei := Ei, sk_ai := Ai, sk_er := Er, sk_ar := Ar,
+          ue_inner_ip := InnerIp} ->
+            logger:notice("MOBIKE UPDATE_SA_ADDRESSES IMSI=~p ~s -> ~s:~B",
+                          [IMSI, format_ip(OldIP), format_ip(NewIP), NewPort]),
+            delete_child_sas(OldIP, CS),
+            delete_ue_policies(InnerIp),
+            install_child_sas(NewIP, NewPort, PeerSPI, RespSPI, Suite,
+                              Ei, Ai, Er, Ar, InnerIp),
+            epdg_metrics:inc(mobike_update_total),
+            Data#data{peer_ip = NewIP, peer_port = NewPort};
+        _ ->
+            logger:warning("MOBIKE UPDATE_SA_ADDRESSES but no stored Child SA "
+                           "params; ignoring IMSI=~p", [IMSI]),
+            Data
     end.
 
 %%====================================================================

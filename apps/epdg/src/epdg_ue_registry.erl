@@ -156,9 +156,18 @@ do_unregister(SPI, State) ->
     case ets:lookup(?TAB_SPI, SPI) of
         [{_, _Pid, IMSI}] ->
             ets:delete(?TAB_SPI, SPI),
+            %% Only drop the IMSI->SPI reverse mapping if it still points at
+            %% THIS SPI. When a UE re-attaches, the new session's FSM
+            %% overwrites IMSI->SPI with its own (newer) SPI before the old
+            %% FSM tears down; deleting unconditionally here would orphan the
+            %% live session from IMSI lookups and defeat per-IMSI dedup.
             case IMSI of
                 undefined -> ok;
-                _ -> ets:delete(?TAB_IMSI, IMSI)
+                _ ->
+                    case ets:lookup(?TAB_IMSI, IMSI) of
+                        [{_, SPI}] -> ets:delete(?TAB_IMSI, IMSI);
+                        _          -> ok
+                    end
             end,
             case maps:find(SPI, State) of
                 {ok, MRef} -> erlang:demonitor(MRef, [flush]);
