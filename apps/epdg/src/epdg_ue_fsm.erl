@@ -1422,6 +1422,19 @@ install_child_sas({U_A, U_B, U_C, U_D} = UeOuter, PeerPort, PeerSPI, RespSPI,
     EncAlgIn   = child_enc_alg(maps:get(encr, Suite)),
     IntegAlgIn = child_integ_alg(maps:get(integ, Suite, none)),
 
+    %% Idempotency: purge any pre-existing ESP SAs for this UE outer
+    %% endpoint (both directions) before installing the fresh pair. A UE
+    %% IKE_AUTH retransmit behind NAT, or a re-dial whose previous FSM did
+    %% not tear down cleanly, otherwise leaves multiple ESP SAs for the
+    %% same src/dst — all with reqid 0 — and the kernel's outbound SA
+    %% lookup wildcard-matches one of them. Picking a stale SPI the UE no
+    %% longer holds black-holes downlink media (RTP timeout) while SIP
+    %% limps on via retransmission. Replacing instead of adding keeps
+    %% exactly one SA pair per UE outer endpoint. (Assumes one tunnel per
+    %% UE outer IP, which holds for the ePDG SWu NAT-T model.)
+    catch epdg_xfrm:flush_sa_endpoint(#{src_ip => UeOuter, dst_ip => LocalOuter}),
+    catch epdg_xfrm:flush_sa_endpoint(#{src_ip => LocalOuter, dst_ip => UeOuter}),
+
     %% Inbound SA: UE → ePDG (SPI = responder SPI we picked)
     InboundParams0 = #{spi => SpiInInt,
                         src_ip => UeOuter,

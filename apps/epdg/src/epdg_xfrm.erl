@@ -9,7 +9,7 @@
 -behaviour(gen_server).
 
 -export([start_link/0,
-         create_sa/1, delete_sa/1,
+         create_sa/1, delete_sa/1, flush_sa_endpoint/1,
          create_policy/1, delete_policy/1,
          get_offload_mode/0, flush_all/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -36,6 +36,13 @@ create_sa(Params) ->
 -spec delete_sa(map()) -> ok | {error, term()}.
 delete_sa(Params) ->
     gen_server:call(?SERVER, {delete_sa, Params}).
+
+%% Delete ALL ESP SAs matching a (src,dst) endpoint pair, regardless of
+%% SPI. Used to make Child SA installation idempotent per UE outer
+%% endpoint (see install_child_sas/10 in epdg_ue_fsm).
+-spec flush_sa_endpoint(map()) -> ok | {error, term()}.
+flush_sa_endpoint(Params) ->
+    gen_server:call(?SERVER, {flush_sa_endpoint, Params}).
 
 -spec create_policy(map()) -> ok | {error, term()}.
 create_policy(Params) ->
@@ -76,6 +83,8 @@ handle_call({create_sa, Params}, _From, State) ->
     {reply, do_create_sa(Params, State), State};
 handle_call({delete_sa, Params}, _From, State) ->
     {reply, do_delete_sa(Params), State};
+handle_call({flush_sa_endpoint, Params}, _From, State) ->
+    {reply, do_flush_sa_endpoint(Params), State};
 handle_call({create_policy, Params}, _From, State) ->
     {reply, do_create_policy(Params), State};
 handle_call({delete_policy, Params}, _From, State) ->
@@ -186,6 +195,20 @@ do_delete_sa(#{spi := SPI}) ->
     epdg_metrics:gauge_dec(xfrm_sa_active),
     ok;
 do_delete_sa(_) ->
+    {error, invalid_params}.
+
+%% Purge every ESP SA for a (src,dst) endpoint pair. `ip xfrm state
+%% deleteall` filters by the supplied selectors (here src/dst/proto),
+%% so this removes any stale SAs left over from a UE IKE_AUTH retransmit
+%% or a re-dial whose previous FSM did not tear down cleanly — without
+%% needing to know their (random responder) SPIs.
+do_flush_sa_endpoint(#{src_ip := Src, dst_ip := Dst}) ->
+    Cmd = io_lib:format(
+        "ip xfrm state deleteall src ~s dst ~s proto esp 2>/dev/null",
+        [ip_str(Src), ip_str(Dst)]),
+    _ = run_cmd(lists:flatten(Cmd)),
+    ok;
+do_flush_sa_endpoint(_) ->
     {error, invalid_params}.
 
 %%====================================================================
