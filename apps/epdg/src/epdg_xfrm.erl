@@ -144,16 +144,26 @@ do_create_sa(#{spi := SPI, src_ip := Src, dst_ip := Dst,
     %% (4500 unless customised).
     EncapPart = case maps:get(nat_t, Params, false) of
         true ->
-            %% Direction of the SA determines which port is ours and
-            %% which is the UE's. We always write the "UE side" port
-            %% first — that matches `ip xfrm` expectations: the first
-            %% port is the peer port (sport on outbound, dport on
-            %% inbound) and the second is ours.
+            %% `ip xfrm ... encap espinudp <sport> <dport> <oaddr>` maps
+            %% positionally to the SA's encap_sport / encap_dport. The
+            %% kernel builds the *outbound* UDP header from
+            %% encap_sport → encap_dport (esp_output); on input it
+            %% de-encapsulates purely by SPI, so the inbound ordering is
+            %% cosmetic. The ports MUST therefore follow the SA direction:
+            %%   outbound (ePDG → UE): src = our 4500, dst = UE NAT port
+            %%   inbound  (UE → ePDG): src = UE NAT port, dst = our 4500
+            %% A single fixed ordering for both directions emitted downlink
+            %% ESP from the wrong source port to the wrong UE port, which a
+            %% port-translating NAT then dropped.
             LocalPort = maps:get(local_udp_port, Params, 4500),
             PeerPort  = maps:get(peer_udp_port,  Params, 4500),
             PeerOuter = maps:get(peer_outer_ip,  Params, Src),
+            {Sport, Dport} = case maps:get(sa_dir, Params, in) of
+                out -> {LocalPort, PeerPort};
+                _   -> {PeerPort, LocalPort}
+            end,
             io_lib:format(" encap espinudp ~B ~B ~s",
-                          [PeerPort, LocalPort, ip_str(PeerOuter)]);
+                          [Sport, Dport, ip_str(PeerOuter)]);
         false -> ""
     end,
 

@@ -9,7 +9,7 @@
 
 -behaviour(gen_statem).
 
--export([start_link/1, handle_ikev2/4, get_state/1, disconnect/1]).
+-export([start_link/1, handle_ikev2/4, get_state/1, get_info/1, disconnect/1]).
 -export([init/1, callback_mode/0, terminate/3, code_change/4]).
 -export([idle/3, ike_sa_init/3, ike_auth/3, established/3]).
 
@@ -113,6 +113,11 @@
     sai2_body        :: binary() | undefined,
     tsi_body         :: binary() | undefined,
     tsr_body         :: binary() | undefined,
+    %% UE's IKEv2 Configuration Payload (CFG_REQUEST) body from the first
+    %% IKE_AUTH. Used to derive the requested PDN type (IPv4 / IPv6 / IPv4v6)
+    %% so the ePDG can ask the PGW for a matching S2b PDN when dual-stack is
+    %% enabled (epdg_config ipv6_enabled). RFC 7296 §3.15 / 3GPP TS 24.302.
+    cp_body          :: binary() | undefined,
     %% Cached final IKE_AUTH response bytes for retransmission (RFC 7296
     %% §2.1: "If a request is retransmitted, the responder MUST send back
     %% its last response to that request").
@@ -136,6 +141,16 @@ handle_ikev2(Pid, Header, RawData, FromPort) ->
 -spec get_state(pid()) -> {ok, atom()}.
 get_state(Pid) ->
     gen_statem:call(Pid, get_state).
+
+%% @doc Return a read-only snapshot of this UE session for the admin
+%% `/admin/sessions' endpoint. Includes the UE's real (outer) source
+%% address as observed on the SWu socket (`peer_ip'/`peer_port') — the
+%% public/NAT'd IP the UE used to reach the ePDG (TS 23.402 untrusted
+%% non-3GPP access). All values are normalised to JSON-friendly
+%% binaries/integers/atoms by the caller.
+-spec get_info(pid()) -> {ok, map()}.
+get_info(Pid) ->
+    gen_statem:call(Pid, get_info, 2000).
 
 -spec disconnect(pid()) -> ok.
 disconnect(Pid) ->
@@ -171,6 +186,7 @@ terminate(_Reason, _State, #data{responder_spi = RSPI, imsi = IMSI,
                                   peer_ip = PeerIP, initiator_spi = ISPI,
                                   child_sa = ChildSA, pgw_session = PGW,
                                   ue_nai = UeNai, ue_inner_ip = UeInnerIp,
+                                  ue_inner_ip6 = UeInnerIp6,
                                   swm_session_id = SwmSessionId,
                                   swm_dest_host  = SwmDestHost}) ->
     %% Tear down the kernel data plane for this session. Delete SAs by the
@@ -181,7 +197,7 @@ terminate(_Reason, _State, #data{responder_spi = RSPI, imsi = IMSI,
     case ChildSA of
         #{spi_in := _, spi_out := _} ->
             delete_child_sas(PeerIP, ChildSA),
-            delete_ue_policies(UeInnerIp);
+            delete_ue_policies(UeInnerIp, UeInnerIp6);
         _ -> ok
     end,
     case PGW of
@@ -273,7 +289,9 @@ idle(state_timeout, timeout, #data{peer_ip = PeerIP} = _Data) ->
     {stop, normal};
 
 idle({call, From}, get_state, Data) ->
-    {keep_state, Data, [{reply, From, {ok, idle}}]}.
+    {keep_state, Data, [{reply, From, {ok, idle}}]};
+idle({call, From}, get_info, Data) ->
+    {keep_state, Data, [{reply, From, {ok, session_info(idle, Data)}}]}.
 
 %%====================================================================
 %% State: ike_sa_init
@@ -313,7 +331,9 @@ ike_sa_init(state_timeout, timeout,
     {stop, normal};
 
 ike_sa_init({call, From}, get_state, Data) ->
-    {keep_state, Data, [{reply, From, {ok, ike_sa_init}}]}.
+    {keep_state, Data, [{reply, From, {ok, ike_sa_init}}]};
+ike_sa_init({call, From}, get_info, Data) ->
+    {keep_state, Data, [{reply, From, {ok, session_info(ike_sa_init, Data)}}]}.
 
 %%====================================================================
 %% State: ike_auth (EAP exchange in progress)
@@ -365,7 +385,9 @@ ike_auth(state_timeout, timeout, #data{peer_ip = PeerIP, imsi = IMSI} = _Data) -
     {stop, normal};
 
 ike_auth({call, From}, get_state, Data) ->
-    {keep_state, Data, [{reply, From, {ok, ike_auth}}]}.
+    {keep_state, Data, [{reply, From, {ok, ike_auth}}]};
+ike_auth({call, From}, get_info, Data) ->
+    {keep_state, Data, [{reply, From, {ok, session_info(ike_auth, Data)}}]}.
 
 %%====================================================================
 %% State: established (IPsec tunnel active)
@@ -455,7 +477,9 @@ established(state_timeout, dpd, #data{dpd_failures = F, imsi = IMSI} = Data) ->
     end;
 
 established({call, From}, get_state, Data) ->
-    {keep_state, Data, [{reply, From, {ok, established}}]}.
+    {keep_state, Data, [{reply, From, {ok, established}}]};
+established({call, From}, get_info, Data) ->
+    {keep_state, Data, [{reply, From, {ok, session_info(established, Data)}}]}.
 
 %%====================================================================
 %% IKE_SA_INIT handler
@@ -776,6 +800,9 @@ handle_ike_auth_request(Header, RawData,
                             Sai2Body = stash_payload_body(sa,  InnerPayloads),
                             TsiBody  = stash_payload_body(tsi, InnerPayloads),
                             TsrBody  = stash_payload_body(tsr, InnerPayloads),
+                            %% RFC 7296 §3.15: the UE's CFG_REQUEST (what IP
+                            %% versions it wants) rides in this first IKE_AUTH.
+                            CpBody   = stash_payload_body(cp,  InnerPayloads),
                             %% RFC 4555 §3.1: the UE signals MOBIKE in the
                             %% first IKE_AUTH request via N(MOBIKE_SUPPORTED).
                             Mobike = find_notify(?N_MOBIKE_SUPPORTED, InnerPayloads),
@@ -845,6 +872,7 @@ handle_ike_auth_request(Header, RawData,
                                         sai2_body    = Sai2Body,
                                         tsi_body     = TsiBody,
                                         tsr_body     = TsrBody,
+                                        cp_body      = CpBody,
                                         ike_auth_last_resp = RespBytes,
                                         ike_auth_last_msg_id = MsgId
                                     },
@@ -1001,9 +1029,15 @@ relay_eap_via_swm(MsgId, InFlags, EapBytes, ISPI, RSPI,
              user_name   => pick_user_name(UeNai, IMSI),
              eap_payload => EapBytes,
              apn         => to_bin(epdg_config:get(default_apn, "ims"))},
+    %% TS 29.273 §9.2.3.1.1: carry the UE's local (outer) IP address as
+    %% seen on the SWu socket in the SWm DER so the AAA can record where
+    %% the subscriber attached from. This is the public/NAT'd source
+    %% address of the UE on the untrusted access (the AAA never otherwise
+    %% sees it — only the ePDG terminates the IKEv2/IPsec tunnel).
+    Base1 = maybe_put_ue_local_ip(Base, PeerIP),
     DERArgs = case DestHost0 of
-        undefined -> Base;
-        DH        -> Base#{destination_host => DH}
+        undefined -> Base1;
+        DH        -> Base1#{destination_host => DH}
     end,
     logger:notice("SWm DER send session_id=~s eap_len=~B IMSI=~p dest_host=~p",
                   [SessionId, byte_size(EapBytes), IMSI, DestHost0]),
@@ -1108,6 +1142,47 @@ handle_post_eap_auth(MsgId, InFlags, AuthRaw, InnerPayloads,
 default_apn() ->
     list_to_binary(epdg_config:get(default_apn, "ims")).
 
+%% Only attach UE-Local-IP-Address when we actually have the UE's outer
+%% address (always true once the IKE_SA_INIT was received, but the guard
+%% keeps the DER well-formed if it is ever called earlier).
+maybe_put_ue_local_ip(Map, IP) when is_tuple(IP) -> Map#{ue_local_ip => IP};
+maybe_put_ue_local_ip(Map, _)                    -> Map.
+
+%% Build the read-only JSON-friendly snapshot returned by get_info/1.
+%% `peer_ip'/`peer_port' are the UE's real outer source address on SWu.
+session_info(State, #data{peer_ip = PeerIP, peer_port = PeerPort,
+                          imsi = IMSI, apn = Apn, ue_nai = UeNai,
+                          responder_spi = RSPI, initiator_spi = ISPI,
+                          ue_inner_ip = InnerIP, ue_inner_ip6 = InnerIP6,
+                          mobike = Mobike,
+                          swm_session_id = SwmSessionId}) ->
+    #{state          => State,
+      imsi           => null_or_bin(IMSI),
+      nai            => null_or_bin(UeNai),
+      apn            => null_or_bin(Apn),
+      peer_ip        => fmt_addr(PeerIP),
+      peer_port      => null_or_int(PeerPort),
+      ue_inner_ip    => fmt_addr(InnerIP),
+      ue_inner_ipv6  => fmt_addr(InnerIP6),
+      mobike         => Mobike =:= true,
+      responder_spi  => fmt_spi(RSPI),
+      initiator_spi  => fmt_spi(ISPI),
+      swm_session_id => null_or_bin(SwmSessionId)}.
+
+fmt_addr(IP) when is_tuple(IP) -> list_to_binary(inet:ntoa(IP));
+fmt_addr(_)                    -> null.
+
+fmt_spi(SPI) when is_integer(SPI) ->
+    list_to_binary(io_lib:format("~16.16.0b", [SPI]));
+fmt_spi(_) -> null.
+
+null_or_bin(B) when is_binary(B) -> B;
+null_or_bin(L) when is_list(L)   -> list_to_binary(L);
+null_or_bin(_)                   -> null.
+
+null_or_int(N) when is_integer(N) -> N;
+null_or_int(_)                    -> null.
+
 %%--------------------------------------------------------------------
 %% Request an S2b PDN connection, set up the child SA, then send the
 %% final IKE_AUTH response.
@@ -1122,16 +1197,33 @@ proceed_with_s2b(MsgId, InFlags, ISPI, RSPI,
                        eap_msk = MSK} = Data0) ->
     LocalCTeid = new_teid(),
     LocalUTeid = new_teid(),
+    %% PDN type: honour the UE's IKEv2 CFG_REQUEST when dual-stack is enabled,
+    %% otherwise force IPv4 (historical behaviour). The PGW still has the final
+    %% say via the Create-Session PAA; we set up whatever it actually grants.
+    PdnType = requested_pdn_type(Data0),
+    logger:info("S2b Create-Session IMSI=~p APN=~p pdn_type=~B (1=v4 2=v6 3=v4v6)",
+                [IMSI, Apn, PdnType]),
     case epdg_gtpc_client:create_session_request(#{
             imsi         => IMSI,
             apn          => Apn,
             rat_type     => 3,           %% WLAN
-            pdn_type     => 1,           %% IPv4
+            pdn_type     => PdnType,
             ebi          => 5,
             local_c_teid => LocalCTeid,
             local_u_teid => LocalUTeid
         }) of
-        {ok, #{cause := Cause} = Resp} when Cause =:= 16 orelse Cause =:= undefined ->
+        %% TS 29.274 §8.4 Table 8.4-1: cause values 16..63 are the
+        %% "Acceptance" range, 64..239 are "Rejection". For a dual-stack
+        %% (pdn_type=3) request the PGW commonly answers with cause 18
+        %% ("New PDN type due to network preference") or 19 ("...due to
+        %% single address bearer only") when it grants a narrower PDN type
+        %% than requested (e.g. IPv4-only) -- these are SUCCESS, not failure.
+        %% We honour whatever PAA the PGW actually allocated in
+        %% finalize_ike_auth (extract_pdn_attrs/1), so any acceptance cause
+        %% proceeds. (undefined = cause IE absent, treat as accepted.)
+        {ok, #{cause := Cause} = Resp}
+          when Cause =:= undefined
+               orelse (Cause >= 16 andalso Cause =< 63) ->
             finalize_ike_auth(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
                                IDrBody, NonceI, NonceR,
                                IkeSaInitRespBytes, MSK,
@@ -1200,8 +1292,11 @@ finalize_ike_auth(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
     PeerSPI = maps:get(peer_spi, ChildSuite, <<0:32>>),
 
     %% CP/TS from UE
-    {UeInnerIp, PdnDns, PdnPcscf, _CpAttrsIn} =
-        extract_pdn_attrs(GtpcResp),
+    Pdn        = extract_pdn_attrs(GtpcResp),
+    UeInnerIp  = maps:get(ip4, Pdn),
+    UeInnerIp6 = maps:get(ip6, Pdn),
+    PdnDns     = maps:get(dns4, Pdn),
+    PdnPcscf   = maps:get(pcscf4, Pdn),
     %% Same reasoning as SAi2 above — TSi/TSr were stashed from the
     %% first IKE_AUTH. Fall back to whatever the post-EAP AUTH message
     %% happens to carry only if the stash is empty (defensive).
@@ -1210,16 +1305,17 @@ finalize_ike_auth(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
     install_child_sas(PeerIP, PeerPort, PeerSPI, ResponderSPI,
                        ChildSuite,
                        SkEiChild, SkAiChild, SkErChild, SkArChild,
-                       UeInnerIp),
+                       UeInnerIp, UeInnerIp6),
 
     %% Register this UE's bearer with the GTP-U forwarder so the
     %% inbound GTP-U packets from PGW-U can be demuxed to the right
-    %% TUN device.
+    %% TUN device. ue_inner_ip6 is undefined for an IPv4-only PAA.
     {PgwUIp, PgwUTeid} = pgw_u_from_resp(GtpcResp),
     catch epdg_gtpu_forwarder:register_ue(#{
         pgw_u_teid   => PgwUTeid,
         pgw_u_ip     => PgwUIp,
         ue_inner_ip  => UeInnerIp,
+        ue_inner_ip6 => UeInnerIp6,
         imsi         => Data0#data.imsi,
         owner_pid    => self(),
         local_teid_hint => LocalUTeid}),
@@ -1230,8 +1326,8 @@ finalize_ike_auth(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
                 maps:get(sk_pr, Keys), IDrBody),
     AuthBin = epdg_ikev2_codec:encode_auth_payload(2, AuthSig),
 
-    %% CFG_REPLY from the PGW's PAA + PCO
-    CpReplyBin = build_cfg_reply(UeInnerIp, PdnDns, PdnPcscf),
+    %% CFG_REPLY from the PGW's PAA + PCO (IPv4 always, IPv6 when granted)
+    CpReplyBin = build_cfg_reply(Pdn),
 
     %% SAr2: advertise chosen child suite with our SPI
     ChildRespSuite = ChildSuite#{responder_spi => ResponderSPI},
@@ -1274,9 +1370,9 @@ finalize_ike_auth(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
         {ok, RespBytes} ->
             catch epdg_ikev2_listener:send(PeerIP, PeerPort, RespBytes),
             logger:info("IKE_AUTH final response sent (~B bytes) IMSI=~p "
-                        "ue_inner_ip=~p pcscf=~p dns=~p",
+                        "ue_inner_ip=~p ue_inner_ip6=~p pcscf=~p dns=~p",
                         [byte_size(RespBytes), Data0#data.imsi,
-                         UeInnerIp, PdnPcscf, PdnDns]),
+                         UeInnerIp, UeInnerIp6, PdnPcscf, PdnDns]),
             epdg_metrics:inc(ike_auth_success_total),
             Data1 = Data0#data{
                 child_sa = #{spi_in  => ResponderSPIInt,
@@ -1293,11 +1389,14 @@ finalize_ike_auth(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
                                             sk_ai       => SkAiChild,
                                             sk_er       => SkErChild,
                                             sk_ar       => SkArChild,
-                                            ue_inner_ip => UeInnerIp}},
+                                            ue_inner_ip => UeInnerIp,
+                                            ue_inner_ip6 => UeInnerIp6}},
                 pgw_session = GtpcResp#{ue_inner_ip => UeInnerIp,
+                                          ue_inner_ip6 => UeInnerIp6,
                                           local_c_teid => LocalCTeid,
                                           local_u_teid => LocalUTeid},
                 ue_inner_ip = UeInnerIp,
+                ue_inner_ip6 = UeInnerIp6,
                 gtpu_teid_local = LocalUTeid,
                 gtpu_teid_pgw = PgwUTeid,
                 ike_auth_last_resp = RespBytes,
@@ -1329,14 +1428,49 @@ split_child_keymat(Mat, E, I) ->
     <<SKar:I/binary, _/binary>> = Rest3,
     {SKei, SKai, SKer, SKar}.
 
-%% Pull UE inner IP / DNS / P-CSCF out of the GTP-C Create-Session-Resp
-%% map that our codec returns.
-extract_pdn_attrs(#{paa := #{ipv4 := Ip4}, pco := Pco}) ->
-    {Ip4, maps:get(dns_v4, Pco, []), maps:get(pcscf_v4, Pco, []), Pco};
-extract_pdn_attrs(#{paa := #{ipv4 := Ip4}}) ->
-    {Ip4, [], [], #{}};
+%% Determine the S2b PDN type to request from the PGW.
+%%   1 = IPv4, 2 = IPv6, 3 = IPv4v6 (TS 29.274 §8.34).
+%% When dual-stack is disabled we always request IPv4 (historical default).
+%% When enabled we honour what the UE asked for in its IKEv2 CFG_REQUEST
+%% (RFC 7296 §3.15): INTERNAL_IP4_ADDRESS (1) and/or INTERNAL_IP6_ADDRESS (8).
+requested_pdn_type(#data{cp_body = CpBody}) ->
+    case epdg_config:get(ipv6_enabled, false) of
+        true  -> pdn_type_from_cp(CpBody);
+        _     -> 1
+    end.
+
+pdn_type_from_cp(CpBody) when is_binary(CpBody) ->
+    case epdg_ikev2_codec:decode_cp_payload(CpBody) of
+        {ok, {_CfgType, Attrs}} ->
+            HasV4 = lists:keymember(internal_ip4_address, 1, Attrs),
+            HasV6 = lists:keymember(internal_ip6_address, 1, Attrs),
+            case {HasV4, HasV6} of
+                {true,  true}  -> 3;
+                {false, true}  -> 2;
+                _              -> 1
+            end;
+        _ -> 1
+    end;
+pdn_type_from_cp(_) -> 1.
+
+%% Pull UE inner IP(s) / DNS / P-CSCF out of the GTP-C Create-Session-Resp
+%% map that our codec returns. Returns a map so the IPv4-only and dual-stack
+%% paths share one shape:
+%%   #{ip4, ip6, dns4, dns6, pcscf4, pcscf6, pco}
+%% ip4 is always present (defaults to 0.0.0.0); ip6 is undefined unless the
+%% PGW granted an IPv6 (or IPv4v6) PAA.
+extract_pdn_attrs(#{paa := Paa} = Resp) when is_map(Paa) ->
+    Pco = maps:get(pco, Resp, #{}),
+    #{ip4    => maps:get(ipv4, Paa, {0,0,0,0}),
+      ip6    => maps:get(ipv6, Paa, undefined),
+      dns4   => maps:get(dns_v4, Pco, []),
+      dns6   => maps:get(dns_v6, Pco, []),
+      pcscf4 => maps:get(pcscf_v4, Pco, []),
+      pcscf6 => maps:get(pcscf_v6, Pco, []),
+      pco    => Pco};
 extract_pdn_attrs(_) ->
-    {{0,0,0,0}, [], [], #{}}.
+    #{ip4 => {0,0,0,0}, ip6 => undefined,
+      dns4 => [], dns6 => [], pcscf4 => [], pcscf6 => [], pco => #{}}.
 
 pgw_u_from_resp(#{pgw_u_fteid := #{ip := IP, teid := T}}) -> {IP, T};
 pgw_u_from_resp(_) -> {{0,0,0,0}, 0}.
@@ -1395,15 +1529,36 @@ encode_ts_or_default(List) when is_list(List), List /= [] ->
     epdg_ikev2_codec:encode_ts_payload(List).
 
 %% Build a CFG_REPLY with the PDN attributes returned by the PGW.
-build_cfg_reply(Ip4, DnsList, PcscfList) ->
-    {A,B,C,D} = Ip4,
-    Base = [{internal_ip4_address, <<A:8,B:8,C:8,D:8>>},
-            {internal_ip4_netmask, <<255:8,255:8,255:8,255:8>>}],
-    Dns = [{internal_ip4_dns, encode_ip4(X)} || X <- DnsList],
-    Pcf = [{p_cscf_ip4_address, encode_ip4(X)} || X <- PcscfList],
-    epdg_ikev2_codec:encode_cp_payload(2, Base ++ Dns ++ Pcf).
+%% Emits IPv4 attributes when an IPv4 address was granted and IPv6
+%% attributes when an IPv6 address was granted (dual-stack returns both).
+%% RFC 7296 §3.15.1 (INTERNAL_IP6_ADDRESS = 16-byte addr + 1-byte prefix
+%% length) and 3GPP TS 24.302 §8.2 (P_CSCF_IP6_ADDRESS attr 22).
+build_cfg_reply(#{ip4 := Ip4, ip6 := Ip6,
+                  dns4 := Dns4, dns6 := Dns6,
+                  pcscf4 := Pcscf4, pcscf6 := Pcscf6}) ->
+    V4 = case Ip4 of
+        {0,0,0,0} -> [];
+        {A,B,C,D} ->
+            [{internal_ip4_address, <<A:8,B:8,C:8,D:8>>},
+             {internal_ip4_netmask, <<255:8,255:8,255:8,255:8>>}]
+            ++ [{internal_ip4_dns, encode_ip4(X)} || X <- Dns4]
+            ++ [{p_cscf_ip4_address, encode_ip4(X)} || X <- Pcscf4];
+        _ -> []
+    end,
+    V6 = case Ip6 of
+        undefined -> [];
+        _ ->
+            %% INTERNAL_IP6_ADDRESS: 16-byte address + /64 prefix length.
+            [{internal_ip6_address, <<(encode_ip6(Ip6))/binary, 64:8>>}]
+            ++ [{internal_ip6_dns, encode_ip6(X)} || X <- Dns6]
+            ++ [{p_cscf_ip6_address, encode_ip6(X)} || X <- Pcscf6]
+    end,
+    epdg_ikev2_codec:encode_cp_payload(2, V4 ++ V6).
 
 encode_ip4({A,B,C,D}) -> <<A:8,B:8,C:8,D:8>>.
+
+encode_ip6({A,B,C,D,E,F,G,H}) ->
+    <<A:16,B:16,C:16,D:16,E:16,F:16,G:16,H:16>>.
 
 %%--------------------------------------------------------------------
 %% Install IPsec SAs + policies for the freshly-negotiated Child SA.
@@ -1415,7 +1570,7 @@ encode_ip4({A,B,C,D}) -> <<A:8,B:8,C:8,D:8>>.
 install_child_sas({U_A, U_B, U_C, U_D} = UeOuter, PeerPort, PeerSPI, RespSPI,
                    Suite,
                    SkEiChild, SkAiChild, SkErChild, SkArChild,
-                   UeInnerIp) ->
+                   UeInnerIp, UeInnerIp6) ->
     LocalOuter = local_outer_ip(),
     SpiInInt   = binary_to_int(RespSPI),
     SpiOutInt  = binary_to_int(PeerSPI),
@@ -1439,6 +1594,7 @@ install_child_sas({U_A, U_B, U_C, U_D} = UeOuter, PeerPort, PeerSPI, RespSPI,
     InboundParams0 = #{spi => SpiInInt,
                         src_ip => UeOuter,
                         dst_ip => LocalOuter,
+                        sa_dir => in,
                         enc_alg => EncAlgIn,
                         enc_key => SkEiChild,
                         auth_alg => IntegAlgIn,
@@ -1455,6 +1611,7 @@ install_child_sas({U_A, U_B, U_C, U_D} = UeOuter, PeerPort, PeerSPI, RespSPI,
     OutboundParams0 = #{spi => SpiOutInt,
                          src_ip => LocalOuter,
                          dst_ip => UeOuter,
+                         sa_dir => out,
                          enc_alg => EncAlgIn,
                          enc_key => SkErChild,
                          auth_alg => IntegAlgIn,
@@ -1489,7 +1646,37 @@ install_child_sas({U_A, U_B, U_C, U_D} = UeOuter, PeerPort, PeerSPI, RespSPI,
                                           direction => out,
                                           tmpl_src => LocalOuter,
                                           tmpl_dst => UeOuter})),
+
+    %% Dual-stack: when the PGW also granted an IPv6 prefix, add the
+    %% matching IPv6 inner selectors. The tunnel endpoints (tmpl src/dst)
+    %% stay the IPv4 outer node IPs — Linux XFRM supports inner-IPv6 over
+    %% an outer-IPv4 tunnel, and both families ride the same ESP SA pair.
+    install_v6_policies(UeInnerIp6, UeOuter, LocalOuter),
+
     _ = {U_A, U_B, U_C, U_D},  %% silence unused
+    ok.
+
+%% Install the in/fwd/out XFRM policies for the UE's IPv6 inner address.
+%% No-op when the UE has no IPv6 (IPv4-only PAA).
+install_v6_policies(undefined, _UeOuter, _LocalOuter) -> ok;
+install_v6_policies(UeInnerIp6, UeOuter, LocalOuter) ->
+    Ue6Cidr  = ip6_cidr(UeInnerIp6, 128),
+    Any6Cidr = "::/0",
+    log_xfrm_result(pol6_in, 0,
+        catch epdg_xfrm:create_policy(#{src => Ue6Cidr, dst => Any6Cidr,
+                                          direction => in,
+                                          tmpl_src => UeOuter,
+                                          tmpl_dst => LocalOuter})),
+    log_xfrm_result(pol6_fwd, 0,
+        catch epdg_xfrm:create_policy(#{src => Ue6Cidr, dst => Any6Cidr,
+                                          direction => fwd,
+                                          tmpl_src => UeOuter,
+                                          tmpl_dst => LocalOuter})),
+    log_xfrm_result(pol6_out, 0,
+        catch epdg_xfrm:create_policy(#{src => Any6Cidr, dst => Ue6Cidr,
+                                          direction => out,
+                                          tmpl_src => LocalOuter,
+                                          tmpl_dst => UeOuter})),
     ok.
 
 %% Log the return of an xfrm mutation. Keeps IKE signalling up on
@@ -1506,14 +1693,25 @@ log_xfrm_result(Kind, Spi, Other) ->
     error.
 
 maybe_nat_t(Params, PeerOuter, PeerPort) ->
-    %% We infer NAT-T from the peer port: if the UE is sending from
-    %% UDP/4500 the IKE_SA_INIT NAT_DETECTION exchange asserted that
-    %% one end is behind a NAT, so turn on espinudp. 500 → plain ESP.
+    %% NAT-T (RFC 3948) covers the entire UDP/4500 datapath. After the
+    %% IKE_SA_INIT NAT_DETECTION exchange flags a NAT, the UE migrates
+    %% IKE/ESP off UDP/500 onto UDP/4500 (see refresh_peer_port/2).
+    %%
+    %% Crucially, a *port-translating* NAT (carrier-grade NAT) rewrites
+    %% the UE's source port to a random high port (e.g. 57187), NOT 4500.
+    %% Keying NAT-T on `PeerPort == 4500` therefore installed a plain-ESP
+    %% SA for exactly the NAT'd UEs that need espinudp; the kernel then
+    %% dropped every ESP-in-UDP packet at decrypt with XfrmInStateMismatch
+    %% (`(x->encap?:0) != ESPINUDP`), so IKE/EAP/GTP-C succeeded but the
+    %% whole user plane silently black-holed. Any peer port other than the
+    %% raw IKE port (500) means we are on the NAT-T datapath: enable
+    %% espinudp and use the observed (NAT-mapped) port.
     case PeerPort of
-        4500 ->
+        500 -> Params;
+        P when is_integer(P), P > 0 ->
             Params#{nat_t => true,
                     peer_outer_ip => PeerOuter,
-                    peer_udp_port => PeerPort,
+                    peer_udp_port => P,
                     local_udp_port => 4500};
         _ -> Params
     end.
@@ -1595,6 +1793,9 @@ child_integ_alg(_)             -> hmac_sha256.
 
 ip4_cidr({A,B,C,D}, Prefix) ->
     lists:flatten(io_lib:format("~B.~B.~B.~B/~B", [A,B,C,D,Prefix])).
+
+ip6_cidr({_,_,_,_,_,_,_,_} = Ip6, Prefix) ->
+    lists:flatten(io_lib:format("~s/~B", [inet:ntoa(Ip6), Prefix])).
 
 binary_to_int(<<N:32>>) -> N;
 binary_to_int(<<N:64>>) -> N;
@@ -1871,8 +2072,9 @@ delete_child_sas(_OuterIP, _) ->
 
 %% Delete the three per-UE XFRM policies (in/fwd/out) keyed by the UE inner
 %% IP. Mirrors the create_policy calls in install_child_sas/10.
-delete_ue_policies(undefined) -> ok;
-delete_ue_policies(UeInnerIp) ->
+delete_ue_policies(undefined, UeInnerIp6) ->
+    delete_ue6_policies(UeInnerIp6);
+delete_ue_policies(UeInnerIp, UeInnerIp6) ->
     UeCidr  = ip4_cidr(UeInnerIp, 32),
     AnyCidr = "0.0.0.0/0",
     catch epdg_xfrm:delete_policy(#{src => UeCidr,  dst => AnyCidr,
@@ -1880,6 +2082,19 @@ delete_ue_policies(UeInnerIp) ->
     catch epdg_xfrm:delete_policy(#{src => UeCidr,  dst => AnyCidr,
                                     direction => fwd}),
     catch epdg_xfrm:delete_policy(#{src => AnyCidr, dst => UeCidr,
+                                    direction => out}),
+    delete_ue6_policies(UeInnerIp6),
+    ok.
+
+delete_ue6_policies(undefined) -> ok;
+delete_ue6_policies(UeInnerIp6) ->
+    Ue6Cidr  = ip6_cidr(UeInnerIp6, 128),
+    Any6Cidr = "::/0",
+    catch epdg_xfrm:delete_policy(#{src => Ue6Cidr,  dst => Any6Cidr,
+                                    direction => in}),
+    catch epdg_xfrm:delete_policy(#{src => Ue6Cidr,  dst => Any6Cidr,
+                                    direction => fwd}),
+    catch epdg_xfrm:delete_policy(#{src => Any6Cidr, dst => Ue6Cidr,
                                     direction => out}),
     ok.
 
@@ -1893,13 +2108,14 @@ do_mobike_update(NewIP, NewPort,
     case maps:get(reinstall, CS, undefined) of
         #{peer_spi := PeerSPI, resp_spi := RespSPI, suite := Suite,
           sk_ei := Ei, sk_ai := Ai, sk_er := Er, sk_ar := Ar,
-          ue_inner_ip := InnerIp} ->
+          ue_inner_ip := InnerIp} = RI ->
+            InnerIp6 = maps:get(ue_inner_ip6, RI, undefined),
             logger:notice("MOBIKE UPDATE_SA_ADDRESSES IMSI=~p ~s -> ~s:~B",
                           [IMSI, format_ip(OldIP), format_ip(NewIP), NewPort]),
             delete_child_sas(OldIP, CS),
-            delete_ue_policies(InnerIp),
+            delete_ue_policies(InnerIp, InnerIp6),
             install_child_sas(NewIP, NewPort, PeerSPI, RespSPI, Suite,
-                              Ei, Ai, Er, Ar, InnerIp),
+                              Ei, Ai, Er, Ar, InnerIp, InnerIp6),
             epdg_metrics:inc(mobike_update_total),
             Data#data{peer_ip = NewIP, peer_port = NewPort};
         _ ->

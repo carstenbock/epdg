@@ -64,6 +64,13 @@ init(Req, #{action := status} = State) ->
         Body, Req),
     {ok, Reply, State};
 
+init(Req, #{action := sessions} = State) ->
+    Body = jsx:encode(collect_sessions()),
+    Reply = cowboy_req:reply(200,
+        #{<<"content-type">> => <<"application/json">>},
+        Body, Req),
+    {ok, Reply, State};
+
 init(Req, #{action := drain} = State) ->
     %% Idempotent: repeated POSTs just re-broadcast the drain intent,
     %% which is harmless — UE FSMs that are already scheduling teardown
@@ -119,6 +126,28 @@ broadcast_drain() ->
                 "broadcast_drain failed: ~p:~p~n~p", [Class, Reason, Stack]),
             ok
     end.
+
+%% Build the JSON-friendly list backing /admin/sessions. Walks the SPI
+%% registry and asks each live UE FSM for a read-only snapshot. The FSM
+%% call is wrapped so a single slow/dead FSM cannot stall or crash the
+%% endpoint; such sessions are simply skipped.
+-spec collect_sessions() -> [map()].
+collect_sessions() ->
+    Entries = try epdg_ue_registry:all() catch _:_ -> [] end,
+    lists:filtermap(
+      fun({_SPI, Pid, _IMSI}) when is_pid(Pid) ->
+              case is_process_alive(Pid) of
+                  true ->
+                      try epdg_ue_fsm:get_info(Pid) of
+                          {ok, Info} when is_map(Info) -> {true, Info};
+                          _ -> false
+                      catch
+                          _:_ -> false
+                      end;
+                  false -> false
+              end;
+         (_) -> false
+      end, Entries).
 
 -spec safe_registry_count() -> non_neg_integer().
 safe_registry_count() ->

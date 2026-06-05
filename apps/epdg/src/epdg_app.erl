@@ -11,10 +11,46 @@
 -export([start/2, prep_stop/1, stop/1]).
 
 start(_StartType, _StartArgs) ->
-    logger:info("Starting ePDG application"),
     epdg_config:init(),
+    apply_log_level(),
+    logger:info("Starting ePDG application"),
     epdg_metrics:init(),
     epdg_sup:start_link().
+
+%% Apply the configured primary log level to the Erlang `logger'.
+%%
+%% The level arrives as a string in `EPDG_LOG_LEVEL' (chart value
+%% `erlang.logLevel'). Without this call the BEAM keeps the OTP default
+%% primary level `notice', so every per-attach IKE_SA_INIT proposal and
+%% SWm DER/DEA line (all emitted via `logger:notice/2') reaches the logs.
+%% Setting `warning' (or `error') silences that chatter while still
+%% surfacing genuine problems (e.g. `pgw_unreachable'). An unrecognised
+%% value falls back to `notice' rather than crashing the boot.
+apply_log_level() ->
+    Level = parse_log_level(epdg_config:get(log_level, "notice")),
+    case logger:set_primary_config(level, Level) of
+        ok -> ok;
+        {error, Reason} ->
+            logger:warning("Could not set log level to ~p: ~p", [Level, Reason])
+    end,
+    Level.
+
+parse_log_level(L) when is_atom(L) -> parse_log_level(atom_to_list(L));
+parse_log_level(L) when is_list(L) ->
+    case string:lowercase(string:trim(L)) of
+        "emergency" -> emergency;
+        "alert"     -> alert;
+        "critical"  -> critical;
+        "error"     -> error;
+        "warning"   -> warning;
+        "notice"    -> notice;
+        "info"      -> info;
+        "debug"     -> debug;
+        Other ->
+            logger:warning("Unknown EPDG_LOG_LEVEL ~p, defaulting to notice",
+                           [Other]),
+            notice
+    end.
 
 %% Called BEFORE the supervisor tree is torn down. Last chance to do
 %% protocol-level housekeeping while every worker is still alive.

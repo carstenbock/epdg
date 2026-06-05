@@ -94,6 +94,14 @@ init() ->
     set_from_env("EPDG_UE_IP_POOL", ue_ip_pool, "10.47.0.0/16"),
     set_from_env("EPDG_UE_IP6_POOL", ue_ip6_pool, ""),
 
+    %% Dual-stack toggle. When false (default) the ePDG always requests an
+    %% IPv4-only S2b PDN and only ever hands the UE an IPv4 inner address --
+    %% the historical behaviour. When true the ePDG honours the PDN type the
+    %% UE asks for in its IKEv2 CFG_REQUEST (INTERNAL_IP4_ADDRESS /
+    %% INTERNAL_IP6_ADDRESS) and grants whatever the PGW actually allocates
+    %% in the Create-Session PAA (IPv4, IPv6 or IPv4v6). GSMA IR.51/IR.92.
+    set_from_env_bool("EPDG_IPV6_ENABLED", ipv6_enabled, false),
+
     %% Allowed APNs (comma-separated; empty = allow all, "ims" is always allowed)
     set_from_env("EPDG_ALLOWED_APNS", allowed_apns, "ims"),
     set_from_env("EPDG_DEFAULT_APN", default_apn, "ims"),
@@ -110,8 +118,10 @@ init() ->
     %% TUN device garbage collection interval (ms)
     set_from_env_int("EPDG_TUN_GC_INTERVAL", tun_gc_interval, 300000),
 
-    %% Log level
-    set_from_env("EPDG_LOG_LEVEL", log_level, "info"),
+    %% Log level (applied to the primary logger in epdg_app:start/2).
+    %% Default `notice' matches the OTP default primary level; lower it to
+    %% `warning'/`error' to silence the per-attach NOTICE chatter.
+    set_from_env("EPDG_LOG_LEVEL", log_level, "notice"),
 
     ok.
 
@@ -139,6 +149,20 @@ set_from_env_int(EnvVar, AppKey, Default) ->
     Value = case os:getenv(EnvVar) of
         false -> Default;
         Val -> list_to_integer(Val)
+    end,
+    application:set_env(?APP, AppKey, Value).
+
+set_from_env_bool(EnvVar, AppKey, Default) ->
+    Value = case os:getenv(EnvVar) of
+        false -> Default;
+        Val ->
+            case string:lowercase(string:trim(Val)) of
+                "1"    -> true;
+                "true" -> true;
+                "yes"  -> true;
+                "on"   -> true;
+                _      -> false
+            end
     end,
     application:set_env(?APP, AppKey, Value).
 

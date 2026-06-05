@@ -45,6 +45,7 @@
     tun_name     :: string(),
     tun_port     :: port() | undefined,
     ue_inner_ip  :: inet:ip_address(),
+    ue_inner_ip6 :: inet:ip_address() | undefined,
     owner_pid    :: pid() | undefined
 }).
 
@@ -229,6 +230,7 @@ do_register_ue(#{pgw_u_teid := PgwTeid, pgw_u_ip := PgwIP,
                  ue_inner_ip := InnerIP} = P,
                #state{by_teid = Map, next_teid = N,
                       by_owner = Owners, by_port = PMap} = State) ->
+    InnerIP6 = maps:get(ue_inner_ip6, P, undefined),
     %% The FSM generates a 32-bit TEID in new_teid/0, advertises it to
     %% the PGW-U in the Create-Session F-TEID IE, and passes it in
     %% here as `local_teid_hint`. The PGW-U then uses THAT value as
@@ -241,7 +243,7 @@ do_register_ue(#{pgw_u_teid := PgwTeid, pgw_u_ip := PgwIP,
                     _                           -> N
                 end,
     TunName   = tun_name_for(P),
-    TunPort   = maybe_open_tun(TunName, InnerIP, LocalTeid),
+    TunPort   = maybe_open_tun(TunName, InnerIP, InnerIP6, LocalTeid),
     Owner     = maps:get(owner_pid, P, undefined),
     case is_pid(Owner) of
         true  -> erlang:monitor(process, Owner);
@@ -253,6 +255,7 @@ do_register_ue(#{pgw_u_teid := PgwTeid, pgw_u_ip := PgwIP,
                   tun_name = TunName,
                   tun_port = TunPort,
                   ue_inner_ip = InnerIP,
+                  ue_inner_ip6 = InnerIP6,
                   owner_pid = Owner},
     Owners1 = case Owner of
         undefined -> Owners;
@@ -367,7 +370,7 @@ skip_ext_hdrs(Bin) -> Bin.
 %% toward the UE.
 %%====================================================================
 
-maybe_open_tun(Name, {A,B,C,D} = _Ip, LocalTeid) ->
+maybe_open_tun(Name, Ip4, Ip6, LocalTeid) ->
     %% Linux IFNAMSIZ = 16 bytes incl. trailing NUL: interface names
     %% must be <= 15 chars. Guard here so that upstream generation
     %% mistakes surface as explicit log warnings instead of silent
@@ -380,14 +383,13 @@ maybe_open_tun(Name, {A,B,C,D} = _Ip, LocalTeid) ->
                            [Name, length(Name)]),
             undefined;
         true ->
-            ensure_forwarding_sysctls(),
-            UeIp = io_lib:format("~B.~B.~B.~B", [A,B,C,D]),
+            ensure_forwarding_sysctls(Ip6 =/= undefined),
             Table = ue_route_table(LocalTeid),
             %% NOTE: we intentionally do NOT assign the UE's inner IP to
             %% the TUN — that would make the kernel treat UE_IP as local
             %% and deliver downlink packets to us instead of forwarding
             %% them through the XFRM OUT policy back out to the UE.
-            Cmds = [
+            BaseCmds = [
                 io_lib:format("ip tuntap add dev ~s mode tun", [Name]),
                 io_lib:format("ip link set dev ~s up", [Name]),
                 %% Loose rp_filter on the TUN so decrypted uplink with
@@ -399,26 +401,73 @@ maybe_open_tun(Name, {A,B,C,D} = _Ip, LocalTeid) ->
                 io_lib:format(
                     "val=$(cat /proc/sys/net/ipv4/conf/~s/rp_filter "
                     "2>/dev/null); [ \"$val\" != 1 ] || "
-                    "sysctl -wq net.ipv4.conf.~s.rp_filter=2", [Name, Name]),
-                %% Main table downlink route: lets FIB lookup for dst=UE_IP
-                %% succeed; the XFRM OUT bundle (dst=UE_IP/32 tmpl tunnel esp)
-                %% overrides and actually emits ESP via eth0.
-                io_lib:format("ip route add ~s/32 dev ~s", [UeIp, Name]),
-                %% Uplink policy table: after XFRM decrypt, packets with
-                %% src=UE_IP are sent out the UE's own TUN for the BEAM
-                %% to pick up and wrap into GTP-U.
-                io_lib:format("ip rule add from ~s/32 lookup ~B priority ~B",
-                              [UeIp, Table, Table]),
-                io_lib:format("ip route add default dev ~s table ~B",
-                              [Name, Table])
+                    "sysctl -wq net.ipv4.conf.~s.rp_filter=2", [Name, Name])
             ],
+            Cmds = BaseCmds ++ v4_tun_cmds(Ip4, Name, Table)
+                            ++ v6_tun_cmds(Ip6, Name, Table),
             case run_cmds_or_warn(Name, Cmds) of
                 ok    -> open_tun_port(Name);
                 error -> undefined
             end
-    end;
-maybe_open_tun(_Name, _, _) ->
-    undefined.
+    end.
+
+%% IPv4 downlink/uplink routing for the per-UE TUN. Skipped for an
+%% IPv6-only bearer (UE IPv4 is the unspecified address).
+v4_tun_cmds({0,0,0,0}, _Name, _Table) -> [];
+v4_tun_cmds({A,B,C,D}, Name, Table) ->
+    UeIp = io_lib:format("~B.~B.~B.~B", [A,B,C,D]),
+    [
+        %% Uplink policy table: after XFRM decrypt, packets with
+        %% src=UE_IP are sent out the UE's own TUN for the BEAM
+        %% to pick up and wrap into GTP-U.
+        io_lib:format("ip rule add from ~s/32 lookup ~B priority ~B",
+                      [UeIp, Table, Table]),
+        %% Downlink route: scoped to the per-UE table, reached only for
+        %% packets the forwarder injects into this UE's TUN (iif rule
+        %% below). The FIB lookup for dst=UE_IP succeeds here and the
+        %% global XFRM OUT bundle (dst=UE_IP/32 tmpl tunnel esp) emits
+        %% ESP toward the UE.
+        %%
+        %% CRITICAL: this /32 must NOT live in the MAIN table. The ePDG
+        %% runs on hostNetwork and shares the node routing table with a
+        %% co-located PGW-U. A main-table UE_IP/32 is more specific than
+        %% the PGW-U's /17 ogstun pool route, so it shadowed it and
+        %% black-holed IMS downlink for every UE whose anchoring PGW-U
+        %% landed on the same node (the packet was swallowed into this
+        %% TUN instead of reaching the PGW-U). Keeping MAIN clean lets
+        %% forwarded downlink reach the PGW-U; the `iif <TUN>` rule still
+        %% routes the ePDG's own injected packets out via XFRM.
+        io_lib:format("ip rule add iif ~s lookup ~B priority ~B",
+                      [Name, Table, Table]),
+        io_lib:format("ip route add ~s/32 dev ~s table ~B",
+                      [UeIp, Name, Table]),
+        io_lib:format("ip route add default dev ~s table ~B", [Name, Table])
+    ];
+v4_tun_cmds(_, _Name, _Table) -> [].
+
+%% IPv6 analogue of v4_tun_cmds/3. Uses the same per-UE table id (the v4
+%% and v6 routing tables are independent address families in iproute2) so
+%% downlink dst=UE_IP6 and uplink src=UE_IP6 ride the same TUN as IPv4.
+v6_tun_cmds(undefined, _Name, _Table) -> [];
+v6_tun_cmds({_,_,_,_,_,_,_,_} = Ip6, Name, Table) ->
+    UeIp6 = inet:ntoa(Ip6),
+    [
+        %% Make sure IPv6 is enabled on the freshly-created TUN even if the
+        %% host disables it by default.
+        io_lib:format("sysctl -wq net.ipv6.conf.~s.disable_ipv6=0", [Name]),
+        %% Uplink policy (src=UE_IP6 -> UE TUN).
+        io_lib:format("ip -6 rule add from ~s/128 lookup ~B priority ~B",
+                      [UeIp6, Table, Table]),
+        %% Downlink scoped to the per-UE table only -- NOT in the MAIN v6
+        %% table, to avoid shadowing a co-located PGW-U's /48 ogstun pool
+        %% route. See the v4_tun_cmds comment for the full rationale.
+        io_lib:format("ip -6 rule add iif ~s lookup ~B priority ~B",
+                      [Name, Table, Table]),
+        io_lib:format("ip -6 route add ~s/128 dev ~s table ~B",
+                      [UeIp6, Name, Table]),
+        io_lib:format("ip -6 route add default dev ~s table ~B", [Name, Table])
+    ];
+v6_tun_cmds(_, _Name, _Table) -> [].
 
 %% Route-table / rule priority derived from the per-pod local TEID.
 %%
@@ -450,10 +499,17 @@ run_cmds_or_warn(Name, Cmds) ->
 %% securityContext.sysctls or host-level /etc/sysctl.d/ the values
 %% are already correct and the write attempts are harmless no-ops
 %% (or fail on a read-only /proc/sys).
-ensure_forwarding_sysctls() ->
+ensure_forwarding_sysctls(WantV6) ->
     _ = os:cmd("sysctl -wq net.ipv4.ip_forward=1 2>&1"),
     verify_sysctl_exact("net.ipv4.ip_forward", "1"),
     verify_rp_filter("net.ipv4.conf.all.rp_filter"),
+    case WantV6 of
+        true ->
+            _ = os:cmd("sysctl -wq net.ipv6.conf.all.forwarding=1 2>&1"),
+            verify_sysctl_exact("net.ipv6.conf.all.forwarding", "1");
+        false ->
+            ok
+    end,
     ok.
 
 verify_sysctl_exact(Key, Expected) ->
@@ -523,23 +579,49 @@ locate_tun_helper() ->
     end.
 
 close_tun_ent(#ue_ent{tun_port = TP, tun_name = Name,
-                      local_teid = Teid, ue_inner_ip = Ip}) ->
+                      local_teid = Teid, ue_inner_ip = Ip,
+                      ue_inner_ip6 = Ip6}) ->
     case TP of
         undefined -> ok;
         Port when is_port(Port) -> catch erlang:port_close(Port), ok
     end,
-    teardown_ue_routing(Ip, Teid),
+    teardown_ue_routing(Ip, Ip6, Teid),
     delete_tun_dev(Name).
 
-teardown_ue_routing(undefined, _Teid) -> ok;
-teardown_ue_routing({A,B,C,D}, Teid) ->
-    UeIp = io_lib:format("~B.~B.~B.~B", [A,B,C,D]),
+teardown_ue_routing(Ip, Teid) ->
+    teardown_ue_routing(Ip, undefined, Teid).
+
+teardown_ue_routing(Ip, Ip6, Teid) ->
     Table = ue_route_table(Teid),
+    %% The downlink iif rule (v4_tun_cmds / v6_tun_cmds) is keyed on the TUN
+    %% device name, which is derived purely from the TEID -- so we can always
+    %% remove it, even during startup orphan cleanup when the UE IP is unknown.
+    Name = lists:flatten(io_lib:format("ue~B", [Teid])),
+    %% IPv4 teardown.
+    case Ip of
+        {A,B,C,D} when {A,B,C,D} =/= {0,0,0,0} ->
+            UeIp = io_lib:format("~B.~B.~B.~B", [A,B,C,D]),
+            _ = os:cmd(lists:flatten(
+                io_lib:format("ip rule del from ~s/32 lookup ~B priority ~B 2>&1",
+                              [UeIp, Table, Table])));
+        _ -> ok
+    end,
     _ = os:cmd(lists:flatten(
-        io_lib:format("ip rule del from ~s/32 lookup ~B priority ~B 2>&1",
-                      [UeIp, Table, Table]))),
+        io_lib:format("ip rule del iif ~s lookup ~B priority ~B 2>&1",
+                      [Name, Table, Table]))),
     _ = os:cmd(lists:flatten(
         io_lib:format("ip route flush table ~B 2>&1", [Table]))),
+    %% IPv6 teardown. Remove the downlink iif rule by selector, the uplink
+    %% from-rule by priority (works even when we don't know the UE's IPv6,
+    %% e.g. startup orphan cleanup), and flush the per-UE v6 table.
+    _ = os:cmd(lists:flatten(
+        io_lib:format("ip -6 rule del iif ~s lookup ~B priority ~B 2>&1",
+                      [Name, Table, Table]))),
+    _ = os:cmd(lists:flatten(
+        io_lib:format("ip -6 rule del priority ~B 2>&1", [Table]))),
+    _ = os:cmd(lists:flatten(
+        io_lib:format("ip -6 route flush table ~B 2>&1", [Table]))),
+    _ = Ip6,
     ok.
 
 delete_tun_dev(undefined) -> ok;
@@ -603,8 +685,13 @@ teid_from_tun_name("ue" ++ Digits) ->
 teid_from_tun_name(_) -> 0.
 
 tun_ip_from_route(Name) ->
+    %% The UE's /32 now lives in the per-UE policy table (see v4_tun_cmds),
+    %% not the main table, so query that table (id derived from the TEID)
+    %% and ignore its default route.
+    Table = ue_route_table(teid_from_tun_name(Name)),
     Cmd = lists:flatten(io_lib:format(
-        "ip route show dev ~s 2>/dev/null | head -1 | awk '{print $1}'", [Name])),
+        "ip route show table ~B dev ~s 2>/dev/null "
+        "| grep -v default | head -1 | awk '{print $1}'", [Table, Name])),
     Raw = string:trim(os:cmd(Cmd)),
     case parse_route_ip(Raw) of
         {ok, Ip} -> Ip;

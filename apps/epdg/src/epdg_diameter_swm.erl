@@ -293,10 +293,15 @@ send_der(#{session_id := SessionId, eap_payload := EAPPayload} = Opts) ->
     Msg0 = maybe_add(Base, 'User-Name', UserName),
     Msg1 = maybe_add(Msg0, 'Visited-Network-Identifier',
                       maps:get(visited_plmn, Opts, undefined)),
+    %% TS 29.273 §9.2.3.1.1 UE-Local-IP-Address (AVP 2805, type Address):
+    %% the UE's outer source address on SWu as observed by the ePDG.
+    %% Encoded from the inet:ip_address() tuple the FSM threads through.
+    Msg2 = maybe_add(Msg1, 'UE-Local-IP-Address',
+                      maps:get(ue_local_ip, Opts, undefined)),
     %% RFC 6733 §6.8 / 3GPP TS 29.273: pin follow-up DERs of a session to
     %% the AAA that anchored the first DEA. The DRA honours Destination-Host
     %% over load-balancing realm-based routing.
-    Msg  = maybe_add(Msg1, 'Destination-Host', DestHost),
+    Msg  = maybe_add(Msg2, 'Destination-Host', DestHost),
     do_call(Msg, fun parse_dea/1);
 
 send_der(_Opts) ->

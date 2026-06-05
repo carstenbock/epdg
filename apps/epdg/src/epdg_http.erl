@@ -14,6 +14,10 @@ start_link() ->
             {"/readyz",     epdg_http_handler, #{action => ready}},
             {"/metrics",    epdg_http_handler, #{action => metrics}},
             {"/api/status", epdg_http_handler, #{action => status}},
+            %% Read-only listing of active UE sessions, including each
+            %% UE's real outer (NAT'd) source IP/port on SWu. Surfaced
+            %% for operator visibility (HSS-GUI ePDG Sessions view).
+            {"/admin/sessions", epdg_http_handler, #{action => sessions}},
             %% Graceful drain (preStop hook on rolling upgrade). Flips the
             %% persistent_term draining flag so /readyz returns 503 and
             %% the LB de-registers this pod, then asks every live UE FSM
