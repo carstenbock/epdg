@@ -1577,24 +1577,33 @@ install_child_sas({U_A, U_B, U_C, U_D} = UeOuter, PeerPort, PeerSPI, RespSPI,
     EncAlgIn   = child_enc_alg(maps:get(encr, Suite)),
     IntegAlgIn = child_integ_alg(maps:get(integ, Suite, none)),
 
-    %% Idempotency: purge any pre-existing ESP SAs for this UE outer
-    %% endpoint (both directions) before installing the fresh pair. A UE
-    %% IKE_AUTH retransmit behind NAT, or a re-dial whose previous FSM did
-    %% not tear down cleanly, otherwise leaves multiple ESP SAs for the
-    %% same src/dst — all with reqid 0 — and the kernel's outbound SA
-    %% lookup wildcard-matches one of them. Picking a stale SPI the UE no
-    %% longer holds black-holes downlink media (RTP timeout) while SIP
-    %% limps on via retransmission. Replacing instead of adding keeps
-    %% exactly one SA pair per UE outer endpoint. (Assumes one tunnel per
-    %% UE outer IP, which holds for the ePDG SWu NAT-T model.)
-    catch epdg_xfrm:flush_sa_endpoint(#{src_ip => UeOuter, dst_ip => LocalOuter}),
-    catch epdg_xfrm:flush_sa_endpoint(#{src_ip => LocalOuter, dst_ip => UeOuter}),
+    %% Unique reqid per Child SA, applied to BOTH ESP SAs and to all
+    %% three XFRM policies installed below. Multiple UEs can share one
+    %% public IP (CGNAT, or simply two handsets on one home router — a
+    %% normal VoWiFi case, TS 23.402 / RFC 3948), so the UE outer
+    %% (src,dst) tuple is NOT unique per tunnel. The responder SPI we
+    %% minted for this UE's inbound Child SA is unique, so we reuse it as
+    %% the reqid that ties this UE's policy templates to its own SA pair.
+    Reqid = SpiInInt,
+
+    %% Idempotency WITHOUT collateral damage: remove only THIS UE's own
+    %% prior SA pair (exact SPI + endpoint) before re-installing — e.g. on
+    %% an IKE_AUTH retransmit or an unclean re-dial. A co-NAT'd sibling UE
+    %% behind the same public IP has different SPIs and is left untouched.
+    %% (The previous `flush_sa_endpoint(src,dst)` deleted by outer IP pair
+    %% only and so wiped that sibling's SAs, black-holing it until it
+    %% happened to re-dial.)
+    catch epdg_xfrm:delete_sa(#{spi => SpiInInt,
+                                src_ip => UeOuter, dst_ip => LocalOuter}),
+    catch epdg_xfrm:delete_sa(#{spi => SpiOutInt,
+                                src_ip => LocalOuter, dst_ip => UeOuter}),
 
     %% Inbound SA: UE → ePDG (SPI = responder SPI we picked)
     InboundParams0 = #{spi => SpiInInt,
                         src_ip => UeOuter,
                         dst_ip => LocalOuter,
                         sa_dir => in,
+                        reqid => Reqid,
                         enc_alg => EncAlgIn,
                         enc_key => SkEiChild,
                         auth_alg => IntegAlgIn,
@@ -1612,6 +1621,7 @@ install_child_sas({U_A, U_B, U_C, U_D} = UeOuter, PeerPort, PeerSPI, RespSPI,
                          src_ip => LocalOuter,
                          dst_ip => UeOuter,
                          sa_dir => out,
+                         reqid => Reqid,
                          enc_alg => EncAlgIn,
                          enc_key => SkErChild,
                          auth_alg => IntegAlgIn,
@@ -1626,6 +1636,7 @@ install_child_sas({U_A, U_B, U_C, U_D} = UeOuter, PeerPort, PeerSPI, RespSPI,
     log_xfrm_result(pol_in, 0,
         catch epdg_xfrm:create_policy(#{src => UeCidr, dst => AnyCidr,
                                           direction => in,
+                                          reqid => Reqid,
                                           tmpl_src => UeOuter,
                                           tmpl_dst => LocalOuter})),
     %% `dir fwd` is REQUIRED for the uplink data path: after XFRM
@@ -1639,11 +1650,13 @@ install_child_sas({U_A, U_B, U_C, U_D} = UeOuter, PeerPort, PeerSPI, RespSPI,
     log_xfrm_result(pol_fwd, 0,
         catch epdg_xfrm:create_policy(#{src => UeCidr, dst => AnyCidr,
                                           direction => fwd,
+                                          reqid => Reqid,
                                           tmpl_src => UeOuter,
                                           tmpl_dst => LocalOuter})),
     log_xfrm_result(pol_out, 0,
         catch epdg_xfrm:create_policy(#{src => AnyCidr, dst => UeCidr,
                                           direction => out,
+                                          reqid => Reqid,
                                           tmpl_src => LocalOuter,
                                           tmpl_dst => UeOuter})),
 
@@ -1651,30 +1664,34 @@ install_child_sas({U_A, U_B, U_C, U_D} = UeOuter, PeerPort, PeerSPI, RespSPI,
     %% matching IPv6 inner selectors. The tunnel endpoints (tmpl src/dst)
     %% stay the IPv4 outer node IPs — Linux XFRM supports inner-IPv6 over
     %% an outer-IPv4 tunnel, and both families ride the same ESP SA pair.
-    install_v6_policies(UeInnerIp6, UeOuter, LocalOuter),
+    install_v6_policies(UeInnerIp6, UeOuter, LocalOuter, Reqid),
 
     _ = {U_A, U_B, U_C, U_D},  %% silence unused
     ok.
 
 %% Install the in/fwd/out XFRM policies for the UE's IPv6 inner address.
-%% No-op when the UE has no IPv6 (IPv4-only PAA).
-install_v6_policies(undefined, _UeOuter, _LocalOuter) -> ok;
-install_v6_policies(UeInnerIp6, UeOuter, LocalOuter) ->
+%% No-op when the UE has no IPv6 (IPv4-only PAA). Reqid pins the policy
+%% templates to this UE's Child SA pair (shared with the IPv4 selectors).
+install_v6_policies(undefined, _UeOuter, _LocalOuter, _Reqid) -> ok;
+install_v6_policies(UeInnerIp6, UeOuter, LocalOuter, Reqid) ->
     Ue6Cidr  = ip6_cidr(UeInnerIp6, 128),
     Any6Cidr = "::/0",
     log_xfrm_result(pol6_in, 0,
         catch epdg_xfrm:create_policy(#{src => Ue6Cidr, dst => Any6Cidr,
                                           direction => in,
+                                          reqid => Reqid,
                                           tmpl_src => UeOuter,
                                           tmpl_dst => LocalOuter})),
     log_xfrm_result(pol6_fwd, 0,
         catch epdg_xfrm:create_policy(#{src => Ue6Cidr, dst => Any6Cidr,
                                           direction => fwd,
+                                          reqid => Reqid,
                                           tmpl_src => UeOuter,
                                           tmpl_dst => LocalOuter})),
     log_xfrm_result(pol6_out, 0,
         catch epdg_xfrm:create_policy(#{src => Any6Cidr, dst => Ue6Cidr,
                                           direction => out,
+                                          reqid => Reqid,
                                           tmpl_src => LocalOuter,
                                           tmpl_dst => UeOuter})),
     ok.

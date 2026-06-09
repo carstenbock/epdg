@@ -167,10 +167,21 @@ do_create_sa(#{spi := SPI, src_ip := Src, dst_ip := Dst,
         false -> ""
     end,
 
+    %% reqid binds this SA to its UE-specific XFRM policy template. With
+    %% multiple UEs behind one public IP (CGNAT / a shared home router)
+    %% the outer (src,dst) tuple is identical, so a reqid-0 wildcard let
+    %% the kernel resolve a co-NAT'd UE's outbound SA for the wrong UE. A
+    %% unique per-UE reqid keeps each UE's policy bound to its own SA pair
+    %% (same model strongSwan / Open5GS use for multi-UE-behind-NAT).
+    ReqidPart = case maps:get(reqid, Params, 0) of
+        R when is_integer(R), R > 0 -> io_lib:format(" reqid ~B", [R]);
+        _ -> ""
+    end,
+
     Cmd = io_lib:format(
-        "ip xfrm state add src ~s dst ~s proto esp spi 0x~.16B "
+        "ip xfrm state add src ~s dst ~s proto esp spi 0x~.16B~s "
         "enc '~s' 0x~s~s~s mode tunnel",
-        [ip_str(Src), ip_str(Dst), SPI,
+        [ip_str(Src), ip_str(Dst), SPI, ReqidPart,
          enc_alg_str(EncAlg), bin2hex(EncKey), AuthPart, EncapPart]),
 
     OffloadPart = case Offload of
@@ -226,11 +237,18 @@ do_flush_sa_endpoint(_) ->
 %%====================================================================
 
 do_create_policy(#{src := Src, dst := Dst, direction := Dir,
-                   tmpl_src := TSrc, tmpl_dst := TDst}) ->
+                   tmpl_src := TSrc, tmpl_dst := TDst} = Params) ->
+    %% `update` (create-or-replace), not `add` (create-exclusive): a UE
+    %% that re-dials onto the SAME inner IP must REBIND its policy to the
+    %% new Child SA's reqid. `add` returned EEXIST ("File exists") and
+    %% silently kept the stale template pointing at the old, now-deleted
+    %% reqid, which black-holed the downlink. The reqid pins the template
+    %% to this UE's SA pair (see do_create_sa/2).
+    Reqid = maps:get(reqid, Params, 0),
     Cmd = io_lib:format(
-        "ip xfrm policy add src ~s dst ~s dir ~s "
-        "tmpl src ~s dst ~s proto esp mode tunnel",
-        [Src, Dst, dir_str(Dir), ip_str(TSrc), ip_str(TDst)]),
+        "ip xfrm policy update src ~s dst ~s dir ~s "
+        "tmpl src ~s dst ~s proto esp reqid ~B mode tunnel",
+        [Src, Dst, dir_str(Dir), ip_str(TSrc), ip_str(TDst), Reqid]),
     run_cmd(lists:flatten(Cmd));
 do_create_policy(_) ->
     {error, invalid_params}.
