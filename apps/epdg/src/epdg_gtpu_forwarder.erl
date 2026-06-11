@@ -37,6 +37,10 @@
 -define(GTPU_PORT,  2152).
 -define(GTPU_HDR_FLAGS, 16#30).
 -define(GTPU_MSG_TPDU,  16#FF).
+%% Priority of the PGW-U escape rules (ensure_pgwu_escape_rules/0).
+%% Must sort strictly before every per-UE rule, which live in the
+%% 1000..30999 range (see ue_route_table/1).
+-define(PGWU_ESCAPE_PRIO, 900).
 
 -record(ue_ent, {
     local_teid   :: non_neg_integer(),
@@ -103,6 +107,7 @@ send(LocalTeid, InnerPkt) ->
 
 init([]) ->
     cleanup_stale_tun_devices(),
+    ensure_pgwu_escape_rules(),
     BindIpStr = epdg_config:get(gtpu_bind_addr, "0.0.0.0"),
     BindIp    = parse_ip_or_any(BindIpStr),
     Port      = epdg_config:get(gtpu_port, ?GTPU_PORT),
@@ -384,6 +389,9 @@ maybe_open_tun(Name, Ip4, Ip6, LocalTeid) ->
             undefined;
         true ->
             ensure_forwarding_sysctls(Ip6 =/= undefined),
+            %% Re-run on every TUN setup so ogstun devices created after
+            %% ePDG startup (e.g. a PGW-U pod restart) are covered too.
+            ensure_pgwu_escape_rules(),
             Table = ue_route_table(LocalTeid),
             %% NOTE: we intentionally do NOT assign the UE's inner IP to
             %% the TUN — that would make the kernel treat UE_IP as local
@@ -420,6 +428,11 @@ v4_tun_cmds({A,B,C,D}, Name, Table) ->
         %% Uplink policy table: after XFRM decrypt, packets with
         %% src=UE_IP are sent out the UE's own TUN for the BEAM
         %% to pick up and wrap into GTP-U.
+        %%
+        %% CRITICAL: a co-located PGW-U also emits packets with src=UE_IP
+        %% (via its ogstun device, post GTP-U decap). Those must NOT match
+        %% this rule — see ensure_pgwu_escape_rules/0 for the higher-
+        %% priority iif-ogstun escape that protects them.
         io_lib:format("ip rule add from ~s/32 lookup ~B priority ~B",
                       [UeIp, Table, Table]),
         %% Downlink route: scoped to the per-UE table, reached only for
@@ -511,6 +524,38 @@ ensure_forwarding_sysctls(WantV6) ->
             ok
     end,
     ok.
+
+%% Escape rules for a co-located PGW-U.
+%%
+%% The ePDG runs on hostNetwork and shares the node routing table with a
+%% co-located PGW-U. When the PGW-U decapsulates GTP-U uplink it injects
+%% the inner packet (src=UE_IP) through its ogstun device for normal
+%% forwarding toward the IMS core. Without an escape rule that packet
+%% matches the per-UE `from UE_IP/32` rule (v4_tun_cmds) — which is meant
+%% for XFRM-decrypted SWu uplink only — and is looped back into the
+%% ePDG's TUN instead of reaching the network: a total uplink black-hole
+%% for every UE whose anchoring PGW-U sits on the ePDG's own node.
+%%
+%% Fix: anything entering through an ogstun device is routed via the
+%% main table, at a priority strictly below every per-UE rule. The rules
+%% are node-global, idempotent, and intentionally never torn down.
+%% XFRM-decrypted SWu uplink is unaffected (iif = the underlay NIC), as
+%% is downlink the forwarder injects into a UE TUN (iif = the UE TUN).
+ensure_pgwu_escape_rules() ->
+    Prio = ?PGWU_ESCAPE_PRIO,
+    Sh = io_lib:format(
+        "for d in /sys/class/net/ogstun*; do "
+          "[ -e \"$d\" ] || continue; dev=${d##*/}; "
+          "ip rule list | grep -q \"^~B:.*iif $dev \" || "
+            "ip rule add iif \"$dev\" lookup main priority ~B; "
+          "ip -6 rule list | grep -q \"^~B:.*iif $dev \" || "
+            "ip -6 rule add iif \"$dev\" lookup main priority ~B; "
+        "done 2>&1",
+        [Prio, Prio, Prio, Prio]),
+    case string:trim(os:cmd(lists:flatten(Sh))) of
+        ""  -> ok;
+        Out -> logger:warning("PGW-U escape rules: ~s", [Out]), ok
+    end.
 
 verify_sysctl_exact(Key, Expected) ->
     case read_sysctl(Key) of
