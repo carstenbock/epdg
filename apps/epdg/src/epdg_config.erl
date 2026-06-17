@@ -115,6 +115,15 @@ init() ->
     set_from_env_int("EPDG_DPD_TIMEOUT", dpd_timeout, 10000),
     set_from_env_int("EPDG_DPD_RETRIES", dpd_retries, 3),
 
+    %% MOBIKE return-routability (COOKIE2) check (RFC 4555 §3.7). When on
+    %% (default), an UPDATE_SA_ADDRESSES does not move the kernel SAs until
+    %% the UE echoes a random COOKIE2 sent to its new outer address, so an
+    %% on-path attacker cannot redirect the IPsec SAs. Disable only for
+    %% interop debugging with a non-conformant UE.
+    set_from_env_bool("EPDG_MOBIKE_RR_CHECK", mobike_rr_check, true),
+    set_from_env_int("EPDG_MOBIKE_RR_TIMEOUT", mobike_rr_timeout, 3000),
+    set_from_env_int("EPDG_MOBIKE_RR_RETRIES", mobike_rr_retries, 2),
+
     %% TUN device garbage collection interval (ms)
     set_from_env_int("EPDG_TUN_GC_INTERVAL", tun_gc_interval, 300000),
 

@@ -22,6 +22,12 @@
 %% MOBIKE notify message types (RFC 4555 §3.x / RFC 7296 §3.10.1).
 -define(N_MOBIKE_SUPPORTED,    16396).
 -define(N_UPDATE_SA_ADDRESSES, 16400).
+-define(N_COOKIE2,             16401).
+
+%% MOBIKE return-routability (COOKIE2) check defaults (RFC 4555 §3.7).
+%% Retransmit the COOKIE2 probe a few times (UDP) before giving up.
+-define(MOBIKE_RR_TIMEOUT,      3000).
+-define(MOBIKE_RR_RETRIES,         2).
 
 %% Maximum jitter for graceful-drain teardown. Broadcast {drain, _} fans
 %% out to every live UE FSM simultaneously; each FSM picks a random delay
@@ -124,7 +130,13 @@
     ike_auth_last_resp :: binary() | undefined,
     %% Message ID of the last IKE_AUTH request we responded to; used to
     %% detect retransmissions across all EAP round-trip stages.
-    ike_auth_last_msg_id :: non_neg_integer() | undefined
+    ike_auth_last_msg_id :: non_neg_integer() | undefined,
+    %% Pending MOBIKE return-routability (COOKIE2) check (RFC 4555 §3.7).
+    %% When set, an UPDATE_SA_ADDRESSES has been acknowledged and the IKE
+    %% peer address re-pointed, but the kernel data-plane move is deferred
+    %% until the UE echoes our COOKIE2 from the new address. Map of
+    %% #{old_ip, new_ip, new_port, cookie, msg_id, retries}.
+    rr_pending :: map() | undefined
 }).
 
 %%====================================================================
@@ -407,6 +419,14 @@ established(enter, _OldState, #data{responder_spi = RSPI, imsi = IMSI} = Data) -
     Interval = epdg_config:get(dpd_interval, ?DPD_INTERVAL),
     {keep_state, Data, [{state_timeout, Interval, dpd}]};
 
+established(cast, {ikev2, #{exchange_type := informational, message_id := MsgId,
+                           flags := Flags} = _Header, RawData, FromPort},
+            #data{rr_pending = #{msg_id := MsgId}} = Data)
+  when (Flags band 16#20) =/= 0 ->
+    %% INFORMATIONAL response whose message-id matches our in-flight COOKIE2
+    %% probe: this is the UE's return-routability echo (RFC 4555 §3.7).
+    handle_rr_response(RawData, refresh_peer_port(Data, FromPort));
+
 established(cast, {ikev2, #{exchange_type := informational, flags := Flags} = _Header,
                    _RawData, FromPort}, Data)
   when (Flags band 16#20) =/= 0 ->
@@ -461,6 +481,12 @@ established(info, drain_stop, Data) ->
     _ = try_send_delete_informational(Data),
     {stop, {shutdown, drained}};
 
+established(state_timeout, dpd, #data{rr_pending = RR} = Data) when is_map(RR) ->
+    %% A return-routability check is in flight; its COOKIE2 request doubles
+    %% as a liveness probe (and shares the message-id counter), so skip the
+    %% DPD probe this cycle and just reschedule.
+    Interval = epdg_config:get(dpd_interval, ?DPD_INTERVAL),
+    {keep_state, Data, [{state_timeout, Interval, dpd}]};
 established(state_timeout, dpd, #data{dpd_failures = F, imsi = IMSI} = Data) ->
     MaxRetries = epdg_config:get(dpd_retries, ?DPD_RETRIES),
     case F >= MaxRetries of
@@ -475,6 +501,13 @@ established(state_timeout, dpd, #data{dpd_failures = F, imsi = IMSI} = Data) ->
             {keep_state, Data1#data{dpd_failures = F + 1},
              [{state_timeout, Timeout, dpd}]}
     end;
+
+established({timeout, rr_check}, rr_timeout, #data{rr_pending = RR} = Data)
+  when is_map(RR) ->
+    handle_rr_timeout(RR, Data);
+established({timeout, rr_check}, rr_timeout, Data) ->
+    %% Stale timer fired after the check already resolved — ignore.
+    {keep_state, Data};
 
 established({call, From}, get_state, Data) ->
     {keep_state, Data, [{reply, From, {ok, established}}]};
@@ -1956,45 +1989,142 @@ handle_informational(#{message_id := MsgId} = Header, RawData,
   when is_map(KeyParams), is_map(Keys) ->
     %% The UE is the initiator of this exchange, so its peer-direction keys
     %% (SK_ei/SK_ai) decrypt it. We inspect once for DELETE (RFC 7296
-    %% §3.11) and UPDATE_SA_ADDRESSES (RFC 4555 §3.2).
+    %% §3.11), UPDATE_SA_ADDRESSES (RFC 4555 §3.2) and COOKIE2 (RFC 4555
+    %% §4.2.5).
     Payloads = decrypt_informational_payloads(KeyParams, Keys, RawData),
-    %% RFC 4555 §3.2: a MOBIKE UPDATE_SA_ADDRESSES means the UE's outer
-    %% address and/or NAT mapping changed (Wi-Fi roam, CPE rebind, new DSL
-    %% IP). Re-point our peer endpoint and re-key the kernel SAs/policies
-    %% to the new outer address BEFORE we answer, so the response — and all
-    %% subsequent DPD — traverse the new path instead of the dead one.
-    Data1 = case is_mobike_update(Payloads, Data0) of
-        true ->
-            %% Use the UDP source IP *and* port the listener observed on this
-            %% request: a CPE NAT rebind / Wi-Fi roam remaps both, and the
-            %% espinudp encapsulation dst port must follow the new mapping or
-            %% the downlink stays black-holed.
-            NewIP   = maps:get(from_ip,   Header, Data0#data.peer_ip),
-            NewPort = maps:get(from_port, Header, Data0#data.peer_port),
-            do_mobike_update(NewIP, NewPort, Data0);
-        false ->
-            Data0
-    end,
-    %% RFC 7296 §1.4/§2.4: every INFORMATIONAL request gets an (empty)
-    %% INFORMATIONAL response — covers DPD liveness, DELETE and MOBIKE.
-    send_informational_response(MsgId, Data1),
-    %% RFC 7296 §1.4.1: a UE-initiated DELETE is the normal graceful VoWiFi
-    %% detach. Tear the FSM down so terminate/3 releases the S2b GTP session
-    %% (TS 29.274 Delete-Session) and the SWm Diameter session (TS 29.273
-    %% STR). A plain DPD/keepalive INFORMATIONAL carries no DELETE, so we
-    %% just reset the DPD timer.
+    %% RFC 4555 §4.2.5: if the UE put a COOKIE2 in its request (to verify
+    %% *our* return routability) we MUST echo it verbatim in the response.
+    Echo = cookie2_echo_payloads(Payloads),
     case has_delete(Payloads) of
         true ->
+            %% RFC 7296 §1.4.1: a UE-initiated DELETE is the normal graceful
+            %% VoWiFi detach. ACK it, then tear the FSM down so terminate/3
+            %% releases the S2b GTP session (TS 29.274 Delete-Session) and
+            %% the SWm Diameter session (TS 29.273 STR).
+            send_informational_response(MsgId, Echo, Data0),
             logger:info("INFORMATIONAL DELETE received from UE IMSI=~p "
                         "- tearing down tunnel", [IMSI]),
-            {stop, {shutdown, ue_delete}, Data1};
+            {stop, {shutdown, ue_delete}, Data0};
         false ->
-            Interval = epdg_config:get(dpd_interval, ?DPD_INTERVAL),
-            {keep_state, Data1#data{dpd_failures = 0},
-             [{state_timeout, Interval, dpd}]}
+            case is_mobike_update(Payloads, Data0) of
+                true ->
+                    %% Use the UDP source IP *and* port the listener observed
+                    %% on this request: a CPE NAT rebind / Wi-Fi roam remaps
+                    %% both, and the espinudp encapsulation dst port must
+                    %% follow the new mapping or the downlink black-holes.
+                    NewIP   = maps:get(from_ip,   Header, Data0#data.peer_ip),
+                    NewPort = maps:get(from_port, Header, Data0#data.peer_port),
+                    handle_mobike_update(MsgId, NewIP, NewPort, Echo, Data0);
+                false ->
+                    %% RFC 7296 §1.4/§2.4: plain DPD/keepalive INFORMATIONAL
+                    %% gets an (empty) response; reset the DPD timer.
+                    send_informational_response(MsgId, Echo, Data0),
+                    Interval = epdg_config:get(dpd_interval, ?DPD_INTERVAL),
+                    {keep_state, Data0#data{dpd_failures = 0},
+                     [{state_timeout, Interval, dpd}]}
+            end
     end;
 handle_informational(_Header, _RawData, Data) ->
     {keep_state, Data}.
+
+%% RFC 4555 §3.5/§3.7. Re-point the IKE SA peer endpoint to the new outer
+%% address immediately (so our response and the COOKIE2 probe reach the UE)
+%% and ACK the UPDATE_SA_ADDRESSES. The kernel data-plane move is deferred
+%% behind a return-routability check unless that check is disabled.
+handle_mobike_update(MsgId, NewIP, NewPort, Echo,
+                     #data{imsi = IMSI, peer_ip = OldIP} = Data0) ->
+    Data1 = Data0#data{peer_ip = NewIP, peer_port = NewPort},
+    send_informational_response(MsgId, Echo, Data1),
+    case epdg_config:get(mobike_rr_check, true) of
+        true ->
+            start_rr_check(OldIP, NewIP, NewPort, Data1);
+        _ ->
+            logger:notice("MOBIKE UPDATE_SA_ADDRESSES IMSI=~p ~s -> ~s:~B "
+                          "(RR check disabled)",
+                          [IMSI, format_ip(OldIP), format_ip(NewIP), NewPort]),
+            Data2 = do_mobike_dataplane_move(OldIP, NewIP, NewPort, Data1),
+            Interval = epdg_config:get(dpd_interval, ?DPD_INTERVAL),
+            {keep_state, Data2#data{dpd_failures = 0},
+             [{state_timeout, Interval, dpd}]}
+    end.
+
+%% RFC 4555 §3.7: send a random, unpredictable COOKIE2 (8-64 octets) in a
+%% gateway-initiated INFORMATIONAL request to the UE's new address. The
+%% data-plane move waits in rr_pending until the UE echoes it back.
+start_rr_check(OldIP, NewIP, NewPort,
+               #data{imsi = IMSI, message_id = MsgId} = Data0) ->
+    Cookie = crypto:strong_rand_bytes(16),
+    logger:notice("MOBIKE UPDATE_SA_ADDRESSES IMSI=~p ~s -> ~s:~B; starting "
+                  "RFC 4555 return-routability check (msg_id=~B)",
+                  [IMSI, format_ip(OldIP), format_ip(NewIP), NewPort, MsgId]),
+    ok = send_cookie2_request(Cookie, MsgId, Data0),
+    epdg_metrics:inc(mobike_rr_check_total),
+    RR = #{old_ip => OldIP, new_ip => NewIP, new_port => NewPort,
+           cookie => Cookie, msg_id => MsgId,
+           retries => epdg_config:get(mobike_rr_retries, ?MOBIKE_RR_RETRIES)},
+    Timeout = epdg_config:get(mobike_rr_timeout, ?MOBIKE_RR_TIMEOUT),
+    {keep_state, Data0#data{message_id = MsgId + 1, rr_pending = RR,
+                            dpd_failures = 0},
+     [{{timeout, rr_check}, Timeout, rr_timeout}]}.
+
+%% Process the UE's reply to our COOKIE2 probe (RFC 4555 §3.7). The UE is
+%% the IKE initiator, so it encrypts with its initiator-half keys — exactly
+%% what decrypt_informational_payloads/3 already uses.
+handle_rr_response(RawData,
+                   #data{keys_params = KeyParams, ike_keys = Keys, imsi = IMSI,
+                         rr_pending = #{cookie := Cookie, old_ip := OldIP,
+                                        new_ip := NewIP, new_port := NewPort}}
+                       = Data0) ->
+    Payloads = decrypt_informational_payloads(KeyParams, Keys, RawData),
+    case cookie2_value(Payloads) of
+        {ok, Cookie} ->
+            logger:notice("MOBIKE RR check passed IMSI=~p; committing move "
+                          "to ~s:~B", [IMSI, format_ip(NewIP), NewPort]),
+            Data1 = do_mobike_dataplane_move(
+                      OldIP, NewIP, NewPort,
+                      Data0#data{rr_pending = undefined}),
+            Interval = epdg_config:get(dpd_interval, ?DPD_INTERVAL),
+            {keep_state, Data1#data{dpd_failures = 0},
+             [{state_timeout, Interval, dpd},
+              {{timeout, rr_check}, infinity, rr_timeout}]};
+        {ok, _Other} ->
+            %% RFC 4555 §3.7: a mismatching echo means the IKE SA MUST be
+            %% closed.
+            logger:warning("MOBIKE RR check FAILED IMSI=~p: COOKIE2 mismatch "
+                           "- closing IKE SA", [IMSI]),
+            epdg_metrics:inc(mobike_rr_fail_total),
+            {stop, {shutdown, mobike_rr_mismatch}, Data0};
+        error ->
+            %% The UE answered (so it is alive) but did not echo COOKIE2.
+            %% Conservative: keep the existing path, abandon the move.
+            logger:warning("MOBIKE RR check inconclusive IMSI=~p: no COOKIE2 "
+                           "in reply - keeping current path", [IMSI]),
+            epdg_metrics:inc(mobike_rr_fail_total),
+            Interval = epdg_config:get(dpd_interval, ?DPD_INTERVAL),
+            {keep_state, Data0#data{rr_pending = undefined, dpd_failures = 0},
+             [{state_timeout, Interval, dpd},
+              {{timeout, rr_check}, infinity, rr_timeout}]}
+    end.
+
+%% RFC 4555 §3.7 RR probe timed out: retransmit a few times (the COOKIE2
+%% request travels over UDP), then give up conservatively by keeping the
+%% existing path rather than moving to an unverified address.
+handle_rr_timeout(#{retries := N, cookie := Cookie, msg_id := MsgId,
+                    new_ip := NewIP, new_port := NewPort} = RR,
+                  #data{imsi = IMSI} = Data) when N > 0 ->
+    logger:info("MOBIKE RR check retransmit IMSI=~p (~B left) to ~s:~B",
+                [IMSI, N, format_ip(NewIP), NewPort]),
+    ok = send_cookie2_request(Cookie, MsgId, Data),
+    Timeout = epdg_config:get(mobike_rr_timeout, ?MOBIKE_RR_TIMEOUT),
+    {keep_state, Data#data{rr_pending = RR#{retries := N - 1}},
+     [{{timeout, rr_check}, Timeout, rr_timeout}]};
+handle_rr_timeout(_RR, #data{imsi = IMSI} = Data) ->
+    logger:warning("MOBIKE RR check timed out IMSI=~p - keeping current path",
+                   [IMSI]),
+    epdg_metrics:inc(mobike_rr_fail_total),
+    Interval = epdg_config:get(dpd_interval, ?DPD_INTERVAL),
+    {keep_state, Data#data{rr_pending = undefined},
+     [{state_timeout, Interval, dpd}]}.
 
 %% Decrypt an INFORMATIONAL request to its inner payload list (or [] on
 %% failure). The UE initiated the exchange, so use the initiator keys.
@@ -2013,17 +2143,83 @@ has_delete(Payloads) ->
 
 %% Only honour UPDATE_SA_ADDRESSES if we actually negotiated MOBIKE with
 %% this UE (RFC 4555 §3.1). The INFORMATIONAL is integrity-protected by the
-%% IKE SA, so the peer is authenticated; we update on first request.
-%% SPEC-DEVIATION: RFC 4555 §3.5 return-routability (COOKIE2) check is not
-%% implemented — acceptable in this lab, but an on-path attacker could in
-%% principle redirect the SA. Revisit before any production use.
+%% IKE SA, so the peer is authenticated; the data-plane move is additionally
+%% gated by a COOKIE2 return-routability check (RFC 4555 §3.7) before the
+%% kernel SAs are re-pointed — see handle_mobike_update/5.
 is_mobike_update(Payloads, #data{mobike = true}) ->
     find_notify(?N_UPDATE_SA_ADDRESSES, Payloads);
 is_mobike_update(_Payloads, _Data) ->
     false.
 
-%% Empty INFORMATIONAL response to the (possibly just-updated) peer.
-send_informational_response(MsgId,
+%% Extract the COOKIE2 notification value (RFC 4555 §4.2.5) from a decrypted
+%% payload list. Protocol ID and SPI Size are zero for COOKIE2, so the
+%% notification data is the whole cookie.
+cookie2_value(Payloads) ->
+    case lists:search(
+           fun(#{type := notify,
+                 data := <<_Proto:8, _SPISize:8, ?N_COOKIE2:16, _/binary>>}) ->
+                   true;
+              (_) -> false
+           end, Payloads) of
+        {value, #{data := <<_Proto:8, SPISize:8, ?N_COOKIE2:16, Rest/binary>>}} ->
+            <<_SPI:SPISize/binary, Cookie/binary>> = Rest,
+            {ok, Cookie};
+        _ ->
+            error
+    end.
+
+%% Re-encode a UE-supplied COOKIE2 as a response payload list to echo it
+%% back verbatim (RFC 4555 §4.2.5 MUST), or [] when none was present.
+cookie2_echo_payloads(Payloads) ->
+    case cookie2_value(Payloads) of
+        {ok, Cookie} ->
+            [{notify, epdg_ikev2_codec:encode_notify_payload(
+                        0, ?N_COOKIE2, <<>>, Cookie)}];
+        error ->
+            []
+    end.
+
+%% RFC 4555 §3.7: a gateway-initiated INFORMATIONAL request carrying a
+%% single COOKIE2 notification. We are the IKE SA responder initiating this
+%% exchange, so the Initiator flag is clear (RFC 7296 §2.2). Side-effecting
+%% send only; the caller manages the message-id counter so retransmits can
+%% reuse the same id.
+send_cookie2_request(Cookie, MsgId,
+                     #data{ike_keys = Keys, keys_params = KeyParams,
+                           initiator_spi = ISPI, responder_spi = RSPI,
+                           peer_ip = PeerIP, peer_port = PeerPort})
+  when is_map(Keys), is_map(KeyParams),
+       is_integer(ISPI), is_integer(RSPI),
+       is_tuple(PeerIP), is_integer(PeerPort) ->
+    Notify = epdg_ikev2_codec:encode_notify_payload(0, ?N_COOKIE2, <<>>, Cookie),
+    Hdr = #{initiator_spi     => ISPI,
+            responder_spi     => RSPI,
+            exchange_type_raw => 37,
+            flags             => 16#00,
+            message_id        => MsgId},
+    try
+        case epdg_ikev2_crypto:encode_encrypted_message(
+               KeyParams, Keys, responder, Hdr, [{notify, Notify}]) of
+            {ok, Bytes} ->
+                catch epdg_ikev2_listener:send(PeerIP, PeerPort, Bytes),
+                ok;
+            {error, EncErr} ->
+                logger:info("MOBIKE RR: COOKIE2 encode failed: ~p", [EncErr]),
+                ok
+        end
+    catch
+        Class:Reason:_ ->
+            logger:info("MOBIKE RR: COOKIE2 send failed: ~p:~p",
+                        [Class, Reason]),
+            ok
+    end;
+send_cookie2_request(_Cookie, _MsgId, _Data) ->
+    ok.
+
+%% INFORMATIONAL response carrying ExtraPayloads (e.g. an echoed COOKIE2,
+%% RFC 4555 §4.2.5) to the (possibly just-updated) peer. ExtraPayloads is
+%% [] for a plain DPD/keepalive or MOBIKE acknowledgement.
+send_informational_response(MsgId, ExtraPayloads,
                             #data{keys_params = KeyParams, ike_keys = Keys,
                                   initiator_spi = ISPI, responder_spi = RSPI,
                                   peer_ip = PeerIP, peer_port = PeerPort}) ->
@@ -2033,7 +2229,7 @@ send_informational_response(MsgId,
             flags             => 16#20,  %% Response=1, Initiator=0
             message_id        => MsgId},
     case epdg_ikev2_crypto:encode_encrypted_message(
-           KeyParams, Keys, responder, Hdr, []) of
+           KeyParams, Keys, responder, Hdr, ExtraPayloads) of
         {ok, Bytes} -> catch epdg_ikev2_listener:send(PeerIP, PeerPort, Bytes);
         _ -> ok
     end,
@@ -2115,29 +2311,32 @@ delete_ue6_policies(UeInnerIp6) ->
                                     direction => out}),
     ok.
 
-%% RFC 4555 §3.2: move the kernel data plane to the UE's new outer address.
+%% RFC 4555 §3.5: move the kernel data plane to the UE's new outer address.
 %% Delete the SAs/policies bound to the old address, then re-install them
-%% against the new one with the SAME Child SA keys/SPIs. Best-effort: any
-%% xfrm error is logged by install_child_sas/10, and if the move does not
-%% take the UE will redial via DPD as before.
-do_mobike_update(NewIP, NewPort,
-                 #data{peer_ip = OldIP, child_sa = CS, imsi = IMSI} = Data) ->
+%% against the new one with the SAME Child SA keys/SPIs. The IKE peer
+%% address (peer_ip/peer_port) has already been re-pointed by the caller;
+%% only the kernel SAs/policies are moved here, once return routability has
+%% been confirmed (RFC 4555 §3.7). Best-effort: any xfrm error is logged by
+%% install_child_sas/10, and if the move does not take the UE will redial
+%% via DPD as before.
+do_mobike_dataplane_move(OldIP, NewIP, NewPort,
+                         #data{child_sa = CS, imsi = IMSI} = Data) ->
     case maps:get(reinstall, CS, undefined) of
         #{peer_spi := PeerSPI, resp_spi := RespSPI, suite := Suite,
           sk_ei := Ei, sk_ai := Ai, sk_er := Er, sk_ar := Ar,
           ue_inner_ip := InnerIp} = RI ->
             InnerIp6 = maps:get(ue_inner_ip6, RI, undefined),
-            logger:notice("MOBIKE UPDATE_SA_ADDRESSES IMSI=~p ~s -> ~s:~B",
+            logger:notice("MOBIKE data-plane move IMSI=~p ~s -> ~s:~B",
                           [IMSI, format_ip(OldIP), format_ip(NewIP), NewPort]),
             delete_child_sas(OldIP, CS),
             delete_ue_policies(InnerIp, InnerIp6),
             install_child_sas(NewIP, NewPort, PeerSPI, RespSPI, Suite,
                               Ei, Ai, Er, Ar, InnerIp, InnerIp6),
             epdg_metrics:inc(mobike_update_total),
-            Data#data{peer_ip = NewIP, peer_port = NewPort};
+            Data;
         _ ->
-            logger:warning("MOBIKE UPDATE_SA_ADDRESSES but no stored Child SA "
-                           "params; ignoring IMSI=~p", [IMSI]),
+            logger:warning("MOBIKE move but no stored Child SA params; "
+                           "ignoring IMSI=~p", [IMSI]),
             Data
     end.
 
