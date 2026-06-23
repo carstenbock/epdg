@@ -135,7 +135,7 @@ sequenceDiagram
     ePDG->>PGW: S2b GTPv2-C Create Session (IMSI, APN, F-TEID)
     PGW-->>ePDG: Create Session Response (PAA = UE inner IP, PGW F-TEID)
     ePDG-->>UE: IKE_AUTH (EAP-Success, AUTH, CFG_REPLY: INTERNAL_IP4/6, DNS, P-CSCF)
-    Note over ePDG: install kernel XFRM SAs/policies; bearer is up
+    Note over ePDG: install kernel XFRM SAs/policies, bearer is up
 ```
 
 After `established`, the BEAM only handles control traffic (DPD, MOBIKE,
