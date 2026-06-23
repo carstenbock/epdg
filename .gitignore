@@ -1,0 +1,22 @@
+# Erlang / rebar3
+_build/
+.rebar3/
+*.beam
+erl_crash.dump
+rebar3.crashdump
+
+# Compiled NIF / port artifacts
+*.o
+*.so
+
+# Generated Diameter dictionaries (produced by scripts/compile-diameter-dicts.sh
+# from apps/epdg/priv/dict/*.dia at every rebar3 compile)
+apps/epdg/src/diameter_gen_*.erl
+apps/epdg/include/diameter_gen_*.hrl
+
+# OS
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
