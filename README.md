@@ -1,0 +1,367 @@
+# ePDG (Evolved Packet Data Gateway)
+
+Native Erlang/OTP **Evolved Packet Data Gateway** (3GPP TS 23.402) that
+terminates the SWu IKEv2/IPsec tunnel from a UE on untrusted non-3GPP
+access (Wi-Fi) and anchors the PDN connection to the EPC, enabling
+**VoWiFi** per GSMA IR.51 / IR.92.
+
+The ePDG is **peer-agnostic on its core-facing interfaces**: it
+authenticates the UE with EAP-AKA' over the SWm Diameter interface to any
+TS 29.273-conformant 3GPP AAA Server (typically reached through a DRA), and
+sets up the user-plane bearer over GTPv2-C/GTP-U (S2b) toward any
+TS 29.274 PGW-C/SMF (Open5GS SMF in our deployments).
+
+The IKEv2/IPsec stack is implemented natively in Erlang (no strongSwan);
+the data plane is programmed into the Linux kernel XFRM subsystem, so the
+BEAM is out of the per-packet path once Child SAs are installed.
+
+---
+
+## Scope and standards
+
+| Area | Standard |
+|------|----------|
+| Non-3GPP access architecture (S2b) | 3GPP TS 23.402 |
+| Tunnel mode / UE attach procedures | 3GPP TS 24.302 |
+| Non-3GPP access security | 3GPP TS 33.402 |
+| SWm (ePDG ↔ AAA) — untrusted non-3GPP | 3GPP TS 29.273 §7 |
+| GTPv2-C S2b (ePDG ↔ PGW-C/SMF) | 3GPP TS 29.274 |
+| GTP-U S2b-U user plane | 3GPP TS 29.281 |
+| ePDG / APN FQDN formats | 3GPP TS 23.003 §19.4, §14 |
+| IKEv2 | IETF RFC 7296 |
+| IKEv2 NAT traversal (UDP-encap ESP) | IETF RFC 3948 |
+| MOBIKE (Wi-Fi ↔ Wi-Fi handover) | IETF RFC 4555 |
+| EAP | IETF RFC 3748 |
+| EAP-AKA | IETF RFC 4187 |
+| EAP-AKA' | IETF RFC 5448 |
+| Diameter base protocol | IETF RFC 6733 |
+
+---
+
+## Component architecture
+
+```
+        SWu: IKEv2/IPsec (EAP-AKA')                SWm (Diameter, App 16777264)
+ +------+  ===========================>  +-------+  ----------->  +-----+        +-----+
+ |  UE  |  <---------- ESP ------------   | ePDG  |  <----------   | DRA |--SWx-->| AAA |--->HSS
+ +------+                                 +-------+               +-----+        +-----+
+                                          |   ^
+                          S2b-U GTP-U     |   |   S2b GTP-C v2 (TS 29.274)
+                          (TS 29.281)     v   |
+                                       +-----------+
+                                       | PGW-C/SMF |  ---> P-GW-U / UPF ---> IMS (P-CSCF)
+                                       +-----------+
+```
+
+A single Erlang/OTP application owns the whole signalling plane; a per-UE
+`gen_statem` drives one IKEv2/IPsec tunnel each, and the kernel handles
+ESP ↔ GTP-U translation once the bearer is up.
+
+### Key modules
+
+| Module | Responsibility |
+|--------|----------------|
+| `epdg_ikev2_listener` | UDP sockets on 500 (IKE) and 4500 (NAT-T); dispatches datagrams to UE FSMs |
+| `epdg_ikev2_codec` | IKEv2 header/payload encode + decode, proposal selection (RFC 7296) |
+| `epdg_ikev2_crypto` | DH/ECDH, PRF, AES-GCM/AES-CBC, EAP-AKA' key derivation (CK'/IK', MSK, SK_*) |
+| `epdg_ue_fsm` | Per-UE `gen_statem`: `idle → ike_sa_init → ike_auth → established`; DPD, MOBIKE, teardown |
+| `epdg_ue_sup` | `simple_one_for_one` dynamic supervisor spawning one FSM per UE |
+| `epdg_ue_registry` | ETS maps: SPI → FSM pid, IMSI → SPI; drain broadcast |
+| `epdg_diameter_swm` | SWm Diameter client (DER/STR) toward the AAA via one transport per DRA replica |
+| `epdg_gtpc_client` | S2b GTP-C v2 Create/Delete Session; Echo heartbeat, FQDN re-resolve, restart detection |
+| `epdg_gtpc_codec` | GTPv2-C message/IE encode + decode (TS 29.274) |
+| `epdg_gtpu_forwarder` | Userspace GTP-U bridge (per-UE TUN ↔ shared S2b-U socket) for control of the data path |
+| `epdg_xfrm` | Linux kernel IPsec SA/SP programming; hardware-offload detection |
+| `epdg_dns_cache` | TTL-aware DNS cache used by the GTP-C client for PGW FQDN resolution |
+| `epdg_config` | Environment-variable driven configuration |
+| `epdg_http` / `epdg_http_handler` | Cowboy API: `/healthz`, `/readyz`, `/metrics`, `/api/status`, `/admin/*` |
+| `epdg_metrics` | Prometheus-style counters/gauges in ETS (`epdg_*`) |
+
+### Supervision tree (`epdg_sup`, `one_for_one`)
+
+```
+epdg_ue_registry  →  epdg_dns_cache  →  epdg_xfrm  →  epdg_gtpc_client
+   →  epdg_gtpu_forwarder  →  epdg_diameter_swm  →  epdg_ikev2_listener
+   →  epdg_ue_sup (dynamic)  →  epdg_http
+```
+
+Order matters: the DNS cache starts before the GTP-C client so the first
+PGW resolution is served from cache, and listeners come up only after the
+data-plane and Diameter workers are ready.
+
+---
+
+## Reference points
+
+| Interface | Peer | Transport | Purpose |
+|-----------|------|-----------|---------|
+| **SWu** | UE | IKEv2 / ESP over UDP 500 + 4500 | Tunnel establishment, EAP-AKA' auth, inner IP config |
+| **SWm** | AAA Server (via DRA) | Diameter, App-Id 16777264, Vendor 10415 | Relay EAP, retrieve MSK, anchor/release session |
+| **S2b (control)** | PGW-C / SMF | GTPv2-C, UDP 2123 | Create/Delete Session, bearer + PAA, Echo |
+| **S2b-U (user)** | PGW-U / UPF | GTP-U, UDP 2152 | Subscriber data plane |
+
+### SWm message matrix — App-Id 16777264, Vendor 10415
+
+| Direction | Command | Purpose |
+|-----------|---------|---------|
+| ePDG → AAA | DER (268) | Relay EAP-Response (Identity, then AKA'-Challenge) |
+| AAA → ePDG | DEA (268) | EAP-Request/AKA'-Challenge (1001) or EAP-Success + `EAP-Master-Session-Key` (2001) |
+| ePDG → AAA | STR (275) | Release the non-3GPP session on tunnel teardown |
+| AAA → ePDG | STA (275) | Confirmed |
+| AAA → ePDG | ASR (274) / RAR (258) | HSS-initiated detach / profile refresh — **not yet honoured** (answered `DIAMETER_UNABLE_TO_DELIVER` 3001) |
+
+The DER also carries the UE's real outer (NAT'd) `UE-Local-IP-Address`
+(TS 29.273 §9.2.3.1.1) so the AAA and HSS-GUI can surface it per IMSI.
+
+---
+
+## IKEv2 / EAP-AKA' bring-up
+
+```mermaid
+sequenceDiagram
+    participant UE
+    participant ePDG
+    participant AAA as AAA Server
+    participant PGW as PGW-C/SMF
+    UE->>ePDG: IKE_SA_INIT (SA, KE, Ni)
+    ePDG-->>UE: IKE_SA_INIT (SA, KE, Nr, CERTREQ)
+    UE->>ePDG: IKE_AUTH (IDi = NAI "0<IMSI>@…", CFG_REQUEST)
+    ePDG->>AAA: SWm DER (EAP-Resp/Identity)
+    AAA-->>ePDG: SWm DEA (1001, EAP-Req/AKA'-Challenge: RAND,AUTN,AT_MAC)
+    ePDG-->>UE: IKE_AUTH (CERT, AUTH, EAP payload)
+    UE-->>ePDG: IKE_AUTH (EAP-Resp/AKA'-Challenge: AT_RES, AT_MAC)
+    ePDG->>AAA: SWm DER (EAP-Resp)
+    AAA-->>ePDG: SWm DEA (2001, EAP-Success, EAP-Master-Session-Key = MSK)
+    ePDG->>PGW: S2b GTPv2-C Create Session (IMSI, APN, F-TEID)
+    PGW-->>ePDG: Create Session Response (PAA = UE inner IP, PGW F-TEID)
+    ePDG-->>UE: IKE_AUTH (EAP-Success, AUTH, CFG_REPLY: INTERNAL_IP4/6, DNS, P-CSCF)
+    Note over ePDG: install kernel XFRM SAs/policies; bearer is up
+```
+
+After `established`, the BEAM only handles control traffic (DPD, MOBIKE,
+GTP-C Echo, teardown); ESP ↔ GTP-U runs in the kernel.
+
+---
+
+## Configuration
+
+All configuration is read from environment variables (`epdg_config.erl`).
+Empty/unset values fall back to the defaults below.
+
+### Identity / PLMN / logging
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `EPDG_ORIGIN_HOST` | `$HOSTNAME.$EPDG_ORIGIN_REALM` or `epdg.localdomain` | Diameter Origin-Host |
+| `EPDG_ORIGIN_REALM` | `localdomain` | Diameter Origin-Realm |
+| `MCC` | `001` | PLMN MCC (builds NAIs / IDr FQDN) |
+| `MNC` | `01` | PLMN MNC |
+| `EPDG_LOG_LEVEL` | `notice` | `debug` / `info` / `notice` / `warning` / `error` |
+
+### IKEv2 / IPsec
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `EPDG_IKE_BIND_ADDR` | `0.0.0.0` | IKE/NAT-T bind address (see per-pod/per-node maps below) |
+| `EPDG_IKE_PORT` | `500` | IKE listener port |
+| `EPDG_IKE_NATT_PORT` | `4500` | NAT-T (UDP-encapsulated ESP) port |
+| `EPDG_IKE_CERT_FILE` | _(empty)_ | PEM X.509 certificate the ePDG presents (TS 33.402 §7.2.1) |
+| `EPDG_IKE_KEY_FILE` | _(empty)_ | PEM private key matching the certificate |
+| `EPDG_IKE_ID_FQDN` | `epdg.epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org` | IDr FQDN (should match the cert SAN:DNS) |
+| `EPDG_EAP_METHOD` | `aka-prime` | `aka` or `aka-prime` |
+| `EPDG_IPSEC_OFFLOAD` | `auto` | `auto` / `none` / `inline` / `crypto` |
+| `EPDG_IPSEC_IFACE` | `eth0` | NIC for hardware-offload detection |
+
+### Dead Peer Detection (RFC 7296 §2.4)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `EPDG_DPD_INTERVAL` | `120000` | Idle interval between DPD probes (ms) — deliberately patient for NAT'd VoWiFi UEs |
+| `EPDG_DPD_TIMEOUT` | `10000` | Per-probe response timeout (ms) |
+| `EPDG_DPD_RETRIES` | `3` | Consecutive unanswered probes before teardown |
+
+### MOBIKE return-routability (RFC 4555 §3.7)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `EPDG_MOBIKE_RR_CHECK` | `true` | Require a COOKIE2 echo from the new outer address before moving kernel SAs |
+| `EPDG_MOBIKE_RR_TIMEOUT` | `3000` | Per-probe wait for the COOKIE2 echo (ms) |
+| `EPDG_MOBIKE_RR_RETRIES` | `2` | COOKIE2 probe retransmits before abandoning the move |
+
+### GTP-C / GTP-U S2b (TS 29.274 / TS 29.281)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `PGW_FQDN` | _(empty)_ | Preferred: PGW-C/SMF FQDN, re-resolved on TTL/failure/Echo timeout |
+| `PGW_ADDR` | `127.0.0.1` | Static fallback PGW address (logs a warning; bare-metal/single-node) |
+| `PGW_PORT` | `2123` | PGW-C GTP-C port |
+| `EPDG_GTPC_BIND_ADDR` | `0.0.0.0` | Local GTP-C bind address |
+| `EPDG_GTPC_PORT` | `2123` | Local GTP-C port |
+| `EPDG_GTPC_ECHO_INTERVAL_SEC` | `60` | GTP-C Echo heartbeat interval |
+| `EPDG_GTPC_ECHO_TIMEOUT_SEC` | `3` | Echo response timeout |
+| `EPDG_GTPC_ECHO_MAX_MISSES` | `3` | Missed Echoes before the peer is declared down |
+| `EPDG_GTPC_BACKOFF_MAX_SEC` | `30` | Max reconnect backoff |
+| `EPDG_GTPC_MAX_DOWN_SEC` | `30` | Max time a peer may stay down before pending calls fail |
+| `EPDG_GTPC_PENDING_LIMIT` | `16` | Bounded queue of in-flight Create/Delete while reconnecting |
+| `EPDG_DNS_MIN_TTL_SEC` | `5` | DNS cache TTL floor |
+| `EPDG_DNS_MAX_TTL_SEC` | `60` | DNS cache TTL ceiling |
+| `EPDG_GTPU_BIND_ADDR` | `0.0.0.0` | Local GTP-U bind address |
+| `EPDG_GTPU_ADVERTISE_ADDR` | _(empty)_ | IP put in the S2b-U F-TEID; empty = local GTP-C IP |
+| `EPDG_GTPU_PORT` | `2152` | GTP-U port (TS 29.281 fixed port) |
+
+The IKE and GTP-U bind/advertise addresses additionally accept
+`<name>=<ip>` CSV override maps via `*_BY_POD` (matched on `HOSTNAME`) and
+`*_BY_NODE` (matched on `NODE_NAME`), used for `hostNetwork` active-active
+deployments. Precedence: per-pod → per-node → scalar → default.
+
+### Diameter SWm (toward AAA via DRA)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `DRA_HOSTS` | _(unset)_ | Comma-separated DRA peers (takes precedence over `DRA_HOST`) |
+| `DRA_HOST` | `dra-diameter` | Legacy single-DRA fallback |
+| `DRA_PORT` | `3868` | DRA Diameter port |
+| `DRA_TRANSPORT` | `tcp` | `tcp` or `sctp` |
+| `EPDG_DIAMETER_PORT` | `3868` | Local Diameter port |
+| `EPDG_SWM_DEST_REALM` | _(Origin-Realm)_ | Destination-Realm for routed SWm DERs (the AAA realm) |
+| `EPDG_SWM_RAT_TYPE` | `0` | RAT-Type in SWm DER (`0` = WLAN, TS 29.273 §5.2.3.6) |
+
+### UE addressing / APN / dual-stack
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `EPDG_UE_IP_POOL` | `10.47.0.0/16` | Informational UE IPv4 pool (the PGW PAA is authoritative) |
+| `EPDG_UE_IP6_POOL` | _(empty)_ | Informational UE IPv6 pool |
+| `EPDG_IPV6_ENABLED` | `false` | Honour the UE's requested PDN type and grant IPv6 / IPv4v6 (IR.51/IR.92) |
+| `EPDG_ALLOWED_APNS` | `ims` | Comma-separated allow-list (empty = allow all; `ims` always allowed) |
+| `EPDG_DEFAULT_APN` | `ims` | APN used when the UE does not request one |
+
+### Miscellaneous
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `EPDG_API_PORT` | `8080` | HTTP API port |
+| `EPDG_TUN_GC_INTERVAL` | `300000` | Orphan TUN-device reconciliation interval (ms) |
+
+---
+
+## HTTP endpoints
+
+Served by Cowboy on `EPDG_API_PORT` (default 8080).
+
+| Path | Method | Purpose |
+|------|--------|---------|
+| `GET /healthz` | GET | Liveness — 200 while the VM is up |
+| `GET /readyz` | GET | Readiness — 200 only when not draining **and** ≥ 1 SWm Diameter peer is connected; else 503 |
+| `GET /metrics` | GET | Prometheus exposition (`epdg_*` counters / gauges) |
+| `GET /api/status` | GET | JSON — active/total sessions, tunnels, offload mode, peer count, drain flag |
+| `GET /admin/sessions` | GET | JSON list of active UE sessions incl. real outer `peer_ip`/`peer_port` |
+| `POST /admin/drain` | POST | Begin a graceful drain (preStop hook); flips the readiness flag and tears tunnels down with jitter |
+
+---
+
+## Metrics
+
+`/metrics` exposes ETS-backed counters/gauges prefixed `epdg_`, including:
+
+* `epdg_ikev2_packets_received_total`, `epdg_ike_tunnels_established_total`,
+  `epdg_ike_auth_success_total` / `_failure_total`, `epdg_ike_auth_duration_ms_*`
+* `epdg_ue_sessions_active` (gauge), `epdg_ue_sessions_total`,
+  `epdg_session_superseded_total`
+* `epdg_gtpc_requests_total` / `_responses_total` / `_timeouts_total`,
+  `epdg_gtpc_latency_ms_*`, `epdg_gtpc_echo_*`, `epdg_gtpc_peer_down_total`,
+  `epdg_gtpc_peer_restarts_total`, `epdg_gtpc_dns_resolves_total`
+* `epdg_gtpu_tx_bytes` / `_rx_bytes` / `_tx_pkts` / `_rx_pkts`,
+  `epdg_gtpu_peer_down_total`
+* `epdg_diameter_swm_requests_total`, `epdg_diameter_swm_latency_ms_*`,
+  `epdg_diameter_swm_peers` (gauge)
+* `epdg_xfrm_sa_active` (gauge), `epdg_xfrm_sa_created_total` / `_deleted_total` / `_errors_total`
+* `epdg_dpd_probes_sent_total`, `epdg_dpd_timeout_total`
+* `epdg_mobike_update_total`, `epdg_mobike_rr_check_total`, `epdg_mobike_rr_fail_total`
+* `epdg_tun_gc_cleaned_total`, `epdg_tun_startup_cleaned_total`
+
+---
+
+## Data plane (kernel XFRM + GTP-U)
+
+Once Child SAs are negotiated at the end of `IKE_AUTH`, the ePDG installs an
+inbound/outbound ESP SA pair plus matching XFRM policies in the Linux kernel
+(`epdg_xfrm`). NAT-traversed sessions use UDP encapsulation on 4500 per
+RFC 3948. Each session's SA pair and policies are tagged with a unique
+`reqid` (the responder Child-SA SPI) so two UEs sharing one public IP
+(carrier-grade NAT, or two handsets behind one home router) don't clobber
+each other's state. Uplink cleartext is steered into a per-subscriber GTP-U
+tunnel toward the PGW-U; downlink GTP-U is decapsulated and re-encrypted to
+the UE's outer address. The BEAM is not in the per-packet path.
+
+Hardware ESP offload (Mellanox ConnectX `mlx5`, Intel `ice`/QAT) is detected
+via `ethtool` and used when available, with graceful fallback to software
+ESP (AES-NI). See the platform docs for the full data-path walkthrough.
+
+---
+
+## Deployment notes
+
+* **Capabilities:** runs **unprivileged** with only `NET_ADMIN` + `NET_RAW`
+  (XFRM SA/SP + raw sockets). No `SYS_MODULE`, no kernel module loading.
+* **Ports:** UDP 500, UDP 4500 (IKE/NAT-T), UDP 2123 (GTP-C), UDP 2152
+  (GTP-U), TCP/SCTP 3868 (SWm), TCP 8080 (HTTP API).
+* **Session affinity:** every IKE message in a session must reach the pod
+  holding the SA state. Front the external IKE service with a LoadBalancer
+  using `sessionAffinity: ClientIP` (NAT may remap the UE source port
+  between `IKE_SA_INIT` and `IKE_AUTH`).
+* **Graceful drain:** `POST /admin/drain` (preStop) marks the pod not-ready
+  so the LB de-registers it, stops accepting new `IKE_SA_INIT`, and tears
+  remaining tunnels down with jitter, releasing S2b GTP and SWm STR cleanly.
+* **Shutdown deadline:** `kernel.shutdown_timeout` (`sys.config`) is 20 s so
+  post-SIGTERM teardown fits inside the K8s grace buffer.
+
+This image is deployed by the `epdg-chart` Helm chart as a StatefulSet.
+
+---
+
+## Build
+
+```sh
+# Compile (runs scripts/compile-diameter-dicts.sh to generate the SWm
+# Diameter dictionary from priv/dict/swm.dia first)
+rebar3 compile
+
+# Production release (self-contained, with ERTS)
+rebar3 as prod release
+
+# Bump the version across VERSION + rebar.config + app.src (and tag)
+./Bump.sh patch     # or: minor | major | rc | release
+```
+
+The Docker image (`docker/Dockerfile`, `erlang:26-alpine`) builds the
+release and additionally compiles `apps/epdg/c_src/epdg_tun_port.c` — a tiny
+stdio bridge the GTP-U forwarder uses to plumb per-UE TUN devices to the
+GTP-U socket.
+
+---
+
+## Limitations / roadmap
+
+* **AAA-initiated detach** (SWm ASR / RAR) is not yet honoured; such
+  requests are answered with `DIAMETER_UNABLE_TO_DELIVER` (3001).
+* **No automated CT suite** yet; testing is currently manual / integration
+  (IKEv2 against real UEs, GTP-C against Open5GS). Adding `rebar3 ct`
+  coverage for the IKEv2 and Diameter codecs is a roadmap item.
+* `epdg_xfrm` drives the kernel via `ip xfrm`/`ip tuntap` commands;
+  migrating to a native `gen_netlink` path is planned.
+
+---
+
+## Further documentation
+
+The platform documentation has an in-depth ePDG page covering the full
+IPsec data-path walkthrough, dual-stack handling, `hostNetwork`
+active-active layout, certificate provisioning and troubleshooting:
+`docs/docs/components/epdg.md` in the umbrella repository.
+
+---
+
+## License
+
+Part of the CNaaS VoLTE / VoWiFi distribution. See root `LICENSE`.
