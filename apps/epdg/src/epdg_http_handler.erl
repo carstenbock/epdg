@@ -54,6 +54,7 @@ init(Req, #{action := status} = State) ->
         ue_sessions_active => epdg_metrics:get(ue_sessions_active),
         ue_sessions_total  => epdg_metrics:get(ue_sessions_total),
         tunnels_established => epdg_metrics:get(ike_tunnels_established_total),
+        redirects_sent => epdg_metrics:get(ike_redirects_sent_total),
         offload_mode => atom_to_binary(epdg_xfrm:get_offload_mode()),
         diameter_peers => epdg_metrics:get(diameter_swm_peers),
         draining => is_draining()

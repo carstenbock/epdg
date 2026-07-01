@@ -124,6 +124,18 @@ init() ->
     set_from_env_int("EPDG_MOBIKE_RR_TIMEOUT", mobike_rr_timeout, 3000),
     set_from_env_int("EPDG_MOBIKE_RR_RETRIES", mobike_rr_retries, 2),
 
+    %% IKEv2 Redirect (RFC 5685). When enabled, a draining pod steers UEs
+    %% that advertised N(REDIRECT_SUPPORTED) to `redirect_target` before it
+    %% DELETEs the SA, so they re-establish on a healthy node instead of
+    %% racing back onto a sibling pod. Off by default (no behaviour change).
+    %%
+    %% Prefer an FQDN for the target: a literal IP sends every draining UE
+    %% to one node and recreates the thundering herd the drain jitter exists
+    %% to prevent, whereas an FQDN lets DNS spread arrivals across the
+    %% remaining healthy pods.
+    set_from_env_bool("EPDG_REDIRECT_ENABLE", redirect_enable, false),
+    set_from_env("EPDG_REDIRECT_TARGET", redirect_target, ""),
+
     %% TUN device garbage collection interval (ms)
     set_from_env_int("EPDG_TUN_GC_INTERVAL", tun_gc_interval, 300000),
 

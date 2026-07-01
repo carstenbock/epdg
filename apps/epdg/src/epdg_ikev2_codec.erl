@@ -12,6 +12,8 @@
          decode_ke_payload/1, encode_ke_payload/2,
          decode_nonce_payload/1, encode_nonce_payload/1,
          encode_notify_payload/4,
+         encode_redirect_notify_data/3, decode_redirect_notify_data/1,
+         parse_redirect_target/1,
          encode_delete_ike_payload/0,
          encode_cert_payload/1, encode_auth_payload/2,
          encode_certreq_payload/1,
@@ -487,6 +489,63 @@ encode_nonce_payload(Nonce) -> Nonce.
 encode_notify_payload(ProtocolId, NotifyType, SPI, Data) ->
     SPISize = byte_size(SPI),
     <<ProtocolId:8, SPISize:8, NotifyType:16, SPI/binary, Data/binary>>.
+
+%% REDIRECT / REDIRECT_SUPPORTED / REDIRECT_FROM notification data
+%% (RFC 5685 §6):
+%%   GW Ident Type (1) | GW Ident Len (1) | GW Identity (Len) | [Nonce Data]
+%%
+%% GW Ident Type: 1 = IPv4 (4-byte identity), 2 = IPv6 (16-byte identity),
+%% 3 = FQDN (UTF-8 bytes, no null terminator, no inner length prefix).
+%%
+%% The trailing Nonce is included ONLY for a redirect during IKE_SA_INIT
+%% (RFC 5685 §5), where it echoes the client's Ni. For IKE_AUTH and
+%% active-session (INFORMATIONAL) redirects pass Nonce = <<>>.
+-spec encode_redirect_notify_data(1..3, binary(), binary()) -> binary().
+encode_redirect_notify_data(GwType, GwIdentity, Nonce)
+  when GwType >= 1, GwType =< 3, is_binary(GwIdentity),
+       byte_size(GwIdentity) =< 255, is_binary(Nonce) ->
+    Len = byte_size(GwIdentity),
+    <<GwType:8, Len:8, GwIdentity/binary, Nonce/binary>>.
+
+%% Inverse of encode_redirect_notify_data/3 (used for round-trip tests and
+%% any future initiator-side handling). Returns {GwType, Identity, Nonce}
+%% where Nonce is <<>> when none was appended.
+-spec decode_redirect_notify_data(binary()) ->
+    {ok, {1..3, binary(), binary()}} | {error, term()}.
+decode_redirect_notify_data(<<GwType:8, Len:8, Rest/binary>>)
+  when GwType >= 1, GwType =< 3 ->
+    case Rest of
+        <<GwIdentity:Len/binary, Nonce/binary>> ->
+            {ok, {GwType, GwIdentity, Nonce}};
+        _ ->
+            {error, truncated_redirect}
+    end;
+decode_redirect_notify_data(_) ->
+    {error, invalid_redirect}.
+
+%% Parse a configured redirect target string into the {GwIdentType,
+%% GwIdentity} pair carried in a REDIRECT notification (RFC 5685 §6).
+%%
+%% A literal IPv4/IPv6 sends every draining UE to one node and recreates
+%% the thundering herd the drain jitter exists to prevent; prefer an FQDN
+%% so DNS can spread arrivals across the remaining healthy pods.
+-spec parse_redirect_target(string()) -> {ok, {1..3, binary()}} | {error, term()}.
+parse_redirect_target(Target) when is_list(Target) ->
+    case string:trim(Target) of
+        "" ->
+            {error, empty};
+        Trimmed ->
+            case inet:parse_address(Trimmed) of
+                {ok, {A, B, C, D}} ->
+                    {ok, {1, <<A:8, B:8, C:8, D:8>>}};
+                {ok, {A, B, C, D, E, F, G, H}} ->
+                    {ok, {2, <<A:16, B:16, C:16, D:16,
+                               E:16, F:16, G:16, H:16>>}};
+                {error, _} ->
+                    %% Not a literal address -> treat as FQDN (ID_FQDN form).
+                    {ok, {3, unicode:characters_to_binary(Trimmed)}}
+            end
+    end.
 
 %% Delete payload for the IKE SA itself (RFC 7296 §3.11):
 %% Protocol ID = 1 (IKE), SPI Size = 0, Num SPIs = 0. The IKE SPIs

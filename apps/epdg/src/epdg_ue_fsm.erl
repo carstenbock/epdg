@@ -13,6 +13,13 @@
 -export([init/1, callback_mode/0, terminate/3, code_change/4]).
 -export([idle/3, ike_sa_init/3, ike_auth/3, established/3]).
 
+-ifdef(TEST).
+%% Internal functions exercised by the EUnit suite (see test/). new_data_for_test/1
+%% is a minimal #data constructor so tests can drive drain_action/1 without a
+%% live SA (the #data record is otherwise private to this module).
+-export([drain_action/1, find_notify/2, new_data_for_test/1]).
+-endif.
+
 -define(IKE_SA_INIT_TIMEOUT, 30000).
 -define(IKE_AUTH_TIMEOUT,    60000).
 -define(DPD_INTERVAL,        120000).
@@ -23,6 +30,11 @@
 -define(N_MOBIKE_SUPPORTED,    16396).
 -define(N_UPDATE_SA_ADDRESSES, 16400).
 -define(N_COOKIE2,             16401).
+
+%% IKEv2 Redirect notify message types (RFC 5685 §9).
+-define(N_REDIRECT_SUPPORTED, 16406).
+-define(N_REDIRECT,           16407).
+-define(N_REDIRECT_FROM,      16408).
 
 %% MOBIKE return-routability (COOKIE2) check defaults (RFC 4555 §3.7).
 %% Retransmit the COOKIE2 probe a few times (UDP) before giving up.
@@ -71,6 +83,10 @@
     %% True once the UE advertised N(MOBIKE_SUPPORTED) in IKE_AUTH and we
     %% confirmed it (RFC 4555 §3.1). Gates UPDATE_SA_ADDRESSES handling.
     mobike           :: boolean(),
+    %% True once the UE advertised N(REDIRECT_SUPPORTED) in IKE_SA_INIT
+    %% (RFC 5685 §4). Gates every REDIRECT path: we never redirect a UE
+    %% that did not signal support.
+    redirect_supported :: boolean(),
     %% EAP identifier counter (monotonic per RFC 3748)
     eap_next_id      :: non_neg_integer(),
     %% X.509 certificate for IKEv2 responder auth (TS 33.402 §7.2.1)
@@ -186,6 +202,7 @@ init(#{peer_ip := PeerIP, peer_port := PeerPort} = _Ctx) ->
         message_id    = 0,
         dpd_failures  = 0,
         mobike        = false,
+        redirect_supported = false,
         eap_next_id   = 1,
         cert_der      = CertDer,
         private_key   = PrivKey,
@@ -473,12 +490,28 @@ established(cast, pgw_down,    _Data) -> {stop, {shutdown, pgw_unreachable}};
 
 established(cast, {drain, Reason}, Data) ->
     handle_drain(established, Reason, Data);
-established(info, drain_stop, Data) ->
+established(info, drain_stop, #data{message_id = MsgId} = Data) ->
     %% Best-effort: tell the UE to abandon this IKE SA so it can redial
-    %% a sibling pod immediately rather than waiting for DPD. Any failure
+    %% a healthy node immediately rather than waiting for DPD. Any failure
     %% (missing keys, listener down) is logged and swallowed — we still
     %% tear the FSM down so the preStop deadline is honoured.
-    _ = try_send_delete_informational(Data),
+    case drain_action(Data) of
+        {redirect, Gw} ->
+            %% RFC 5685 §7: steer the UE to `redirect_target`, then STILL
+            %% DELETE + stop so local XFRM/SA state and the S2b/SWm teardown
+            %% always happen inside the shutdown budget regardless of how the
+            %% client reacts to the REDIRECT.
+            %%
+            %% Both the REDIRECT and the DELETE are responder-initiated
+            %% INFORMATIONAL exchanges, which consume the responder's own
+            %% message-id space (RFC 7296 §2.2). try_send_delete_informational/1
+            %% takes its id straight from #data.message_id, so hand it MsgId+1
+            %% to keep the two exchanges on distinct, incrementing ids.
+            _ = try_send_redirect_informational(Gw, Data),
+            _ = try_send_delete_informational(Data#data{message_id = MsgId + 1});
+        delete_only ->
+            _ = try_send_delete_informational(Data)
+    end,
     {stop, {shutdown, drained}};
 
 established(state_timeout, dpd, #data{rr_pending = RR} = Data) when is_map(RR) ->
@@ -526,9 +559,23 @@ handle_ike_sa_init_request(#{initiator_spi := ISPI, next_payload := NextPL,
                                   peer_ip = PeerIP, peer_port = PeerPort} = Data) ->
     case epdg_ikev2_codec:decode_payloads(NextPL, PayloadBin) of
         {ok, Payloads} ->
+            %% RFC 5685 §4: the UE advertises N(REDIRECT_SUPPORTED) in the
+            %% IKE_SA_INIT request (unlike MOBIKE, which is signalled in
+            %% IKE_AUTH). Remember it so the drain / IKE_AUTH redirect paths
+            %% only ever redirect a UE that opted in.
+            RedirectSupported = find_notify(?N_REDIRECT_SUPPORTED, Payloads),
+            %% Responder-only: if a previously-redirected UE arrives carrying
+            %% N(REDIRECT_FROM), log it for visibility but take no action.
+            case find_notify(?N_REDIRECT_FROM, Payloads) of
+                true ->
+                    logger:info("IKE_SA_INIT from ~p:~p carries N(REDIRECT_FROM) "
+                                "(ignored, responder-only)", [PeerIP, PeerPort]);
+                false -> ok
+            end,
+            Data1 = Data#data{redirect_supported = RedirectSupported},
             case process_sa_init_payloads(Payloads) of
                 {ok, Parsed} ->
-                    send_sa_init_response(ISPI, MsgId, Parsed, Data);
+                    send_sa_init_response(ISPI, MsgId, Parsed, Data1);
                 {error, Reason} ->
                     logger:warning("IKE_SA_INIT from ~p:~p rejected: ~p "
                                    "(ISPI=~.16B RSPI=~.16B)",
@@ -635,6 +682,14 @@ with_nonce(Suite, PeerPub, Payloads) ->
     end.
 
 %% Build and transmit the IKE_SA_INIT response; transition to ike_sa_init state.
+%%
+%% P2 extension point (RFC 5685 §5): a redirect MAY also be issued here, in
+%% the IKE_SA_INIT response, by adding {notify, encode_notify_payload(0,
+%% ?N_REDIRECT, <<>>, encode_redirect_notify_data(GwType, GwId, NonceI))} —
+%% note the third arg MUST echo the client's Ni. This form is unauthenticated
+%% (the IKE SA is not yet established), so it is not implemented here; the
+%% authenticated IKE_AUTH-time and active-session INFORMATIONAL redirects are
+%% preferred.
 send_sa_init_response(ISPI, MsgId,
                        #{suite := Suite, peer_dh_pub := PeerPub, nonce_i := NonceI},
                        #data{responder_spi = RSPI, peer_ip = PeerIP,
@@ -1275,7 +1330,91 @@ proceed_with_s2b(MsgId, InFlags, ISPI, RSPI,
                                      37, Data0)
     end.
 
+%% RFC 5685 §5: optionally redirect the UE at IKE_AUTH time (the "staging
+%% weiche" use case) instead of setting up a Child SA. Gated behind the same
+%% enable + REDIRECT_SUPPORTED checks as the drain path PLUS a policy
+%% predicate (should_redirect_at_auth/1), which is a stub returning false, so
+%% this is off by default and finalize_ike_auth_setup/18 below runs exactly
+%% as before. Note: finalize runs AFTER the GTP-C Create-Session, so a real
+%% deployment must decide the redirect earlier (before S2b setup) to avoid an
+%% orphaned PDN — this hook only wires the mechanism.
 finalize_ike_auth(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
+                   IDrBody, NonceI, NonceR,
+                   IkeSaInitRespBytes, MSK, KeyParams, Keys,
+                   LocalCTeid, LocalUTeid, GtpcResp,
+                   PeerIP, PeerPort, Data0) ->
+    case redirect_at_auth_chain(Data0) of
+        [] ->
+            finalize_ike_auth_setup(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
+                                    IDrBody, NonceI, NonceR, IkeSaInitRespBytes,
+                                    MSK, KeyParams, Keys, LocalCTeid, LocalUTeid,
+                                    GtpcResp, PeerIP, PeerPort, Data0);
+        RedirectChain ->
+            finalize_ike_auth_redirect(MsgId, InFlags, ISPI, RSPI, IDrBody,
+                                       NonceI, IkeSaInitRespBytes, MSK,
+                                       KeyParams, Keys, PeerIP, PeerPort,
+                                       RedirectChain, Data0)
+    end.
+
+%% Build the RFC 5685 REDIRECT notify chain for a setup-time redirect, or []
+%% when this session must not be redirected at IKE_AUTH. Reuses drain_action/1
+%% for the enable + target + REDIRECT_SUPPORTED gating; should_redirect_at_auth/1
+%% is the additional policy predicate.
+-spec redirect_at_auth_chain(#data{}) -> [{notify, binary()}].
+redirect_at_auth_chain(Data) ->
+    case should_redirect_at_auth(Data) andalso drain_action(Data) of
+        {redirect, {GwType, GwId}} ->
+            %% No nonce: the IKE_AUTH exchange is already protected (RFC 5685
+            %% §5 reserves the nonce for the unauthenticated IKE_SA_INIT case).
+            RedirectData = epdg_ikev2_codec:encode_redirect_notify_data(
+                             GwType, GwId, <<>>),
+            [{notify, epdg_ikev2_codec:encode_notify_payload(
+                        0, ?N_REDIRECT, <<>>, RedirectData)}];
+        _ ->
+            []
+    end.
+
+%% Policy predicate for a setup-time (IKE_AUTH) redirect. Stub: always false,
+%% so IKE_AUTH-time redirect stays off regardless of config. Replace with a
+%% real policy (e.g. IMSI/APN match or a dedicated config hook) to enable it.
+%% TODO: source this decision from config / subscriber policy.
+-spec should_redirect_at_auth(#data{}) -> boolean().
+should_redirect_at_auth(_Data) ->
+    false.
+
+%% Send an IKE_AUTH response that redirects the UE (IDr + AUTH + N(REDIRECT))
+%% and installs NO Child SA. Best-effort, then tears the half-open session
+%% down so the UE re-establishes to the redirect target.
+finalize_ike_auth_redirect(MsgId, InFlags, ISPI, RSPI, IDrBody, NonceI,
+                           IkeSaInitRespBytes, MSK, KeyParams, Keys,
+                           PeerIP, PeerPort, RedirectChain, Data0) ->
+    #{prf := PRF} = KeyParams,
+    AuthSig = epdg_ikev2_crypto:build_responder_psk_auth(
+                PRF, MSK, IkeSaInitRespBytes, NonceI,
+                maps:get(sk_pr, Keys), IDrBody),
+    AuthBin = epdg_ikev2_codec:encode_auth_payload(2, AuthSig),
+    InnerChain = [{idr, IDrBody}, {auth, AuthBin}] ++ RedirectChain,
+    RespFlags = (InFlags band (bnot 16#08)) bor 16#20,
+    Hdr = #{initiator_spi     => ISPI,
+            responder_spi     => RSPI,
+            exchange_type_raw => 35,
+            flags             => RespFlags,
+            message_id        => MsgId},
+    case epdg_ikev2_crypto:encode_encrypted_message(
+           KeyParams, Keys, responder, Hdr, InnerChain) of
+        {ok, RespBytes} ->
+            catch epdg_ikev2_listener:send(PeerIP, PeerPort, RespBytes),
+            epdg_metrics:inc(ike_redirects_sent_total),
+            logger:info("IKE_AUTH REDIRECT response sent (~B bytes) IMSI=~p",
+                        [byte_size(RespBytes), Data0#data.imsi]),
+            {stop, {shutdown, redirected}, Data0};
+        {error, EErr} ->
+            logger:warning("IKE_AUTH REDIRECT encode failed: ~p IMSI=~p",
+                           [EErr, Data0#data.imsi]),
+            {stop, {shutdown, redirect_encode_failed}, Data0}
+    end.
+
+finalize_ike_auth_setup(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
                    IDrBody, NonceI, NonceR,
                    IkeSaInitRespBytes, MSK, KeyParams, Keys,
                    LocalCTeid, LocalUTeid, GtpcResp,
@@ -2391,6 +2530,78 @@ send_dpd_probe(Data) ->
 %% pod at the same millisecond, then terminates when the jitter fires.
 %%====================================================================
 
+%% Pure decision: should this draining session send an RFC 5685 REDIRECT
+%% before it is torn down? Returns {redirect, {GwIdentType, GwIdentity}}
+%% only when redirect is enabled, a target is configured AND parseable, and
+%% the UE advertised N(REDIRECT_SUPPORTED) in its IKE_SA_INIT; otherwise
+%% delete_only (the historical behaviour). Depends solely on #data + config
+%% so it is unit-testable without a live SA.
+-spec drain_action(#data{}) -> {redirect, {1..3, binary()}} | delete_only.
+drain_action(#data{redirect_supported = true}) ->
+    case {epdg_config:get(redirect_enable, false),
+          epdg_config:get(redirect_target, "")} of
+        {true, Target} when Target =/= "" ->
+            case epdg_ikev2_codec:parse_redirect_target(Target) of
+                {ok, Gw}    -> {redirect, Gw};
+                {error, _}  -> delete_only
+            end;
+        _ ->
+            delete_only
+    end;
+drain_action(_Data) ->
+    delete_only.
+
+%% Best-effort RFC 5685 REDIRECT to a still-established UE, sent as a
+%% responder-initiated INFORMATIONAL (exchange type 37, Initiator flag
+%% clear per RFC 7296 §2.2). Modeled on try_send_delete_informational/1:
+%% requires the IKE keys, and any failure is logged at info and swallowed
+%% so it can never crash or stall the FSM teardown.
+-spec try_send_redirect_informational({1..3, binary()}, #data{}) -> ok.
+try_send_redirect_informational({GwType, GwId},
+                                #data{ike_keys = Keys,
+                                      keys_params = KeyParams,
+                                      initiator_spi = ISPI,
+                                      responder_spi = RSPI,
+                                      peer_ip = PeerIP,
+                                      peer_port = PeerPort,
+                                      message_id = MsgId})
+  when is_map(Keys), is_map(KeyParams),
+       is_integer(ISPI), is_integer(RSPI),
+       is_tuple(PeerIP), is_integer(PeerPort) ->
+    %% Active-session redirect: no nonce (the exchange is IKE-protected).
+    RedirectData = epdg_ikev2_codec:encode_redirect_notify_data(GwType, GwId, <<>>),
+    RedirectNotify = epdg_ikev2_codec:encode_notify_payload(
+                       0, ?N_REDIRECT, <<>>, RedirectData),
+    Hdr = #{initiator_spi     => ISPI,
+            responder_spi     => RSPI,
+            exchange_type_raw => 37,
+            flags             => 16#00,
+            message_id        => MsgId},
+    try
+        case epdg_ikev2_crypto:encode_encrypted_message(
+               KeyParams, Keys, responder, Hdr, [{notify, RedirectNotify}]) of
+            {ok, Bytes} ->
+                catch epdg_ikev2_listener:send(PeerIP, PeerPort, Bytes),
+                epdg_metrics:inc(ike_redirects_sent_total),
+                logger:info("Drain: IKEv2 REDIRECT informational sent "
+                            "(~B bytes) gw_type=~B peer=~p:~p",
+                            [byte_size(Bytes), GwType, PeerIP, PeerPort]),
+                ok;
+            {error, EncErr} ->
+                logger:info("Drain: IKEv2 REDIRECT encode skipped: ~p", [EncErr]),
+                ok
+        end
+    catch
+        Class:CReason:_ ->
+            logger:info("Drain: IKEv2 REDIRECT best-effort send failed: ~p:~p",
+                        [Class, CReason]),
+            ok
+    end;
+try_send_redirect_informational(_Gw, _Data) ->
+    %% No keys yet (pre-auth) — nothing we can encrypt. Fall through to the
+    %% normal DELETE path.
+    ok.
+
 handle_drain(State, Reason, #data{peer_ip = PeerIP, imsi = IMSI} = Data) ->
     case get(drain_scheduled) of
         true ->
@@ -2489,3 +2700,15 @@ load_ike_certificate() ->
                     {undefined, undefined}
             end
     end.
+
+%%====================================================================
+%% Test helpers
+%%====================================================================
+
+-ifdef(TEST).
+%% Minimal #data constructor for the EUnit suite: only the fields
+%% drain_action/1 inspects are meaningful.
+-spec new_data_for_test(boolean()) -> #data{}.
+new_data_for_test(RedirectSupported) ->
+    #data{message_id = 0, redirect_supported = RedirectSupported}.
+-endif.

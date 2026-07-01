@@ -31,6 +31,7 @@ BEAM is out of the per-packet path once Child SAs are installed.
 | IKEv2 | IETF RFC 7296 |
 | IKEv2 NAT traversal (UDP-encap ESP) | IETF RFC 3948 |
 | MOBIKE (Wi-Fi ↔ Wi-Fi handover) | IETF RFC 4555 |
+| IKEv2 Redirect (load steering on drain) | IETF RFC 5685 |
 | EAP | IETF RFC 3748 |
 | EAP-AKA | IETF RFC 4187 |
 | EAP-AKA' | IETF RFC 5448 |
@@ -188,6 +189,18 @@ Empty/unset values fall back to the defaults below.
 | `EPDG_MOBIKE_RR_TIMEOUT` | `3000` | Per-probe wait for the COOKIE2 echo (ms) |
 | `EPDG_MOBIKE_RR_RETRIES` | `2` | COOKIE2 probe retransmits before abandoning the move |
 
+### IKEv2 Redirect (RFC 5685)
+
+Responder-only. On a graceful drain, a UE that advertised `N(REDIRECT_SUPPORTED)`
+in its `IKE_SA_INIT` is steered to a healthy node before its SA is torn down.
+The `DELETE` fallback and drain jitter are always kept, so unsupported UEs and
+the local/S2b/SWm teardown are unaffected.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `EPDG_REDIRECT_ENABLE` | `false` | Send an RFC 5685 `REDIRECT` to draining UEs that advertised `REDIRECT_SUPPORTED`, before the `DELETE` |
+| `EPDG_REDIRECT_TARGET` | _(empty)_ | Gateway the UE should move to. **Prefer an FQDN**: a literal IP sends every draining UE to one node and recreates the thundering herd the drain jitter exists to prevent, whereas an FQDN lets DNS spread arrivals across the remaining healthy pods |
+
 ### GTP-C / GTP-U S2b (TS 29.274 / TS 29.281)
 
 | Variable | Default | Purpose |
@@ -313,6 +326,11 @@ ESP (AES-NI). See the platform docs for the full data-path walkthrough.
 * **Graceful drain:** `POST /admin/drain` (preStop) marks the pod not-ready
   so the LB de-registers it, stops accepting new `IKE_SA_INIT`, and tears
   remaining tunnels down with jitter, releasing S2b GTP and SWm STR cleanly.
+  With `EPDG_REDIRECT_ENABLE` set, a UE that advertised `REDIRECT_SUPPORTED`
+  is first sent an RFC 5685 `REDIRECT` toward `EPDG_REDIRECT_TARGET` (ideally
+  an FQDN) to steer it to a healthy node; the pod then still `DELETE`s the SA
+  and tears down S2b/SWm. UEs that did not advertise support fall back to
+  `DELETE` + DPD.
 * **Shutdown deadline:** `kernel.shutdown_timeout` (`sys.config`) is 20 s so
   post-SIGTERM teardown fits inside the K8s grace buffer.
 

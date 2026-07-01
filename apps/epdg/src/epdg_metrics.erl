@@ -58,6 +58,7 @@ init() ->
         mobike_update_total,
         mobike_rr_check_total,
         mobike_rr_fail_total,
+        ike_redirects_sent_total,
         session_superseded_total,
         tun_gc_cleaned_total,
         tun_startup_cleaned_total
