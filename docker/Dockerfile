@@ -8,7 +8,7 @@ RUN apk add --no-cache bash git build-base wget iproute2 ethtool libcap lksctp-t
   && wget -qO- https://github.com/erlang/rebar3/releases/download/3.23.0/rebar3 \
        | install -m 0755 /dev/stdin /usr/local/bin/rebar3 \
   && rebar3 clean \
-  && rebar3 eunit \
+  && rebar3 test \
   && rebar3 as prod release
 
 # Compile the TUN port-driver helper used by epdg_gtpu_forwarder to
@@ -38,6 +38,9 @@ ENV EPDG_GTPC_BIND_ADDR="0.0.0.0"
 ENV EPDG_GTPC_PORT="2123"
 ENV PGW_ADDR=""
 ENV PGW_PORT="2123"
+# GTP-C dialect toward the PGW: "s2b" (default, Open5GS SMF) or
+# "s5s8" (emulate collapsed MME+SGW toward a yate-UCN PGW).
+ENV EPDG_GTPC_MODE="s2b"
 
 # Diameter SWm toward AAA Server via DRA
 ENV DRA_HOST="dra-diameter"

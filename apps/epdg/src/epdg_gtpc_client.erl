@@ -300,7 +300,8 @@ send_create_session(Params, From,
         serving_network => SN,
         ambr_ul_kbps  => AmbrUl,
         ambr_dl_kbps  => AmbrDl,
-        ebi           => EBI
+        ebi           => EBI,
+        mode          => epdg_config:get(gtpc_mode, s2b)
     }),
 
     deliver_and_pend(Msg, create_session, Params, Seq, Epoch, From, State).

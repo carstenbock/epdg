@@ -57,6 +57,12 @@
 -define(IFACE_S2B_PGW_GTPC,   32).
 -define(IFACE_S2B_PGW_GTPU,   33).
 
+%% TS 29.274 §8.22 — S5/S8 interface types (MME/SGW-emulation mode)
+-define(IFACE_S5S8_SGW_GTPC,   6).
+-define(IFACE_S5S8_SGW_GTPU,   4).
+-define(IFACE_S5S8_PGW_GTPC,   7).
+-define(IFACE_S5S8_PGW_GTPU,   5).
+
 %%====================================================================
 %% Encode — Create-Session-Request
 %%====================================================================
@@ -79,21 +85,40 @@ encode_create_session_request(#{seq_num := Seq,
     LocalUTeid = maps:get(local_u_teid, Params, 0),
     LocalUIP = maps:get(local_u_ip, Params, LIP),
     PdnType  = maps:get(pdn_type, Params, 1), %% 1=IPv4 2=IPv6 3=IPv4v6
+    Mode     = maps:get(mode, Params, s2b),
+    {CIface, UIface, UInst} =
+        case Mode of
+            s5s8 -> {?IFACE_S5S8_SGW_GTPC, ?IFACE_S5S8_SGW_GTPU, 2};
+            _    -> {?IFACE_S2B_EPDG_GTPC, ?IFACE_S2B_EPDG_GTPU, 5}
+        end,
+    %% s5s8 dialect is always E-UTRAN (RAT=6, TS 29.274 §8.17).
+    %% Force it here — the codec owns mode→dialect mapping — so callers
+    %% (incl. the FSM which hardcodes rat_type => 3) are always correct.
+    %% s2b uses whatever rat_type the caller supplies (default 3 = WLAN).
+    ActualRAT = case Mode of
+        s5s8 -> 6;
+        _    -> RAT
+    end,
 
     IEs = lists:flatten([
         ie_opt(IMSI /= <<>>,    encode_ie(?IE_IMSI, encode_tbcd(IMSI))),
         ie_opt(MSISDN /= <<>>,  encode_ie(?IE_MSISDN, encode_tbcd(MSISDN))),
         ie_opt(MEI /= <<>>,     encode_ie(?IE_MEI, encode_tbcd(MEI))),
-        encode_ie(?IE_RAT_TYPE, <<RAT:8>>),
+        encode_ie(?IE_RAT_TYPE, <<ActualRAT:8>>),
         encode_serving_network_ie(SN),
-        encode_fteid_ie(0, ?IFACE_S2B_EPDG_GTPC, LocalCTeid, LIP),
+        encode_fteid_ie(0, CIface, LocalCTeid, LIP),
         encode_ie(?IE_APN, encode_apn_labels(APN)),
         encode_ie(?IE_SELECTION_MODE, <<0:8>>),
         encode_ie(?IE_PDN_TYPE, <<0:5, PdnType:3>>),
         encode_paa_ie(PdnType),
         encode_apn_ambr_ie(AmbrUl, AmbrDl),
         encode_pco_request_ie(),
-        encode_bearer_context_req_ie(EBI, LocalUTeid, LocalUIP),
+        encode_bearer_context_req_ie(EBI, LocalUTeid, LocalUIP, UIface, UInst),
+        case Mode of
+            s5s8 when SN =/= undefined ->
+                encode_uli_ie(SN, maps:get(eci, Params, 0));
+            _ -> <<>>
+        end,
         case UeTZ of
             undefined -> <<>>;
             _         -> encode_ie(?IE_UE_TIME_ZONE, UeTZ)
@@ -163,8 +188,8 @@ decode_header(_) ->
 %% Returns a map with the fields the ePDG needs to bring up the tunnel:
 %%   cause           - numeric cause value (16 = Request accepted)
 %%   paa             - {pdn_type, Addr}
-%%   pgw_c_fteid     - {Iface, TEID, IP} from top-level F-TEID (iface 32)
-%%   pgw_u_fteid     - {Iface, TEID, IP} from Bearer Context F-TEID (iface 33)
+%%   pgw_c_fteid     - {Iface, TEID, IP} from top-level F-TEID (iface 32 S2b, or 7 S5/S8)
+%%   pgw_u_fteid     - {Iface, TEID, IP} from Bearer Context F-TEID (iface 33 S2b, or 5 S5/S8)
 %%   pco             - map with optional pcscf_v4, dns_v4, pcscf_v6, dns_v6
 %%   ebi             - EBS-Bearer-Identity from Bearer Context
 %%   charging_id     - integer (optional)
@@ -187,7 +212,7 @@ extract_csr_ie({recovery, <<R:8>>}, Acc)         -> Acc#{recovery => R};
 extract_csr_ie({paa, PaaBin}, Acc)              -> Acc#{paa => decode_paa(PaaBin)};
 extract_csr_ie({fteid, FBin}, Acc) ->
     case decode_fteid(FBin) of
-        #{iface := 32} = F -> Acc#{pgw_c_fteid => F};
+        #{iface := I} = F when I =:= 32; I =:= 7 -> Acc#{pgw_c_fteid => F};
         _ -> Acc
     end;
 extract_csr_ie({bearer_context, BCBin}, Acc) ->
@@ -203,8 +228,8 @@ extract_csr_ie({bearer_context, BCBin}, Acc) ->
     PgwUF = case lists:keyfind(fteid, 1, Inner) of
         {fteid, FBin} ->
             case decode_fteid(FBin) of
-                #{iface := 33} = F -> F;
-                _                  -> undefined
+                #{iface := Iface} = F when Iface =:= 33; Iface =:= 5 -> F;
+                _                                                      -> undefined
             end;
         _ -> undefined
     end,
@@ -302,18 +327,24 @@ encode_plmn(<<M1,M2,M3>>, MNC) ->
 
 c2n(C) when C >= $0, C =< $9 -> C - $0.
 
-%% Bearer Context IE (93) — grouped, contains EBI + Bearer QoS
-%% + ePDG S2b-U F-TEID (iface 31).
+%% ULI (86) — TS 29.274 §8.21.
+%% Flags octet selects which location fields follow.
+%% Bit 4 (0x10) = ECGI present; ECGI = PLMN(3 octets) + ECI(28-bit, 4 octets).
+encode_uli_ie({MCC, MNC}, ECI) ->
+    Plmn = encode_plmn(MCC, MNC),
+    encode_ie(?IE_ULI, <<2#00010000:8, Plmn/binary, ECI:32>>).
+
+%% Bearer Context IE (93) — grouped, contains EBI + Bearer QoS + user-plane F-TEID.
 %%
 %% F-TEID Instance inside the Bearer Context on a CSR is per
-%% TS 29.274 Table 7.2.1-3: for RAT=WLAN / S2b the "S2b-U ePDG F-TEID"
-%% row is Instance 5 (Open5GS SMF looks it up as
-%% `bearer_contexts_to_be_created[0].s2b_u_epdg_f_teid_5.presence`).
-%% Using any other instance makes the PGW-C reject the request with
-%% "No S2b ePDG GTP-U TEID" / cause=70 (Mandatory IE Missing).
-encode_bearer_context_req_ie(EBI, LocalUTeid, LIP) ->
+%% TS 29.274 Table 7.2.1-2/3:
+%%   S2b (RAT=WLAN):  iface 31 (S2b-U ePDG), instance 5
+%%   S5/S8 (E-UTRAN): iface 4  (S5/S8 SGW GTP-U), instance 2
+%% The caller selects UIface and UInst via the mode switch in
+%% encode_create_session_request/1.
+encode_bearer_context_req_ie(EBI, LocalUTeid, LIP, UIface, UInst) ->
     EBIBin  = encode_ie(?IE_EBI, <<0:4, EBI:4>>),
-    FTeid   = encode_fteid_ie(5, ?IFACE_S2B_EPDG_GTPU, LocalUTeid, LIP),
+    FTeid   = encode_fteid_ie(UInst, UIface, LocalUTeid, LIP),
     %% TS 29.274 §8.15 Bearer QoS: PCI(1)|PL(4)|PVI(1) | Label(8) |
     %% MBR UL(40) | MBR DL(40) | GBR UL(40) | GBR DL(40)
     QoS = <<0:1, 15:4, 0:1, 0:2,  %% reserved bits around ARP

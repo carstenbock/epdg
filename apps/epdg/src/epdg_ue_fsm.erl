@@ -1685,7 +1685,7 @@ decode_ts_body(Body) ->
 %% Prefer stashed TSi/TSr from the first IKE_AUTH; fall back to the
 %% current inner payloads only if both are missing (e.g. non-EAP UE that
 %% sent TS alongside AUTH).
-extract_ts_stashed_or(#data{tsi_body = TsiB, tsr_body = TsrB}, InnerPayloads)
+extract_ts_stashed_or(#data{tsi_body = TsiB, tsr_body = TsrB}, _InnerPayloads)
   when TsiB =/= undefined orelse TsrB =/= undefined ->
     {decode_ts_body(TsiB), decode_ts_body(TsrB)};
 extract_ts_stashed_or(_Data, InnerPayloads) ->

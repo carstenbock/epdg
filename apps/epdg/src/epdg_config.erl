@@ -4,7 +4,7 @@
 %%%-------------------------------------------------------------------
 -module(epdg_config).
 
--export([init/0, get/1, get/2]).
+-export([init/0, get/1, get/2, parse_gtpc_mode/1]).
 
 -define(APP, epdg).
 
@@ -67,6 +67,8 @@ init() ->
     set_from_env_int("EPDG_GTPC_PENDING_LIMIT", gtpc_pending_limit, 16),
     set_from_env_int("EPDG_DNS_MIN_TTL_SEC", dns_min_ttl_sec, 5),
     set_from_env_int("EPDG_DNS_MAX_TTL_SEC", dns_max_ttl_sec, 60),
+    application:set_env(?APP, gtpc_mode,
+                        parse_gtpc_mode(os:getenv("EPDG_GTPC_MODE"))),
 
     %% Diameter SWm (toward AAA Server via DRA)
     %% DRA_HOSTS takes precedence (comma-separated); falls back to DRA_HOST
@@ -153,6 +155,11 @@ get(Key) ->
 -spec get(atom(), term()) -> term().
 get(Key, Default) ->
     application:get_env(?APP, Key, Default).
+
+-spec parse_gtpc_mode(string() | binary() | false) -> s2b | s5s8.
+parse_gtpc_mode("s5s8")    -> s5s8;
+parse_gtpc_mode(<<"s5s8">>) -> s5s8;
+parse_gtpc_mode(_)          -> s2b.
 
 %%====================================================================
 %% Internal
