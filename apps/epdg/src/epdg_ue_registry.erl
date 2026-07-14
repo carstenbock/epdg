@@ -10,6 +10,7 @@
 -export([start_link/0,
          register/3, unregister/1,
          register_initiator/3, lookup_by_initiator/2, unregister_initiator/2,
+         register_cteid/2, lookup_by_cteid/1, unregister_cteid/1,
          lookup_by_spi/1, lookup_by_imsi/1,
          count/0, all/0, broadcast/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -19,6 +20,7 @@
 -define(TAB_SPI,  epdg_spi_tab).
 -define(TAB_IMSI, epdg_imsi_tab).
 -define(TAB_INIT, epdg_initiator_tab).  %% {PeerIP, ISPI} -> Pid (dedup IKE_SA_INIT retransmits)
+-define(TAB_CTEID, epdg_cteid_tab).     %% ePDG local S2b-C TEID -> Pid (route PGW-initiated bearer msgs)
 
 %%====================================================================
 %% API
@@ -57,6 +59,33 @@ lookup_by_initiator(PeerIP, ISPI) ->
 -spec unregister_initiator(inet:ip_address(), non_neg_integer()) -> ok.
 unregister_initiator(PeerIP, ISPI) ->
     ets:delete(?TAB_INIT, {PeerIP, ISPI}),
+    ok.
+
+%% Map the ePDG's local S2b-C TEID (advertised to the PGW in the Create
+%% Session Request Sender F-TEID) to the owning UE FSM, so PGW-initiated
+%% Create/Update/Delete Bearer Requests — addressed to that TEID in the
+%% GTPv2 header — can be routed to the right session.
+-spec register_cteid(non_neg_integer(), pid()) -> ok.
+register_cteid(CTEID, Pid) ->
+    ets:insert(?TAB_CTEID, {CTEID, Pid}),
+    ok.
+
+-spec lookup_by_cteid(non_neg_integer()) -> {ok, pid()} | error.
+lookup_by_cteid(CTEID) ->
+    case ets:lookup(?TAB_CTEID, CTEID) of
+        [{_, Pid}] ->
+            case is_process_alive(Pid) of
+                true  -> {ok, Pid};
+                false ->
+                    ets:delete(?TAB_CTEID, CTEID),
+                    error
+            end;
+        [] -> error
+    end.
+
+-spec unregister_cteid(non_neg_integer()) -> ok.
+unregister_cteid(CTEID) ->
+    ets:delete(?TAB_CTEID, CTEID),
     ok.
 
 -spec lookup_by_spi(non_neg_integer()) -> {ok, pid()} | error.
@@ -107,6 +136,8 @@ init([]) ->
     ets:new(?TAB_IMSI, [named_table, public, set, {read_concurrency, true}]),
     ets:new(?TAB_INIT, [named_table, public, set, {read_concurrency, true},
                         {write_concurrency, true}]),
+    ets:new(?TAB_CTEID, [named_table, public, set, {read_concurrency, true},
+                         {write_concurrency, true}]),
     {ok, #{}}.
 
 handle_call({register, SPI, Pid, IMSI}, _From, State) ->
@@ -131,6 +162,9 @@ handle_cast(_Msg, State) ->
     {noreply, State}.
 
 handle_info({'DOWN', _MRef, process, Pid, _Reason}, State) ->
+    %% Purge any C-TEID route for the dead FSM (safety net; the FSM also
+    %% unregisters explicitly in terminate/3).
+    ets:match_delete(?TAB_CTEID, {'_', Pid}),
     case maps:find(Pid, State) of
         {ok, SPI} ->
             do_unregister(SPI, State),

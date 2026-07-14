@@ -80,3 +80,100 @@ csr_response_decodes_s5s8_pgw_fteids_test() ->
     R = epdg_gtpc_codec:decode_create_session_response(Decoded),
     ?assertMatch(#{iface := 7}, maps:get(pgw_c_fteid, R)),
     ?assertMatch(#{iface := 5}, maps:get(pgw_u_fteid, R)).
+
+%%====================================================================
+%% Dedicated bearer signalling (TS 29.274 §7.2.3-§7.2.10)
+%%====================================================================
+
+%% A minimal but valid "create new TFT" with one uplink UDP filter.
+sample_tft() ->
+    Contents = <<16#30:8, 17:8>>,
+    Filter = <<0:2, 2:2, 1:4, 0:8, (byte_size(Contents)):8, Contents/binary>>,
+    <<2#001:3, 0:1, 1:4, Filter/binary>>.
+
+ie(Type, Value) ->
+    <<Type:8, (byte_size(Value)):16, 0:8, Value/binary>>.
+
+%% Build a Create Bearer Request (type 95): header TEID = ePDG S2b-C TEID,
+%% top-level LBI (EBI 5), one Bearer Context {Bearer QoS, TFT, PGW-U F-TEID,
+%% Charging Id}. `PgwUIface' is 33 for s2b, 5 for the s5s8 emulation.
+create_bearer_request(PgwUIface) ->
+    LBI  = ie(73, <<5:8>>),
+    QoS  = ie(80, <<0:8, 1:8>>),
+    Tft  = ie(84, sample_tft()),
+    PgwF = fteid_ie(2, PgwUIface, 16#CAFEBABE, {10,0,0,9}),
+    ChId = ie(94, <<16#00000007:32>>),
+    BCInner = <<QoS/binary, Tft/binary, PgwF/binary, ChId/binary>>,
+    BC   = ie(93, BCInner),
+    Body = <<LBI/binary, BC/binary>>,
+    <<2:3, 0:1, 1:1, 0:3, 95:8, (8 + byte_size(Body)):16,
+      16#11111111:32, 42:24, 0:8, Body/binary>>.
+
+create_bearer_request_decode_s2b_test() ->
+    {ok, Decoded} = epdg_gtpc_codec:decode_header(create_bearer_request(33)),
+    R = epdg_gtpc_codec:decode_create_bearer_request(Decoded),
+    ?assertEqual(42, maps:get(seq_num, R)),
+    ?assertEqual(16#11111111, maps:get(local_c_teid, R)),
+    ?assertEqual(5, maps:get(lbi, R)),
+    [BC] = maps:get(bearer_contexts, R),
+    ?assertMatch(#{teid := 16#CAFEBABE, ip := {10,0,0,9}},
+                 maps:get(pgw_u_fteid, BC)),
+    ?assertEqual(7, maps:get(charging_id, BC)),
+    ?assert(is_binary(maps:get(tft, BC))).
+
+create_bearer_request_decode_s5s8_test() ->
+    %% s5s8 emulation: the PGW's user-plane F-TEID uses the S5/S8-U interface (5).
+    {ok, Decoded} = epdg_gtpc_codec:decode_header(create_bearer_request(5)),
+    R = epdg_gtpc_codec:decode_create_bearer_request(Decoded),
+    [BC] = maps:get(bearer_contexts, R),
+    ?assertMatch(#{iface := 5, teid := 16#CAFEBABE}, maps:get(pgw_u_fteid, BC)).
+
+create_bearer_response_encode_s2b_test() ->
+    Bin = epdg_gtpc_codec:encode_create_bearer_response(
+            #{seq_num => 42, teid => 16#AAAAAAAA, mode => s2b,
+              bearers => [#{ebi => 6, u_teid => 16#22222222,
+                            u_ip => {10,0,0,1}}]}),
+    {ok, D} = epdg_gtpc_codec:decode_header(Bin),
+    ?assertEqual(96, maps:get(type, D)),
+    ?assertEqual(42, maps:get(seq_num, D)),
+    ?assertEqual(16#AAAAAAAA, maps:get(teid, D)),
+    %% ePDG advertises its S2b-U F-TEID: iface 31, instance 5.
+    ?assertNotEqual(nomatch,
+        binary:match(Bin, fteid_ie(5, 31, 16#22222222, {10,0,0,1}))).
+
+create_bearer_response_encode_s5s8_test() ->
+    Bin = epdg_gtpc_codec:encode_create_bearer_response(
+            #{seq_num => 42, teid => 16#AAAAAAAA, mode => s5s8,
+              bearers => [#{ebi => 6, u_teid => 16#22222222,
+                            u_ip => {10,0,0,1}}]}),
+    %% s5s8 emulation advertises the SGW S5/S8-U F-TEID: iface 4, instance 2.
+    ?assertNotEqual(nomatch,
+        binary:match(Bin, fteid_ie(2, 4, 16#22222222, {10,0,0,1}))).
+
+update_bearer_response_encode_test() ->
+    Bin = epdg_gtpc_codec:encode_update_bearer_response(
+            #{seq_num => 7, teid => 16#AAAAAAAA,
+              bearers => [#{ebi => 6}]}),
+    {ok, D} = epdg_gtpc_codec:decode_header(Bin),
+    ?assertEqual(98, maps:get(type, D)),
+    ?assertEqual(7, maps:get(seq_num, D)),
+    %% top-level Cause 16 (Request accepted).
+    ?assertNotEqual(nomatch, binary:match(Bin, <<2:8, 2:16, 0:8, 16:8, 0:8>>)).
+
+delete_bearer_response_encode_test() ->
+    Bin = epdg_gtpc_codec:encode_delete_bearer_response(
+            #{seq_num => 9, teid => 16#AAAAAAAA,
+              bearers => [#{ebi => 6}]}),
+    {ok, D} = epdg_gtpc_codec:decode_header(Bin),
+    ?assertEqual(100, maps:get(type, D)),
+    ?assertEqual(9, maps:get(seq_num, D)).
+
+delete_bearer_request_decode_test() ->
+    %% Delete Bearer Request (type 99) listing one dedicated EBI (6).
+    EBI  = ie(73, <<6:8>>),
+    Hdr  = <<2:3, 0:1, 1:1, 0:3, 99:8, (8 + byte_size(EBI)):16,
+             16#11111111:32, 3:24, 0:8, EBI/binary>>,
+    {ok, Decoded} = epdg_gtpc_codec:decode_header(Hdr),
+    R = epdg_gtpc_codec:decode_delete_bearer_request(Decoded),
+    ?assertEqual(3, maps:get(seq_num, R)),
+    ?assertEqual([6], maps:get(ebis, R)).

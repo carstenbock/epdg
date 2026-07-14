@@ -17,7 +17,14 @@
          encode_echo_response/1,
          decode_header/1,
          decode_create_session_response/1,
-         decode_recovery/1]).
+         decode_recovery/1,
+         %% PGW-initiated dedicated bearer signalling (TS 29.274 §7.2.3-§7.2.10)
+         decode_create_bearer_request/1,
+         decode_update_bearer_request/1,
+         decode_delete_bearer_request/1,
+         encode_create_bearer_response/1,
+         encode_update_bearer_response/1,
+         encode_delete_bearer_response/1]).
 
 %% GTPv2 message types (TS 29.274 §7)
 -define(ECHO_REQ,            1).
@@ -26,6 +33,12 @@
 -define(CREATE_SESSION_RSP,  33).
 -define(DELETE_SESSION_REQ,  36).
 -define(DELETE_SESSION_RSP,  37).
+-define(CREATE_BEARER_REQ,   95).
+-define(CREATE_BEARER_RSP,   96).
+-define(UPDATE_BEARER_REQ,   97).
+-define(UPDATE_BEARER_RSP,   98).
+-define(DELETE_BEARER_REQ,   99).
+-define(DELETE_BEARER_RSP,  100).
 
 %% IE types (TS 29.274 §8)
 -define(IE_IMSI,             1).
@@ -42,11 +55,13 @@
 -define(IE_BEARER_QOS,      80).
 -define(IE_RAT_TYPE,        82).
 -define(IE_SERVING_NET,     83).
+-define(IE_BEARER_TFT,      84).
 -define(IE_ULI,             86).
 -define(IE_FTEID,           87).
 -define(IE_BEARER_CTX,      93).
 -define(IE_CHARGING_ID,     94).
 -define(IE_PDN_TYPE,        99).
+-define(IE_PTI,            100).
 -define(IE_UE_TIME_ZONE,   114).
 -define(IE_APN_RESTRICTION, 127).
 -define(IE_SELECTION_MODE, 128).
@@ -140,6 +155,71 @@ encode_delete_session_request(#{seq_num := Seq, teid := TEID, ebi := EBI}) ->
     IEs = encode_ie(?IE_EBI, <<0:4, EBI:4>>),
     encode_gtpv2_header(?DELETE_SESSION_REQ, TEID, Seq,
                         iolist_to_binary([IEs])).
+
+%%====================================================================
+%% Encode — triggered responses to PGW-initiated bearer requests
+%%
+%%   Create Bearer Response (96) — TS 29.274 §7.2.4
+%%   Update Bearer Response (98) — TS 29.274 §7.2.8
+%%   Delete Bearer Response (100)— TS 29.274 §7.2.10.1
+%%
+%% Each carries the request's Sequence Number and is addressed to the PGW's
+%% control-plane TEID (learned from the Create-Session-Response F-TEID). A
+%% top-level Cause plus a Bearer Context (EBI + per-bearer Cause) per bearer.
+%% The Create Bearer Response additionally advertises the ePDG's user-plane
+%% F-TEID for the newly accepted bearer.
+%%====================================================================
+
+-spec encode_create_bearer_response(map()) -> binary().
+encode_create_bearer_response(#{seq_num := Seq, teid := TEID} = P) ->
+    Mode    = maps:get(mode, P, s2b),
+    Cause   = maps:get(cause, P, 16),
+    Bearers = maps:get(bearers, P, []),
+    {UIface, UInst} = resp_uplane_iface(Mode),
+    BCs = [ begin
+                EBIBin = encode_ie(?IE_EBI, <<0:4, Ebi:4>>),
+                CBin   = encode_cause_ie(16),
+                FBin   = encode_fteid_ie(UInst, UIface, UTeid, UIp),
+                encode_ie(?IE_BEARER_CTX,
+                          iolist_to_binary([EBIBin, CBin, FBin]))
+            end
+          || #{ebi := Ebi, u_teid := UTeid, u_ip := UIp} <- Bearers ],
+    Body = iolist_to_binary([encode_cause_ie(Cause) | BCs]),
+    encode_gtpv2_header(?CREATE_BEARER_RSP, TEID, Seq, Body).
+
+-spec encode_update_bearer_response(map()) -> binary().
+encode_update_bearer_response(#{seq_num := Seq, teid := TEID} = P) ->
+    encode_bearer_ack(?UPDATE_BEARER_RSP, Seq, TEID, P).
+
+-spec encode_delete_bearer_response(map()) -> binary().
+encode_delete_bearer_response(#{seq_num := Seq, teid := TEID} = P) ->
+    encode_bearer_ack(?DELETE_BEARER_RSP, Seq, TEID, P).
+
+%% Update/Delete Bearer Response share the shape: top-level Cause + one Bearer
+%% Context (EBI + Cause) per affected bearer. No F-TEID (the bearer's user-plane
+%% endpoints are unchanged / released).
+encode_bearer_ack(MsgType, Seq, TEID, P) ->
+    Cause   = maps:get(cause, P, 16),
+    Bearers = maps:get(bearers, P, []),
+    BCs = [ encode_ie(?IE_BEARER_CTX,
+              iolist_to_binary([encode_ie(?IE_EBI, <<0:4, Ebi:4>>),
+                                encode_cause_ie(16)]))
+            || #{ebi := Ebi} <- Bearers ],
+    Body = iolist_to_binary([encode_cause_ie(Cause) | BCs]),
+    encode_gtpv2_header(MsgType, TEID, Seq, Body).
+
+%% Responder user-plane F-TEID interface + Bearer-Context instance, mirroring
+%% encode_create_session_request/1: S2b advertises the ePDG S2b-U interface
+%% (31) at instance 5; the S5/S8 emulation advertises the SGW S5/S8-U
+%% interface (4) at instance 2.
+resp_uplane_iface(s5s8) -> {?IFACE_S5S8_SGW_GTPU, 2};
+resp_uplane_iface(_)    -> {?IFACE_S2B_EPDG_GTPU, 5}.
+
+%% Cause IE — TS 29.274 §8.4. Two octets: Cause value + spare/flags octet.
+%% Offending-IE fields (octets 7-8) are only present for specific causes and
+%% are omitted here.
+encode_cause_ie(Cause) ->
+    encode_ie(?IE_CAUSE, <<Cause:8, 0:8>>).
 
 %%====================================================================
 %% Encode — Echo Request / Response (TS 29.274 §7.1)
@@ -242,6 +322,98 @@ extract_csr_ie(_, Acc) -> Acc.
 -spec decode_recovery(binary()) -> non_neg_integer() | undefined.
 decode_recovery(<<R:8>>) -> R;
 decode_recovery(_) -> undefined.
+
+%%====================================================================
+%% Decode — PGW-initiated dedicated bearer requests
+%%
+%%   Create Bearer Request  (95) — TS 29.274 §7.2.3
+%%   Update Bearer Request  (97) — TS 29.274 §7.2.7
+%%   Delete Bearer Request  (99) — TS 29.274 §7.2.9.1
+%%
+%% All three arrive on the ePDG's S2b-C TEID (GTPv2 header TEID field) and
+%% carry the same Sequence Number the triggered response must echo. The
+%% caller (`epdg_gtpc_client`) passes the already header-decoded map
+%% (`#{type, teid, seq_num, ies}`), like decode_create_session_response/1.
+%%====================================================================
+
+-spec decode_create_bearer_request(map()) -> map().
+decode_create_bearer_request(#{seq_num := Seq, teid := TEID, ies := IEs}) ->
+    #{seq_num         => Seq,
+      local_c_teid    => TEID,
+      lbi             => first_ebi(IEs),
+      pti             => first_pti(IEs),
+      bearer_contexts => [decode_bearer_ctx(BC)
+                          || {bearer_context, BC} <- IEs]}.
+
+-spec decode_update_bearer_request(map()) -> map().
+decode_update_bearer_request(#{seq_num := Seq, teid := TEID, ies := IEs}) ->
+    #{seq_num         => Seq,
+      local_c_teid    => TEID,
+      pti             => first_pti(IEs),
+      bearer_contexts => [decode_bearer_ctx(BC)
+                          || {bearer_context, BC} <- IEs]}.
+
+-spec decode_delete_bearer_request(map()) -> map().
+decode_delete_bearer_request(#{seq_num := Seq, teid := TEID, ies := IEs}) ->
+    %% The Delete Bearer Request carries either the Linked EPS Bearer ID (LBI,
+    %% releasing the default bearer and thus the whole PDN connection) or a list
+    %% of dedicated EPS Bearer IDs. decode_ies/1 does not retain the IE Instance
+    %% that formally distinguishes the two, so we return every EBI present (top
+    %% level plus any inside Bearer Contexts) and let the FSM decide: if the
+    %% default (linked) bearer EBI is in the set it is a full PDN release,
+    %% otherwise the listed dedicated bearers are removed.
+    EbisTop = [E || {ebi, <<_:4, E:4>>} <- IEs],
+    EbisBC  = lists:flatten(
+                [ [Eb || {ebi, <<_:4, Eb:4>>} <- decode_ies(BC)]
+                  || {bearer_context, BC} <- IEs ]),
+    #{seq_num      => Seq,
+      local_c_teid => TEID,
+      pti          => first_pti(IEs),
+      ebis         => lists:usort(EbisTop ++ EbisBC)}.
+
+%% Decode a Bearer Context grouped IE from a request. `ebi` is `undefined` in a
+%% Create Bearer Request (the ePDG assigns it) but present in Update Bearer.
+decode_bearer_ctx(BCBin) ->
+    Inner = decode_ies(BCBin),
+    #{ebi         => first_ebi(Inner),
+      tft         => kf_bin(bearer_tft, Inner),
+      bearer_qos  => kf_bin(bearer_qos, Inner),
+      charging_id => case lists:keyfind(charging_id, 1, Inner) of
+                        {charging_id, <<I:32>>} -> I;
+                        _                        -> undefined
+                     end,
+      pgw_u_fteid => bc_pgw_u_fteid(Inner)}.
+
+first_ebi(IEs) ->
+    case lists:keyfind(ebi, 1, IEs) of
+        {ebi, <<_:4, E:4>>} -> E;
+        _                   -> undefined
+    end.
+
+first_pti(IEs) ->
+    case lists:keyfind(pti, 1, IEs) of
+        {pti, <<P:8>>} -> P;
+        _              -> undefined
+    end.
+
+kf_bin(Key, IEs) ->
+    case lists:keyfind(Key, 1, IEs) of
+        {Key, V} -> V;
+        _        -> undefined
+    end.
+
+%% Pick the PGW's user-plane F-TEID from a Bearer Context: prefer the S2b-U
+%% PGW GTP-U interface (33) or the S5/S8-U PGW GTP-U interface (5); fall back
+%% to the first F-TEID present.
+bc_pgw_u_fteid(Inner) ->
+    Fs = [decode_fteid(F) || {fteid, F} <- Inner],
+    case [F || #{iface := I} = F <- Fs, I =:= 33 orelse I =:= 5] of
+        [F | _] -> F;
+        []      -> case Fs of
+                       [F0 | _] -> F0;
+                       []       -> undefined
+                   end
+    end.
 
 %%====================================================================
 %% Header builders
@@ -497,6 +669,8 @@ ie_type_atom(?IE_BEARER_CTX)    -> bearer_context;
 ie_type_atom(?IE_BEARER_QOS)    -> bearer_qos;
 ie_type_atom(?IE_PAA)           -> paa;
 ie_type_atom(?IE_PCO)           -> pco;
+ie_type_atom(?IE_BEARER_TFT)    -> bearer_tft;
+ie_type_atom(?IE_PTI)           -> pti;
 ie_type_atom(?IE_EBI)           -> ebi;
 ie_type_atom(?IE_MEI)           -> mei;
 ie_type_atom(?IE_MSISDN)        -> msisdn;

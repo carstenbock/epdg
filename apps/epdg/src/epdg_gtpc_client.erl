@@ -25,6 +25,7 @@
 
 -export([start_link/0,
          create_session_request/1, delete_session_request/1,
+         send_bearer_response/1,
          peer_status/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
@@ -91,6 +92,15 @@ create_session_request(Params) ->
 -spec delete_session_request(map()) -> {ok, map()} | {error, term()}.
 delete_session_request(Params) ->
     gen_server:call(?SERVER, {delete_session, Params}, 30000).
+
+%% Send a triggered response to a PGW-initiated bearer request. Called by the
+%% owning UE FSM once it has (un)installed the dedicated bearer's data-plane
+%% state. `Resp' carries `kind' (create|update|delete), `seq_num', `teid' (the
+%% PGW's control-plane TEID), and per-bearer details. The client fills in its
+%% own advertised user-plane IP + GTP-C mode and emits the encoded response.
+-spec send_bearer_response(map()) -> ok.
+send_bearer_response(Resp) ->
+    gen_server:cast(?SERVER, {send_bearer_response, Resp}).
 
 -spec peer_status() -> map().
 peer_status() ->
@@ -184,6 +194,8 @@ handle_call(_Req, _From, State) ->
 %% handle_cast / handle_info
 %%--------------------------------------------------------------------
 
+handle_cast({send_bearer_response, Resp}, State) ->
+    {noreply, do_send_bearer_response(Resp, State)};
 handle_cast(_, State) -> {noreply, State}.
 
 handle_info({udp, _Sock, _FromIP, _FromPort, Data}, State) ->
@@ -500,7 +512,72 @@ dispatch_gtpc_msg(#{type := 33, seq_num := Seq} = Msg, State) ->
     deliver_response(Seq, Msg, State, create_session);
 dispatch_gtpc_msg(#{type := 37, seq_num := Seq} = Msg, State) ->
     deliver_response(Seq, Msg, State, delete_session);
+%% PGW-initiated dedicated bearer signalling (TS 29.274 §7.2.3/§7.2.7/§7.2.9.1).
+%% Routed to the owning UE FSM by the request's header TEID (= the ePDG's local
+%% S2b-C TEID); an unknown TEID is answered with "Context Not Found" so the PGW
+%% stops retransmitting instead of timing out.
+dispatch_gtpc_msg(#{type := 95} = Msg, State) ->
+    route_bearer_request(create, Msg, State);
+dispatch_gtpc_msg(#{type := 97} = Msg, State) ->
+    route_bearer_request(update, Msg, State);
+dispatch_gtpc_msg(#{type := 99} = Msg, State) ->
+    route_bearer_request(delete, Msg, State);
 dispatch_gtpc_msg(_Other, State) -> State.
+
+route_bearer_request(Kind, #{teid := CTEID, seq_num := Seq} = Msg, State) ->
+    epdg_metrics:inc(bearer_req_metric(Kind)),
+    case epdg_ue_registry:lookup_by_cteid(CTEID) of
+        {ok, Pid} ->
+            Decoded = decode_bearer_request(Kind, Msg),
+            gen_statem:cast(Pid, {gtpc_bearer_request, Kind, Decoded}),
+            State;
+        error ->
+            logger:warning("GTP-C: ~p bearer request for unknown C-TEID ~p "
+                           "— replying Context Not Found", [Kind, CTEID]),
+            epdg_metrics:inc(gtpc_bearer_no_context_total),
+            Bin = encode_bearer_response(
+                    Kind, #{seq_num => Seq, teid => 0, cause => 64,
+                            bearers => []}),
+            catch resolve_and_send(Bin, State),
+            State
+    end.
+
+decode_bearer_request(create, Msg) ->
+    epdg_gtpc_codec:decode_create_bearer_request(Msg);
+decode_bearer_request(update, Msg) ->
+    epdg_gtpc_codec:decode_update_bearer_request(Msg);
+decode_bearer_request(delete, Msg) ->
+    epdg_gtpc_codec:decode_delete_bearer_request(Msg).
+
+bearer_req_metric(create) -> gtpc_create_bearer_req_total;
+bearer_req_metric(update) -> gtpc_update_bearer_req_total;
+bearer_req_metric(delete) -> gtpc_delete_bearer_req_total.
+
+%% Encode + emit a bearer response to the PGW. For a Create Bearer Response the
+%% ePDG advertises its own user-plane F-TEID, whose IP is the client's
+%% advertised GTP-U address (the FSM only knows the TEID it allocated).
+do_send_bearer_response(#{kind := Kind} = Resp0,
+                        #state{local_u_ip = LUIP} = State) ->
+    Resp = case Kind of
+        create ->
+            Bearers = [B#{u_ip => maps:get(u_ip, B, LUIP)}
+                       || B <- maps:get(bearers, Resp0, [])],
+            Resp0#{bearers => Bearers};
+        _ ->
+            Resp0
+    end,
+    Bin = encode_bearer_response(Kind, Resp),
+    catch resolve_and_send(Bin, State),
+    epdg_metrics:inc(gtpc_bearer_resp_total),
+    State.
+
+encode_bearer_response(create, R) ->
+    Mode = epdg_config:get(gtpc_mode, s2b),
+    epdg_gtpc_codec:encode_create_bearer_response(R#{mode => Mode});
+encode_bearer_response(update, R) ->
+    epdg_gtpc_codec:encode_update_bearer_response(R);
+encode_bearer_response(delete, R) ->
+    epdg_gtpc_codec:encode_delete_bearer_response(R).
 
 resolve_and_send(Bin, #state{socket = S, pgw_port = P} = State) ->
     case resolved_peer_ip(State) of

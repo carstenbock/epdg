@@ -124,6 +124,12 @@
     %% TEID + EBI.
     gtpu_teid_local  :: non_neg_integer() | undefined,
     gtpu_teid_pgw    :: non_neg_integer() | undefined,
+    %% S2b dedicated bearers activated by the PGW via Create Bearer Request
+    %% (TS 23.402 §7.11), keyed by the ePDG-assigned EPS Bearer ID. Each value
+    %% is a map: #{ebi, local_u_teid, pgw_u_teid, pgw_u_ip, tft, filters,
+    %% charging_id}. Dedicated bearers share this UE's single SWu IPsec SA;
+    %% only the S2b user-plane leg is per-bearer.
+    dedicated_bearers = #{} :: #{non_neg_integer() => map()},
     %% RFC 7296 §2.16 (IKE_AUTH with EAP): SAi2 / TSi / TSr are carried in
     %% the *first* IKE_AUTH message (alongside IDi) — the post-EAP-Success
     %% AUTH message only contains AUTH. We cache the raw payload bodies
@@ -248,7 +254,13 @@ terminate(_Reason, _State, #data{responder_spi = RSPI, imsi = IMSI,
     maybe_send_swm_str(SwmSessionId, SwmDestHost, IMSI, UeNai),
     case PGW of
         #{local_u_teid := LocalUTEID} ->
+            %% Also drops this UE's dedicated bearers (they share the TUN).
             catch epdg_gtpu_forwarder:unregister_ue(LocalUTEID);
+        _ -> ok
+    end,
+    case PGW of
+        #{local_c_teid := LocalCTEID} ->
+            catch epdg_ue_registry:unregister_cteid(LocalCTEID);
         _ -> ok
     end,
     catch epdg_ue_registry:unregister(RSPI),
@@ -542,10 +554,155 @@ established({timeout, rr_check}, rr_timeout, Data) ->
     %% Stale timer fired after the check already resolved — ignore.
     {keep_state, Data};
 
+established(cast, {gtpc_bearer_request, Kind, Req}, Data) ->
+    handle_bearer_request(Kind, Req, Data);
+
 established({call, From}, get_state, Data) ->
     {keep_state, Data, [{reply, From, {ok, established}}]};
 established({call, From}, get_info, Data) ->
     {keep_state, Data, [{reply, From, {ok, session_info(established, Data)}}]}.
+
+%%====================================================================
+%% PGW-initiated dedicated bearer handling (TS 23.402 §7.11,
+%% TS 29.274 §7.2.3/§7.2.7/§7.2.9.1)
+%%
+%% Over S2b the ePDG owns EPS Bearer ID assignment and the S2b-U user-plane
+%% endpoint for dedicated bearers. The UE keeps a single SWu IPsec child SA
+%% per PDN connection, so a dedicated bearer only adds an S2b-U GTP-U leg and
+%% an uplink TFT classifier — no IKEv2/IPsec signalling toward the UE.
+%%====================================================================
+
+handle_bearer_request(create, #{seq_num := Seq, bearer_contexts := BCs},
+                      #data{pgw_session = PGW,
+                            dedicated_bearers = Beds,
+                            gtpu_teid_local = DefLocalU,
+                            imsi = IMSI} = Data) ->
+    {NewBeds, RespBearers} =
+        lists:foldl(fun(BC, Acc) -> create_one_bearer(BC, DefLocalU, Acc) end,
+                    {Beds, []}, BCs),
+    logger:info("S2b Create Bearer: IMSI=~p added ~B dedicated bearer(s) ~p",
+                [IMSI, length(RespBearers), [E || #{ebi := E} <- RespBearers]]),
+    epdg_gtpc_client:send_bearer_response(
+        #{kind => create, seq_num => Seq, teid => pgw_c_teid(PGW),
+          bearers => lists:reverse(RespBearers)}),
+    {keep_state, Data#data{dedicated_bearers = NewBeds}};
+
+handle_bearer_request(update, #{seq_num := Seq, bearer_contexts := BCs},
+                      #data{pgw_session = PGW,
+                            dedicated_bearers = Beds,
+                            gtpu_teid_local = DefLocalU} = Data) ->
+    {NewBeds, RespBearers} =
+        lists:foldl(fun(BC, Acc) -> update_one_bearer(BC, DefLocalU, Acc) end,
+                    {Beds, []}, BCs),
+    epdg_gtpc_client:send_bearer_response(
+        #{kind => update, seq_num => Seq, teid => pgw_c_teid(PGW),
+          bearers => lists:reverse(RespBearers)}),
+    {keep_state, Data#data{dedicated_bearers = NewBeds}};
+
+handle_bearer_request(delete, #{seq_num := Seq, ebis := Ebis},
+                      #data{pgw_session = PGW,
+                            dedicated_bearers = Beds,
+                            imsi = IMSI} = Data) ->
+    PgwCTeid = pgw_c_teid(PGW),
+    %% The default (linked) bearer EBI echoed by the PGW in the Create Session
+    %% Response; 5 is the standard default-bearer EBI when absent.
+    DefaultEbi = maps:get(ebi, PGW, 5),
+    RespBearers = [#{ebi => E} || E <- Ebis],
+    case lists:member(DefaultEbi, Ebis) of
+        true ->
+            %% Deleting the linked (default) bearer releases the whole PDN
+            %% connection (TS 29.274 §7.2.9.1). Acknowledge, then tear down.
+            logger:info("S2b Delete Bearer (linked EBI ~p): IMSI=~p releasing "
+                        "PDN connection", [DefaultEbi, IMSI]),
+            epdg_gtpc_client:send_bearer_response(
+                #{kind => delete, seq_num => Seq, teid => PgwCTeid,
+                  bearers => RespBearers}),
+            {stop, {shutdown, pgw_bearer_delete}, Data};
+        false ->
+            NewBeds = lists:foldl(fun release_one_bearer/2, Beds, Ebis),
+            logger:info("S2b Delete Bearer: IMSI=~p removed dedicated bearer(s) "
+                        "~p", [IMSI, Ebis]),
+            epdg_gtpc_client:send_bearer_response(
+                #{kind => delete, seq_num => Seq, teid => PgwCTeid,
+                  bearers => RespBearers}),
+            {keep_state, Data#data{dedicated_bearers = NewBeds}}
+    end.
+
+%% Create a single dedicated bearer: assign an EBI, allocate the ePDG S2b-U
+%% TEID, install the forwarder classifier, and accumulate the response context.
+create_one_bearer(BC, DefLocalU, {BAcc, RAcc}) ->
+    Ebi     = assign_ebi(BC, BAcc),
+    LocalU  = new_teid(),
+    {PgwUTeid, PgwUIp} = pgw_u_fteid_parts(maps:get(pgw_u_fteid, BC, undefined)),
+    Tft     = maps:get(tft, BC, undefined),
+    Filters = epdg_tft:parse(Tft),
+    catch epdg_gtpu_forwarder:register_bearer(
+            #{default_teid => DefLocalU, local_teid => LocalU,
+              pgw_u_teid => PgwUTeid, pgw_u_ip => PgwUIp, filters => Filters}),
+    Bearer = #{ebi => Ebi, local_u_teid => LocalU,
+               pgw_u_teid => PgwUTeid, pgw_u_ip => PgwUIp,
+               tft => Tft, filters => Filters,
+               charging_id => maps:get(charging_id, BC, undefined)},
+    {BAcc#{Ebi => Bearer}, [#{ebi => Ebi, u_teid => LocalU} | RAcc]}.
+
+%% Update a single dedicated bearer's TFT (re-pointing the uplink classifier).
+%% An unknown EBI is still acknowledged so the PGW's procedure completes.
+update_one_bearer(#{ebi := Ebi} = BC, DefLocalU, {BAcc, RAcc})
+  when is_integer(Ebi) ->
+    case maps:find(Ebi, BAcc) of
+        {ok, Bearer} ->
+            {NewTft, NewFilters} =
+                case maps:get(tft, BC, undefined) of
+                    undefined ->
+                        {maps:get(tft, Bearer, undefined),
+                         maps:get(filters, Bearer, [])};
+                    Tft ->
+                        {Tft, epdg_tft:parse(Tft)}
+                end,
+            catch epdg_gtpu_forwarder:register_bearer(
+                    #{default_teid => DefLocalU,
+                      local_teid   => maps:get(local_u_teid, Bearer),
+                      pgw_u_teid   => maps:get(pgw_u_teid, Bearer),
+                      pgw_u_ip     => maps:get(pgw_u_ip, Bearer),
+                      filters      => NewFilters}),
+            Bearer1 = Bearer#{tft => NewTft, filters => NewFilters},
+            {BAcc#{Ebi => Bearer1}, [#{ebi => Ebi} | RAcc]};
+        error ->
+            {BAcc, [#{ebi => Ebi} | RAcc]}
+    end;
+update_one_bearer(_BC, _DefLocalU, Acc) ->
+    Acc.
+
+release_one_bearer(Ebi, BAcc) ->
+    case maps:take(Ebi, BAcc) of
+        {Bearer, BAcc1} ->
+            catch epdg_gtpu_forwarder:unregister_bearer(
+                    maps:get(local_u_teid, Bearer)),
+            BAcc1;
+        error ->
+            BAcc
+    end.
+
+%% EPS Bearer ID for a new dedicated bearer. The PGW does not assign it over
+%% S2b, so the ePDG allocates the next free dedicated EBI (6..15); if a peer
+%% did include one, honour it.
+assign_ebi(#{ebi := E}, _BAcc) when is_integer(E), E >= 6, E =< 15 -> E;
+assign_ebi(_BC, BAcc) ->
+    Used = maps:keys(BAcc),
+    next_free_ebi(lists:seq(6, 15), Used).
+
+next_free_ebi([], _Used) -> 15;   %% pool exhausted (defensive)
+next_free_ebi([E | T], Used) ->
+    case lists:member(E, Used) of
+        true  -> next_free_ebi(T, Used);
+        false -> E
+    end.
+
+pgw_c_teid(#{pgw_c_fteid := #{teid := T}}) when is_integer(T) -> T;
+pgw_c_teid(_) -> 0.
+
+pgw_u_fteid_parts(#{teid := T, ip := IP}) when is_integer(T) -> {T, IP};
+pgw_u_fteid_parts(_) -> {0, {0, 0, 0, 0}}.
 
 %%====================================================================
 %% IKE_SA_INIT handler
@@ -1491,6 +1648,11 @@ finalize_ike_auth_setup(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
         imsi         => Data0#data.imsi,
         owner_pid    => self(),
         local_teid_hint => LocalUTeid}),
+
+    %% Route PGW-initiated dedicated bearer requests (Create/Update/Delete
+    %% Bearer) to this FSM: they carry the ePDG's local S2b-C TEID in the
+    %% GTPv2 header, which epdg_gtpc_client resolves via this mapping.
+    catch epdg_ue_registry:register_cteid(LocalCTeid, self()),
 
     %% Responder AUTH (MSK-based, method 2 = Shared Key MIC)
     AuthSig = epdg_ikev2_crypto:build_responder_psk_auth(

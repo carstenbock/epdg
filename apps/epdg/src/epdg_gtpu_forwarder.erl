@@ -29,6 +29,7 @@
 
 -export([start_link/0,
          register_ue/1, unregister_ue/1,
+         register_bearer/1, unregister_bearer/1,
          send/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
@@ -50,6 +51,22 @@
     tun_port     :: port() | undefined,
     ue_inner_ip  :: inet:ip_address(),
     ue_inner_ip6 :: inet:ip_address() | undefined,
+    owner_pid    :: pid() | undefined,
+    %% Local TEIDs of this UE's dedicated bearers (S2b dedicated bearer
+    %% activation). They share this UE's TUN/IPsec SA; kept here so the
+    %% uplink classifier can enumerate them and so they are torn down with
+    %% the default bearer.
+    ded_teids    = [] :: [non_neg_integer()]
+}).
+
+%% A dedicated bearer. Shares the owning UE's TUN device (downlink writes go to
+%% `default_teid''s TUN); uplink packets matching `filters' are steered onto
+%% this bearer's PGW-U tunnel instead of the default bearer.
+-record(ded_ent, {
+    default_teid :: non_neg_integer(),
+    pgw_u_teid   :: non_neg_integer(),
+    pgw_u_ip     :: inet:ip_address(),
+    filters      :: [epdg_tft:filter()],
     owner_pid    :: pid() | undefined
 }).
 
@@ -57,8 +74,10 @@
     socket     :: gen_udp:socket() | undefined,
     bind_ip    :: inet:ip_address(),
     bind_port  :: inet:port_number(),
-    %% local_teid -> #ue_ent{}
+    %% local_teid -> #ue_ent{} (default bearers; each owns a TUN)
     by_teid    :: #{non_neg_integer() => #ue_ent{}},
+    %% dedicated local_teid -> #ded_ent{} (share the default bearer's TUN)
+    by_ded     :: #{non_neg_integer() => #ded_ent{}},
     %% pid() -> local_teid for cleanup on owner DOWN
     by_owner   :: #{pid() => non_neg_integer()},
     %% port() -> local_teid so we can route TUN-read packets to their
@@ -94,6 +113,26 @@ register_ue(Params) ->
 unregister_ue(LocalTeid) ->
     gen_server:call(?SERVER, {unregister_ue, LocalTeid}).
 
+%% Register a dedicated bearer for an existing UE (S2b dedicated bearer
+%% activation). The bearer shares the UE's TUN/IPsec SA — no new TUN or routes
+%% are created. Downlink GTP-U arriving on `local_teid' is written to the UE's
+%% shared TUN; uplink packets matching `filters' are steered onto this bearer's
+%% PGW-U tunnel.
+%%
+%% Params:
+%%   default_teid - local TEID of the UE's default bearer (owns the TUN)
+%%   local_teid   - local TEID allocated for this dedicated bearer
+%%   pgw_u_teid   - PGW-U TEID from the Create Bearer Request F-TEID
+%%   pgw_u_ip     - PGW-U IP from the same F-TEID
+%%   filters      - parsed uplink TFT filters (see epdg_tft:parse/1)
+-spec register_bearer(map()) -> ok | {error, term()}.
+register_bearer(Params) ->
+    gen_server:call(?SERVER, {register_bearer, Params}).
+
+-spec unregister_bearer(non_neg_integer()) -> ok.
+unregister_bearer(LocalTeid) ->
+    gen_server:call(?SERVER, {unregister_bearer, LocalTeid}).
+
 %% Send an inner IP packet (no GTP header) to the PGW-U for a specific
 %% UE bearer. Normally this is driven by the TUN reader, but exposing
 %% `send/2` lets the higher-layer code inject crafted test traffic.
@@ -125,6 +164,7 @@ init([]) ->
                         bind_ip = BindIp,
                         bind_port = Port,
                         by_teid = #{},
+                        by_ded = #{},
                         by_owner = #{},
                         by_port = #{},
                         next_teid = 16#1000,
@@ -136,16 +176,16 @@ init([]) ->
                            "forwarder disabled", [BindIp, Port]),
             schedule_gc(),
             {ok, #state{socket = undefined, bind_ip = BindIp,
-                        bind_port = Port, by_teid = #{}, by_owner = #{},
-                        by_port = #{}, next_teid = 16#1000,
+                        bind_port = Port, by_teid = #{}, by_ded = #{},
+                        by_owner = #{}, by_port = #{}, next_teid = 16#1000,
                         last_rx_ts = erlang:system_time(second)}};
         {error, Reason} ->
             logger:warning("GTP-U: bind ~p:~p failed: ~p; forwarder disabled",
                            [BindIp, Port, Reason]),
             schedule_gc(),
             {ok, #state{socket = undefined, bind_ip = BindIp,
-                        bind_port = Port, by_teid = #{}, by_owner = #{},
-                        by_port = #{}, next_teid = 16#1000,
+                        bind_port = Port, by_teid = #{}, by_ded = #{},
+                        by_owner = #{}, by_port = #{}, next_teid = 16#1000,
                         last_rx_ts = erlang:system_time(second)}}
     end.
 
@@ -154,6 +194,11 @@ handle_call({register_ue, Params}, _From, State) ->
     {reply, Reply, NewState};
 handle_call({unregister_ue, LocalTeid}, _From, State) ->
     {reply, ok, do_unregister_teid(LocalTeid, State)};
+handle_call({register_bearer, Params}, _From, State) ->
+    {Reply, NewState} = do_register_bearer(Params, State),
+    {reply, Reply, NewState};
+handle_call({unregister_bearer, LocalTeid}, _From, State) ->
+    {reply, ok, do_unregister_bearer(LocalTeid, State)};
 handle_call(_Req, _From, State) ->
     {reply, {error, unknown}, State}.
 
@@ -163,20 +208,21 @@ handle_cast({pgw_restart, _}, State) ->
     logger:warning("GTP-U: pgw_restart received — flushing all TEID registrations"),
     maps:fold(fun(_, Ent, _) -> close_tun_ent(Ent), ok end,
               ok, State#state.by_teid),
-    {noreply, State#state{by_teid = #{}, by_owner = #{}, by_port = #{}}};
+    epdg_metrics:gauge_set(gtpu_dedicated_bearers_active, 0),
+    {noreply, State#state{by_teid = #{}, by_ded = #{},
+                          by_owner = #{}, by_port = #{}}};
 handle_cast(_Msg, State) -> {noreply, State}.
 
-handle_info({udp, _Sock, _FromIP, _FromPort, Packet},
-            #state{by_teid = Map} = State) ->
+handle_info({udp, _Sock, _FromIP, _FromPort, Packet}, State) ->
     case decode_gtpu(Packet) of
         {ok, Teid, Payload} ->
             epdg_metrics:inc(gtpu_rx_pkts),
             epdg_metrics:inc(gtpu_rx_bytes, byte_size(Payload)),
-            case maps:find(Teid, Map) of
-                {ok, #ue_ent{tun_port = TP}} ->
-                    tun_write(TP, Payload);
-                _ ->
-                    ok
+            %% Downlink for a default OR dedicated bearer both land on the same
+            %% UE TUN (dedicated bearers share the default's IPsec SA).
+            case find_tun_port(Teid, State) of
+                {ok, TP} -> tun_write(TP, Payload);
+                error    -> ok
             end,
             {noreply, State#state{last_rx_ts = erlang:system_time(second)}};
         _ ->
@@ -276,11 +322,20 @@ do_register_ue(#{pgw_u_teid := PgwTeid, pgw_u_ip := PgwIP,
                  by_port = PMap1,
                  next_teid = N + 1}}.
 
-do_unregister_teid(Teid, #state{by_teid = Map, by_owner = Owners,
+do_unregister_teid(Teid, #state{by_teid = Map, by_ded = Ded, by_owner = Owners,
                                  by_port = PMap} = State) ->
     case maps:take(Teid, Map) of
-        {#ue_ent{tun_port = TP, owner_pid = Owner} = Ent, Rest} ->
+        {#ue_ent{tun_port = TP, owner_pid = Owner,
+                 ded_teids = DedTeids} = Ent, Rest} ->
             close_tun_ent(Ent),
+            %% Drop this UE's dedicated bearers along with its default bearer.
+            Ded1 = lists:foldl(fun(DT, Acc) ->
+                       case maps:is_key(DT, Acc) of
+                           true  -> epdg_metrics:gauge_dec(gtpu_dedicated_bearers_active),
+                                    maps:remove(DT, Acc);
+                           false -> Acc
+                       end
+                   end, Ded, DedTeids),
             Owners1 = case Owner of
                 undefined -> Owners;
                 _         -> maps:remove(Owner, Owners)
@@ -289,9 +344,72 @@ do_unregister_teid(Teid, #state{by_teid = Map, by_owner = Owners,
                 true  -> maps:remove(TP, PMap);
                 false -> PMap
             end,
-            State#state{by_teid = Rest, by_owner = Owners1, by_port = PMap1};
+            State#state{by_teid = Rest, by_ded = Ded1,
+                        by_owner = Owners1, by_port = PMap1};
         error ->
             State
+    end.
+
+%%====================================================================
+%% Dedicated bearer registration
+%%====================================================================
+
+do_register_bearer(#{default_teid := DefTeid, local_teid := DedTeid,
+                     pgw_u_teid := PgwTeid, pgw_u_ip := PgwIP} = P,
+                   #state{by_teid = Map, by_ded = Ded} = State) ->
+    case maps:find(DefTeid, Map) of
+        {ok, #ue_ent{owner_pid = Owner, ded_teids = DedTeids} = Ent} ->
+            Filters = maps:get(filters, P, []),
+            DedEnt = #ded_ent{default_teid = DefTeid,
+                              pgw_u_teid   = PgwTeid,
+                              pgw_u_ip     = PgwIP,
+                              filters      = Filters,
+                              owner_pid    = Owner},
+            %% Idempotent on re-registration of the same dedicated TEID.
+            WasKey = maps:is_key(DedTeid, Ded),
+            case WasKey of
+                false -> epdg_metrics:gauge_inc(gtpu_dedicated_bearers_active);
+                true  -> ok
+            end,
+            Ent1 = Ent#ue_ent{ded_teids = lists:usort([DedTeid | DedTeids])},
+            {ok, State#state{by_teid = Map#{DefTeid => Ent1},
+                             by_ded  = Ded#{DedTeid => DedEnt}}};
+        error ->
+            {{error, no_default_bearer}, State}
+    end;
+do_register_bearer(_, State) ->
+    {{error, invalid_params}, State}.
+
+do_unregister_bearer(DedTeid, #state{by_teid = Map, by_ded = Ded} = State) ->
+    case maps:take(DedTeid, Ded) of
+        {#ded_ent{default_teid = DefTeid}, Ded1} ->
+            epdg_metrics:gauge_dec(gtpu_dedicated_bearers_active),
+            Map1 = case maps:find(DefTeid, Map) of
+                {ok, #ue_ent{ded_teids = DedTeids} = Ent} ->
+                    Map#{DefTeid =>
+                         Ent#ue_ent{ded_teids = lists:delete(DedTeid, DedTeids)}};
+                error ->
+                    Map
+            end,
+            State#state{by_teid = Map1, by_ded = Ded1};
+        error ->
+            State
+    end.
+
+%% Resolve the TUN port for a downlink TEID: default bearers own their TUN;
+%% dedicated bearers borrow their owning default bearer's TUN.
+find_tun_port(Teid, #state{by_teid = Map, by_ded = Ded}) ->
+    case maps:find(Teid, Map) of
+        {ok, #ue_ent{tun_port = TP}} -> {ok, TP};
+        error ->
+            case maps:find(Teid, Ded) of
+                {ok, #ded_ent{default_teid = DefTeid}} ->
+                    case maps:find(DefTeid, Map) of
+                        {ok, #ue_ent{tun_port = TP}} -> {ok, TP};
+                        error                        -> error
+                    end;
+                error -> error
+            end
     end.
 
 %%====================================================================
@@ -302,7 +420,13 @@ do_send_inner(_Teid, _Pkt, #state{socket = undefined} = State) -> State;
 do_send_inner(Teid, Pkt,
               #state{socket = Sock, by_teid = Map} = State) ->
     case maps:find(Teid, Map) of
-        {ok, #ue_ent{pgw_u_teid = PgwTeid, pgw_u_ip = PgwIP}} ->
+        {ok, #ue_ent{pgw_u_teid = DefTeid, pgw_u_ip = DefIP,
+                     ded_teids = DedTeids}} ->
+            %% Uplink bearer binding: a packet matching a dedicated bearer's
+            %% uplink TFT rides that bearer's S2b-U tunnel; everything else
+            %% stays on the default bearer.
+            {PgwTeid, PgwIP} =
+                classify_uplink(Pkt, DedTeids, State, {DefTeid, DefIP}),
             Packet = encode_gtpu_tpdu(PgwTeid, Pkt),
             case gen_udp:send(Sock, PgwIP, ?GTPU_PORT, Packet) of
                 ok ->
@@ -314,6 +438,27 @@ do_send_inner(Teid, Pkt,
         error -> ok
     end,
     State.
+
+%% Pick the PGW-U endpoint for an uplink packet: the first dedicated bearer
+%% whose uplink TFT matches, else the default bearer.
+classify_uplink(_Pkt, [], _State, Default) -> Default;
+classify_uplink(Pkt, DedTeids, #state{by_ded = Ded}, Default) ->
+    classify_uplink_1(DedTeids, Pkt, Ded, Default).
+
+classify_uplink_1([], _Pkt, _Ded, Default) -> Default;
+classify_uplink_1([DT | Rest], Pkt, Ded, Default) ->
+    case maps:find(DT, Ded) of
+        {ok, #ded_ent{pgw_u_teid = T, pgw_u_ip = IP, filters = F}} ->
+            case epdg_tft:match(F, Pkt) of
+                true ->
+                    epdg_metrics:inc(gtpu_uplink_dedicated_pkts_total),
+                    {T, IP};
+                false ->
+                    classify_uplink_1(Rest, Pkt, Ded, Default)
+            end;
+        error ->
+            classify_uplink_1(Rest, Pkt, Ded, Default)
+    end.
 
 %%====================================================================
 %% GTP-U codec (T-PDU only)
