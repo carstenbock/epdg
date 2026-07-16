@@ -175,15 +175,31 @@ encode_create_bearer_response(#{seq_num := Seq, teid := TEID} = P) ->
     Mode    = maps:get(mode, P, s2b),
     Cause   = maps:get(cause, P, 16),
     Bearers = maps:get(bearers, P, []),
-    {UIface, UInst} = resp_uplane_iface(Mode),
+    {OwnIface, OwnInst, PgwIface, PgwInst} = resp_uplane_ifaces(Mode),
     BCs = [ begin
+                UTeid    = maps:get(u_teid, B, 0),
+                UIp      = maps:get(u_ip, B, {0,0,0,0}),
+                PgwUTeid = maps:get(pgw_u_teid, B, 0),
+                PgwUIp   = maps:get(pgw_u_ip, B, {0,0,0,0}),
                 EBIBin = encode_ie(?IE_EBI, <<0:4, Ebi:4>>),
                 CBin   = encode_cause_ie(16),
-                FBin   = encode_fteid_ie(UInst, UIface, UTeid, UIp),
+                %% Own user-plane F-TEID: the endpoint the PGW-U sends downlink
+                %% to (S2b-U ePDG instance 8 / S5/S8-U SGW instance 2).
+                OwnF   = encode_fteid_ie(OwnInst, OwnIface, UTeid, UIp),
+                %% Echo the PGW's user-plane F-TEID from the request so the PGW-C
+                %% can bind the response to the pending bearer via
+                %% smf_bearer_find_by_pgw_s5u_teid() (TS 29.274 §7.2.4; mirrors
+                %% the SGW Create Bearer Response Open5GS expects). S2b-U PGW
+                %% instance 9 / S5/S8-U PGW instance 3.
+                PgwF   = case PgwUTeid of
+                             T when is_integer(T), T > 0 ->
+                                 encode_fteid_ie(PgwInst, PgwIface, T, PgwUIp);
+                             _ -> <<>>
+                         end,
                 encode_ie(?IE_BEARER_CTX,
-                          iolist_to_binary([EBIBin, CBin, FBin]))
+                          iolist_to_binary([EBIBin, CBin, OwnF, PgwF]))
             end
-          || #{ebi := Ebi, u_teid := UTeid, u_ip := UIp} <- Bearers ],
+          || #{ebi := Ebi} = B <- Bearers ],
     Body = iolist_to_binary([encode_cause_ie(Cause) | BCs]),
     encode_gtpv2_header(?CREATE_BEARER_RSP, TEID, Seq, Body).
 
@@ -208,12 +224,22 @@ encode_bearer_ack(MsgType, Seq, TEID, P) ->
     Body = iolist_to_binary([encode_cause_ie(Cause) | BCs]),
     encode_gtpv2_header(MsgType, TEID, Seq, Body).
 
-%% Responder user-plane F-TEID interface + Bearer-Context instance, mirroring
-%% encode_create_session_request/1: S2b advertises the ePDG S2b-U interface
-%% (31) at instance 5; the S5/S8 emulation advertises the SGW S5/S8-U
-%% interface (4) at instance 2.
-resp_uplane_iface(s5s8) -> {?IFACE_S5S8_SGW_GTPU, 2};
-resp_uplane_iface(_)    -> {?IFACE_S2B_EPDG_GTPU, 5}.
+%% Responder + echoed-PGW user-plane F-TEID interfaces and Bearer-Context
+%% instances for a Create Bearer Response (TS 29.274 Table 7.2.4-2).
+%%
+%% Unlike the Create Session Request (where the ePDG S2b-U F-TEID lives at
+%% instance 5), the Create Bearer Response bearer context uses DIFFERENT
+%% instances: the responder's own user-plane F-TEID is instance 8 (S2b ePDG)
+%% or 2 (S5/S8 SGW), and the peer PGW's user-plane F-TEID is echoed at
+%% instance 9 (S2b PGW) or 3 (S5/S8 PGW). Open5GS requires BOTH to be present
+%% or it rejects the response ("No PGW TEID" / "No SGW TEID") and tears the
+%% dedicated bearer back down.
+%%
+%% Returns {OwnIface, OwnInst, PgwIface, PgwInst}.
+resp_uplane_ifaces(s5s8) ->
+    {?IFACE_S5S8_SGW_GTPU, 2, ?IFACE_S5S8_PGW_GTPU, 3};
+resp_uplane_ifaces(_) ->
+    {?IFACE_S2B_EPDG_GTPU, 8, ?IFACE_S2B_PGW_GTPU, 9}.
 
 %% Cause IE — TS 29.274 §8.4. Two octets: Cause value + spare/flags octet.
 %% Offending-IE fields (octets 7-8) are only present for specific causes and

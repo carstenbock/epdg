@@ -643,7 +643,13 @@ create_one_bearer(BC, DefLocalU, {BAcc, RAcc}) ->
                pgw_u_teid => PgwUTeid, pgw_u_ip => PgwUIp,
                tft => Tft, filters => Filters,
                charging_id => maps:get(charging_id, BC, undefined)},
-    {BAcc#{Ebi => Bearer}, [#{ebi => Ebi, u_teid => LocalU} | RAcc]}.
+    %% The response echoes the PGW's user-plane F-TEID (pgw_u_teid/pgw_u_ip)
+    %% back at instance 9 so the PGW-C can bind the Create Bearer Response to
+    %% the pending bearer; without it Open5GS logs "No PGW TEID" and removes
+    %% the bearer, collapsing the dedicated-bearer user plane.
+    {BAcc#{Ebi => Bearer},
+     [#{ebi => Ebi, u_teid => LocalU,
+        pgw_u_teid => PgwUTeid, pgw_u_ip => PgwUIp} | RAcc]}.
 
 %% Update a single dedicated bearer's TFT (re-pointing the uplink classifier).
 %% An unknown EBI is still acknowledged so the PGW's procedure completes.

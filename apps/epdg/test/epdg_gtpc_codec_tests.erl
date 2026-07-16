@@ -132,23 +132,34 @@ create_bearer_response_encode_s2b_test() ->
     Bin = epdg_gtpc_codec:encode_create_bearer_response(
             #{seq_num => 42, teid => 16#AAAAAAAA, mode => s2b,
               bearers => [#{ebi => 6, u_teid => 16#22222222,
-                            u_ip => {10,0,0,1}}]}),
+                            u_ip => {10,0,0,1},
+                            pgw_u_teid => 16#33333333,
+                            pgw_u_ip => {10,156,15,229}}]}),
     {ok, D} = epdg_gtpc_codec:decode_header(Bin),
     ?assertEqual(96, maps:get(type, D)),
     ?assertEqual(42, maps:get(seq_num, D)),
     ?assertEqual(16#AAAAAAAA, maps:get(teid, D)),
-    %% ePDG advertises its S2b-U F-TEID: iface 31, instance 5.
+    %% Create Bearer Response bearer context (TS 29.274 Table 7.2.4-2):
+    %% the ePDG's own S2b-U F-TEID at iface 31, instance 8 ...
     ?assertNotEqual(nomatch,
-        binary:match(Bin, fteid_ie(5, 31, 16#22222222, {10,0,0,1}))).
+        binary:match(Bin, fteid_ie(8, 31, 16#22222222, {10,0,0,1}))),
+    %% ... and the echoed PGW S2b-U F-TEID at iface 33, instance 9.
+    ?assertNotEqual(nomatch,
+        binary:match(Bin, fteid_ie(9, 33, 16#33333333, {10,156,15,229}))).
 
 create_bearer_response_encode_s5s8_test() ->
     Bin = epdg_gtpc_codec:encode_create_bearer_response(
             #{seq_num => 42, teid => 16#AAAAAAAA, mode => s5s8,
               bearers => [#{ebi => 6, u_teid => 16#22222222,
-                            u_ip => {10,0,0,1}}]}),
-    %% s5s8 emulation advertises the SGW S5/S8-U F-TEID: iface 4, instance 2.
+                            u_ip => {10,0,0,1},
+                            pgw_u_teid => 16#33333333,
+                            pgw_u_ip => {10,156,15,229}}]}),
+    %% s5s8 emulation: own SGW S5/S8-U F-TEID at iface 4, instance 2 ...
     ?assertNotEqual(nomatch,
-        binary:match(Bin, fteid_ie(2, 4, 16#22222222, {10,0,0,1}))).
+        binary:match(Bin, fteid_ie(2, 4, 16#22222222, {10,0,0,1}))),
+    %% ... and the echoed PGW S5/S8-U F-TEID at iface 5, instance 3.
+    ?assertNotEqual(nomatch,
+        binary:match(Bin, fteid_ie(3, 5, 16#33333333, {10,156,15,229}))).
 
 update_bearer_response_encode_test() ->
     Bin = epdg_gtpc_codec:encode_update_bearer_response(
