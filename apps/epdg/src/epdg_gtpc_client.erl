@@ -280,6 +280,9 @@ send_create_session(Params, From,
     MSISDN   = maps:get(msisdn,  Params, <<>>),
     MEI      = maps:get(mei,     Params, <<>>),
     PdnType  = maps:get(pdn_type,Params, 1),
+    %% Requested existing UE IPv4 for a 3GPP->non-3GPP handover attach; relayed
+    %% to the PGW as the Create-Session PAA so the PDN/IP survive the handover.
+    HoV4     = maps:get(handover_v4, Params, undefined),
     %% Serving Network IE is Conditional on S2b CSR (TS 29.274 §7.2.1,
     %% §8.18) and Open5GS SMF enforces its presence — data != NULL,
     %% len == OGS_PLMN_ID_LEN (3 bytes). Default to the ePDG's own PLMN
@@ -304,6 +307,7 @@ send_create_session(Params, From,
         apn           => APN,
         rat_type      => RAT,
         pdn_type      => PdnType,
+        handover_v4   => HoV4,
         local_ip      => LIP,
         local_u_ip    => LUIP,
         local_c_teid  => LCT,

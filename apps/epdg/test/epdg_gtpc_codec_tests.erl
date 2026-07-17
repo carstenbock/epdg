@@ -24,6 +24,29 @@ s2b_default_uses_iface_30_and_rat_wlan_test() ->
         binary:match(Bin, fteid_ie(5, 31, 16#22222222, {10,0,0,1}))),
     ?assertNotEqual(nomatch, binary:match(Bin, rat_ie(3))).
 
+%% Handover attach (TS 23.402 §8 / TS 29.274 §8.12, §8.14): when the UE asks to
+%% keep its existing IMS IPv4, the CSR must carry that address in the PAA and set
+%% the Handover Indication flag, so the PGW preserves the PDN instead of
+%% allocating a fresh IP (which drops the active call).
+paa_ho_ie({A,B,C,D}) -> <<79:8, 5:16, 0:8, 1:8, A:8, B:8, C:8, D:8>>.
+paa_dynamic_ie()      -> <<79:8, 5:16, 0:8, 1:8, 0:32>>.
+indication_hi_ie()    -> <<77:8, 10:16, 0:8, 16#20:8, 0,0,0,0,0,0,0,0,0>>.
+
+s2b_handover_attach_relays_paa_and_sets_hi_test() ->
+    P = (base_params())#{handover_v4 => {10,46,0,33}},
+    Bin = epdg_gtpc_codec:encode_create_session_request(P),
+    %% PAA carries the UE's existing IP (not 0.0.0.0)
+    ?assertNotEqual(nomatch, binary:match(Bin, paa_ho_ie({10,46,0,33}))),
+    ?assertEqual(nomatch, binary:match(Bin, paa_dynamic_ie())),
+    %% Handover Indication present
+    ?assertNotEqual(nomatch, binary:match(Bin, indication_hi_ie())).
+
+s2b_fresh_attach_has_dynamic_paa_and_no_indication_test() ->
+    Bin = epdg_gtpc_codec:encode_create_session_request(base_params()),
+    %% fresh attach => dynamic PAA, no Handover Indication IE
+    ?assertNotEqual(nomatch, binary:match(Bin, paa_dynamic_ie())),
+    ?assertEqual(nomatch, binary:match(Bin, indication_hi_ie())).
+
 s5s8_mode_uses_sgw_ifaces_and_rat_eutran_test() ->
     P = (base_params())#{mode => s5s8, rat_type => 6},
     Bin = epdg_gtpc_codec:encode_create_session_request(P),

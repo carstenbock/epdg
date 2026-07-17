@@ -1452,13 +1452,20 @@ proceed_with_s2b(MsgId, InFlags, ISPI, RSPI,
     %% otherwise force IPv4 (historical behaviour). The PGW still has the final
     %% say via the Create-Session PAA; we set up whatever it actually grants.
     PdnType = requested_pdn_type(Data0),
-    logger:info("S2b Create-Session IMSI=~p APN=~p pdn_type=~B (1=v4 2=v6 3=v4v6)",
-                [IMSI, Apn, PdnType]),
+    %% 3GPP->non-3GPP handover attach (TS 24.302 §6.4): if the UE requested its
+    %% existing IMS IPv4 in the IKEv2 CFG_REQUEST, relay it to the PGW so the
+    %% PDN (and any active call) survive the handover instead of being torn down
+    %% and re-created on a fresh IP.
+    HoV4 = requested_handover_ipv4(Data0#data.cp_body),
+    logger:info("S2b Create-Session IMSI=~p APN=~p pdn_type=~B (1=v4 2=v6 3=v4v6)"
+                " handover_v4=~p",
+                [IMSI, Apn, PdnType, HoV4]),
     case epdg_gtpc_client:create_session_request(#{
             imsi         => IMSI,
             apn          => Apn,
             rat_type     => 3,           %% WLAN
             pdn_type     => PdnType,
+            handover_v4  => HoV4,
             ebi          => 5,
             local_c_teid => LocalCTeid,
             local_u_teid => LocalUTeid
@@ -1773,6 +1780,25 @@ split_child_keymat(Mat, E, I) ->
 %% When dual-stack is disabled we always request IPv4 (historical default).
 %% When enabled we honour what the UE asked for in its IKEv2 CFG_REQUEST
 %% (RFC 7296 §3.15): INTERNAL_IP4_ADDRESS (1) and/or INTERNAL_IP6_ADDRESS (8).
+%% Requested existing UE IPv4 from the IKEv2 CFG_REQUEST, for a 3GPP->non-3GPP
+%% handover attach (TS 24.302 §6.4). A non-zero INTERNAL_IP4_ADDRESS means the
+%% UE wants to keep this IMS IP across the handover; we relay it to the PGW as
+%% the Create-Session PAA. undefined => fresh attach (dynamic IP).
+requested_handover_ipv4(CpBody) when is_binary(CpBody) ->
+    case epdg_ikev2_codec:decode_cp_payload(CpBody) of
+        {ok, {_CfgType, Attrs}} ->
+            case lists:keyfind(internal_ip4_address, 1, Attrs) of
+                {_, <<A:8, B:8, C:8, D:8>>} when {A, B, C, D} =/= {0, 0, 0, 0} ->
+                    {A, B, C, D};
+                _ ->
+                    undefined
+            end;
+        _ ->
+            undefined
+    end;
+requested_handover_ipv4(_) ->
+    undefined.
+
 requested_pdn_type(#data{cp_body = CpBody}) ->
     case epdg_config:get(ipv6_enabled, false) of
         true  -> pdn_type_from_cp(CpBody);
