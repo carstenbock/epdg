@@ -7,5 +7,9 @@ IMAGE="epdg"
 echo "Building ${IMAGE} version ${VERSION}"
 docker build -t "${REGISTRY}/${IMAGE}:latest" -f docker/Dockerfile .
 docker tag "${REGISTRY}/${IMAGE}:latest" "${REGISTRY}/${IMAGE}:${VERSION}"
+
+# Authenticate to Harbor with the shared cnaas push robot before pushing.
+. "$(dirname "$0")/../harbor-login.sh"
+
 docker push "${REGISTRY}/${IMAGE}:latest"
 docker push "${REGISTRY}/${IMAGE}:${VERSION}"
