@@ -4,7 +4,7 @@
 %%%-------------------------------------------------------------------
 -module(epdg_config).
 
--export([init/0, get/1, get/2, parse_gtpc_mode/1]).
+-export([init/0, get/1, get/2, parse_gtpc_mode/1, parse_ue_ip_pools/1]).
 
 -define(APP, epdg).
 
@@ -92,9 +92,16 @@ init() ->
     %% HTTP API
     set_from_env_int("EPDG_API_PORT", api_port, 8080),
 
-    %% UE IP pool (dual-stack: IPv4 + optional IPv6)
-    set_from_env("EPDG_UE_IP_POOL", ue_ip_pool, "10.47.0.0/16"),
-    set_from_env("EPDG_UE_IP6_POOL", ue_ip6_pool, ""),
+    %% UE inner-IP pools (EPDG_UE_IP_POOLS): comma-separated CIDR list,
+    %% IPv4 and IPv6 mixed, e.g. "10.46.0.0/16,cafe:0:46::/48". These are
+    %% the ranges the PGW allocates PAA addresses from; the GTP-U
+    %% forwarder installs one policy-routing rule per pool at startup and
+    %% REJECTS any UE whose PGW-assigned inner IP falls outside every
+    %% pool. There is deliberately no default: a wrong pool list silently
+    %% strands every attach, so a missing value must fail the boot
+    %% instead. (Replaces the never-evaluated EPDG_UE_IP_POOL /
+    %% EPDG_UE_IP6_POOL of pre-shared-TUN releases.)
+    set_ue_ip_pools(),
 
     %% Dual-stack toggle. When false (default) the ePDG always requests an
     %% IPv4-only S2b PDN and only ever hands the UE an IPv4 inner address --
@@ -137,9 +144,6 @@ init() ->
     %% remaining healthy pods.
     set_from_env_bool("EPDG_REDIRECT_ENABLE", redirect_enable, false),
     set_from_env("EPDG_REDIRECT_TARGET", redirect_target, ""),
-
-    %% TUN device garbage collection interval (ms)
-    set_from_env_int("EPDG_TUN_GC_INTERVAL", tun_gc_interval, 300000),
 
     %% Log level (applied to the primary logger in epdg_app:start/2).
     %% Default `notice' matches the OTP default primary level; lower it to
@@ -225,6 +229,55 @@ parse_addr_map(Csv) when is_list(Csv) ->
       #{},
       string:split(Csv, ",", all)
     ).
+
+%% EPDG_UE_IP_POOLS is mandatory: a wrong or missing pool list makes the
+%% GTP-U forwarder reject every attach, so fail the boot loudly instead
+%% of coming up in a state that black-holes all subscribers.
+set_ue_ip_pools() ->
+    case os:getenv("EPDG_UE_IP_POOLS") of
+        false ->
+            error({missing_config,
+                   "EPDG_UE_IP_POOLS is required: comma-separated CIDR list "
+                   "of UE inner-IP pools, e.g. "
+                   "\"10.46.0.0/16,cafe:0:46::/48\""});
+        Csv ->
+            case parse_ue_ip_pools(Csv) of
+                [] ->
+                    error({missing_config,
+                           "EPDG_UE_IP_POOLS is empty: at least one CIDR "
+                           "UE inner-IP pool is required"});
+                Pools ->
+                    application:set_env(?APP, ue_ip_pools, Pools)
+            end
+    end.
+
+%% Parse a comma-separated CIDR list ("10.46.0.0/16,cafe:0:46::/48") into
+%% [{BaseAddr, PrefixLen}]. Any invalid entry raises {invalid_cidr, Entry}
+%% — silently skipping a pool would strand every UE the PGW puts there.
+-spec parse_ue_ip_pools(string()) -> [{inet:ip_address(), 0..128}].
+parse_ue_ip_pools(Csv) when is_list(Csv) ->
+    Entries = [string:trim(E) || E <- string:split(Csv, ",", all)],
+    [parse_cidr(E) || E <- Entries, E =/= ""].
+
+parse_cidr(Str) ->
+    case string:split(Str, "/", all) of
+        [AddrS, LenS] ->
+            case {inet:parse_address(AddrS), string:to_integer(LenS)} of
+                {{ok, Addr}, {Len, ""}} when is_integer(Len) ->
+                    Max = case tuple_size(Addr) of
+                              4 -> 32;
+                              8 -> 128
+                          end,
+                    case Len >= 0 andalso Len =< Max of
+                        true  -> {Addr, Len};
+                        false -> error({invalid_cidr, Str})
+                    end;
+                _ ->
+                    error({invalid_cidr, Str})
+            end;
+        _ ->
+            error({invalid_cidr, Str})
+    end.
 
 set_dra_hosts() ->
     Hosts = case os:getenv("DRA_HOSTS") of

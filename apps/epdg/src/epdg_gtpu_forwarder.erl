@@ -1,11 +1,18 @@
 %%%-------------------------------------------------------------------
 %%% @doc Userspace GTP-U forwarder for the ePDG data plane.
 %%%
-%%% Bridges the UE's inner IP traffic (coming out of the kernel's ESP
-%%% SAs into a per-UE TUN device) to the PGW-U over GTP-U/UDP 2152 and
-%%% back. One process per ePDG pod owns a single UDP socket shared
-%%% across every active UE; per-UE TUN devices handle the "inside"
-%%% plumbing.
+%%% Bridges the UEs' inner IP traffic (coming out of the kernel's ESP
+%%% SAs into ONE shared TUN device, `epdg0') to the PGW-U over
+%%% GTP-U/UDP 2152 and back. One process per ePDG pod owns a single
+%%% UDP socket and the single shared TUN; registration of a UE is pure
+%%% bookkeeping (no per-UE devices, routes or rules), so attach cost is
+%%% constant and independent of the session count.
+%%%
+%%% Uplink packets are attributed to their bearer by the INNER SOURCE
+%%% IP (IPv4: exact address; IPv6: /64 prefix — see inner_src_key/1),
+%%% looked up in `by_inner_ip'. Downlink is demuxed by TEID as before,
+%%% but always written to the shared TUN; the kernel XFRM OUT policy
+%%% keyed on the inner destination IP selects the right SA.
 %%%
 %%% References:
 %%%   3GPP TS 29.281 — GTP User Plane (GTPv1-U)
@@ -34,34 +41,52 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
+-ifdef(TEST).
+%% Internal functions plus a minimal #state{} constructor for the EUnit
+%% suite (see test/epdg_gtpu_forwarder_tests.erl); the record is
+%% otherwise private to this module.
+-export([inner_src_key/1, ip_in_cidr/2, validate_inner_ips/3,
+         new_state_for_test/1, register_ue_for_test/2,
+         register_bearer_for_test/2, unregister_ue_for_test/2,
+         uplink_for_test/2, classify_for_test/2]).
+-endif.
+
 -define(SERVER,     ?MODULE).
 -define(GTPU_PORT,  2152).
 -define(GTPU_HDR_FLAGS, 16#30).
 -define(GTPU_MSG_TPDU,  16#FF).
+%% The single TUN device shared by every UE bearer in this pod.
+-define(SHARED_TUN, "epdg0").
+%% Policy-routing table shared by all UE pools. Deliberately OUTSIDE the
+%% legacy per-UE range 1000..30999 (pre-shared-TUN releases derived one
+%% table per bearer in that range; cleanup_stale_tun_devices/0 may still
+%% flush those tables on upgrade and must never touch ours).
+-define(SHARED_TABLE, 100).
+%% Priority of the shared pool / iif rules. Must sort strictly AFTER the
+%% PGW-U escape rules (?PGWU_ESCAPE_PRIO) and strictly BEFORE the main
+%% table (32766) — see shared_rule_selectors/2.
+-define(SHARED_RULE_PRIO, 1000).
 %% Priority of the PGW-U escape rules (ensure_pgwu_escape_rules/0).
-%% Must sort strictly before every per-UE rule, which live in the
-%% 1000..30999 range (see ue_route_table/1).
+%% Must sort strictly before the UE-pool rules (?SHARED_RULE_PRIO).
 -define(PGWU_ESCAPE_PRIO, 900).
 
 -record(ue_ent, {
     local_teid   :: non_neg_integer(),
     pgw_u_teid   :: non_neg_integer(),
     pgw_u_ip     :: inet:ip_address(),
-    tun_name     :: string(),
-    tun_port     :: port() | undefined,
     ue_inner_ip  :: inet:ip_address(),
     ue_inner_ip6 :: inet:ip_address() | undefined,
     owner_pid    :: pid() | undefined,
     %% Local TEIDs of this UE's dedicated bearers (S2b dedicated bearer
-    %% activation). They share this UE's TUN/IPsec SA; kept here so the
+    %% activation). They share this UE's IPsec SA; kept here so the
     %% uplink classifier can enumerate them and so they are torn down with
     %% the default bearer.
     ded_teids    = [] :: [non_neg_integer()]
 }).
 
-%% A dedicated bearer. Shares the owning UE's TUN device (downlink writes go to
-%% `default_teid''s TUN); uplink packets matching `filters' are steered onto
-%% this bearer's PGW-U tunnel instead of the default bearer.
+%% A dedicated bearer. Shares the owning UE's IPsec SA (downlink rides the
+%% shared TUN like everything else); uplink packets matching `filters' are
+%% steered onto this bearer's PGW-U tunnel instead of the default bearer.
 -record(ded_ent, {
     default_teid :: non_neg_integer(),
     pgw_u_teid   :: non_neg_integer(),
@@ -74,15 +99,24 @@
     socket     :: gen_udp:socket() | undefined,
     bind_ip    :: inet:ip_address(),
     bind_port  :: inet:port_number(),
-    %% local_teid -> #ue_ent{} (default bearers; each owns a TUN)
+    %% local_teid -> #ue_ent{} (default bearers)
     by_teid    :: #{non_neg_integer() => #ue_ent{}},
-    %% dedicated local_teid -> #ded_ent{} (share the default bearer's TUN)
+    %% dedicated local_teid -> #ded_ent{}
     by_ded     :: #{non_neg_integer() => #ded_ent{}},
     %% pid() -> local_teid for cleanup on owner DOWN
     by_owner   :: #{pid() => non_neg_integer()},
-    %% port() -> local_teid so we can route TUN-read packets to their
-    %% bearer without scanning by_teid on the hot path.
-    by_port    :: #{port() => non_neg_integer()},
+    %% Inner source key -> default-bearer local_teid: the uplink hot-path
+    %% lookup. Keys: IPv4 = exact address tuple, IPv6 = {v6, /64 prefix}
+    %% (see inner_src_key/1 for why the prefix rather than the address).
+    by_inner_ip :: #{tuple() => non_neg_integer()},
+    %% The shared TUN helper port (c_src/epdg_tun_port.c) and device name.
+    %% `undefined' when the TUN could not be created (degraded mode, e.g.
+    %% unit tests without NET_ADMIN).
+    tun_port   :: port() | undefined,
+    tun_name   :: string(),
+    %% Configured UE inner-IP pools ({Base, PrefixLen}) from
+    %% EPDG_UE_IP_POOLS; registrations outside every pool are rejected.
+    pools      :: [{inet:ip_address(), 0..128}],
     next_teid  :: non_neg_integer(),
     last_rx_ts :: integer()
 }).
@@ -94,15 +128,25 @@
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
-%% Register a UE bearer: allocates a local TEID, optionally spawns a
-%% TUN device, and returns the allocated TEID + TUN name.
+%% Register a UE bearer: allocates a local TEID and installs the inner
+%% source-IP -> bearer mapping. Pure bookkeeping — no devices, routes or
+%% rules are created (they are shared and set up once in init/1).
 %%
 %% Params:
 %%   pgw_u_teid    - integer, from the Create-Session-Response F-TEID
 %%   pgw_u_ip      - inet:ip_address(), from the same F-TEID
 %%   ue_inner_ip   - inet:ip_address(), from PAA
-%%   imsi          - binary (used only in TUN name suffix)
+%%   imsi          - binary (log correlation only)
 %%   owner_pid     - pid() of the owning UE FSM (we monitor for cleanup)
+%%
+%% Rejects with {error, ue_ip_outside_configured_pools} when the
+%% PGW-assigned inner IP falls outside every configured pool
+%% (EPDG_UE_IP_POOLS): such a UE would attach fine but its uplink could
+%% never be attributed to a bearer — a black hole that is very hard to
+%% diagnose in the field, so fail loudly at registration instead.
+%%
+%% The returned `tun_name' is always the shared device (?SHARED_TUN);
+%% the key is kept for API stability.
 -spec register_ue(map()) ->
     {ok, #{local_teid => non_neg_integer(), tun_name => string()}}
     | {error, term()}.
@@ -114,13 +158,12 @@ unregister_ue(LocalTeid) ->
     gen_server:call(?SERVER, {unregister_ue, LocalTeid}).
 
 %% Register a dedicated bearer for an existing UE (S2b dedicated bearer
-%% activation). The bearer shares the UE's TUN/IPsec SA — no new TUN or routes
-%% are created. Downlink GTP-U arriving on `local_teid' is written to the UE's
-%% shared TUN; uplink packets matching `filters' are steered onto this bearer's
-%% PGW-U tunnel.
+%% activation). The bearer shares the UE's IPsec SA — downlink GTP-U
+%% arriving on `local_teid' is written to the shared TUN; uplink packets
+%% matching `filters' are steered onto this bearer's PGW-U tunnel.
 %%
 %% Params:
-%%   default_teid - local TEID of the UE's default bearer (owns the TUN)
+%%   default_teid - local TEID of the UE's default bearer
 %%   local_teid   - local TEID allocated for this dedicated bearer
 %%   pgw_u_teid   - PGW-U TEID from the Create Bearer Request F-TEID
 %%   pgw_u_ip     - PGW-U IP from the same F-TEID
@@ -145,12 +188,36 @@ send(LocalTeid, InnerPkt) ->
 %%====================================================================
 
 init([]) ->
+    %% Trap exits: (a) terminate/2 must run on supervisor shutdown so the
+    %% shared TUN and pool rules are removed; (b) a crash of the TUN
+    %% helper port arrives as {'EXIT', Port, _} instead of killing us
+    %% without cleanup.
+    process_flag(trap_exit, true),
     cleanup_stale_tun_devices(),
+    %% Node-global and idempotent; runs once per forwarder start (NOT per
+    %% attach — re-running it on every TUN setup used to dump the whole
+    %% rule list on each registration). ogstun devices created later
+    %% (PGW-U pod restart) keep their escape because the rules match the
+    %% device name, which open5gs reuses.
     ensure_pgwu_escape_rules(),
+    Pools = epdg_config:get(ue_ip_pools, []),
+    TunPort = setup_shared_tun(Pools),
     BindIpStr = epdg_config:get(gtpu_bind_addr, "0.0.0.0"),
     BindIp    = parse_ip_or_any(BindIpStr),
     Port      = epdg_config:get(gtpu_port, ?GTPU_PORT),
 
+    Base = #state{socket = undefined,
+                  bind_ip = BindIp,
+                  bind_port = Port,
+                  by_teid = #{},
+                  by_ded = #{},
+                  by_owner = #{},
+                  by_inner_ip = #{},
+                  tun_port = TunPort,
+                  tun_name = ?SHARED_TUN,
+                  pools = Pools,
+                  next_teid = 16#1000,
+                  last_rx_ts = erlang:system_time(second)},
     InetFamily = case BindIp of
         {_,_,_,_,_,_,_,_} -> inet6;
         _                 -> inet
@@ -158,35 +225,19 @@ init([]) ->
     case gen_udp:open(Port, [binary, {ip, BindIp}, {active, true},
                               {reuseaddr, true}, InetFamily]) of
         {ok, Socket} ->
-            logger:info("GTP-U forwarder on ~p:~p", [BindIp, Port]),
-            schedule_gc(),
-            {ok, #state{socket = Socket,
-                        bind_ip = BindIp,
-                        bind_port = Port,
-                        by_teid = #{},
-                        by_ded = #{},
-                        by_owner = #{},
-                        by_port = #{},
-                        next_teid = 16#1000,
-                        last_rx_ts = erlang:system_time(second)}};
+            logger:info("GTP-U forwarder on ~p:~p (shared TUN ~s, ~B UE "
+                        "pool(s))", [BindIp, Port, ?SHARED_TUN, length(Pools)]),
+            {ok, Base#state{socket = Socket}};
         {error, eaddrinuse} ->
             %% Running outside a real ePDG pod (e.g. during unit tests)
             %% — start in a degraded mode so the supervisor comes up.
             logger:warning("GTP-U: bind ~p:~p failed (eaddrinuse); "
                            "forwarder disabled", [BindIp, Port]),
-            schedule_gc(),
-            {ok, #state{socket = undefined, bind_ip = BindIp,
-                        bind_port = Port, by_teid = #{}, by_ded = #{},
-                        by_owner = #{}, by_port = #{}, next_teid = 16#1000,
-                        last_rx_ts = erlang:system_time(second)}};
+            {ok, Base};
         {error, Reason} ->
             logger:warning("GTP-U: bind ~p:~p failed: ~p; forwarder disabled",
                            [BindIp, Port, Reason]),
-            schedule_gc(),
-            {ok, #state{socket = undefined, bind_ip = BindIp,
-                        bind_port = Port, by_teid = #{}, by_ded = #{},
-                        by_owner = #{}, by_port = #{}, next_teid = 16#1000,
-                        last_rx_ts = erlang:system_time(second)}}
+            {ok, Base}
     end.
 
 handle_call({register_ue, Params}, _From, State) ->
@@ -206,11 +257,11 @@ handle_cast({send, Teid, Pkt}, State) ->
     {noreply, do_send_inner(Teid, Pkt, State)};
 handle_cast({pgw_restart, _}, State) ->
     logger:warning("GTP-U: pgw_restart received — flushing all TEID registrations"),
-    maps:fold(fun(_, Ent, _) -> close_tun_ent(Ent), ok end,
-              ok, State#state.by_teid),
     epdg_metrics:gauge_set(gtpu_dedicated_bearers_active, 0),
+    %% The shared TUN and pool rules are session-independent; only the
+    %% per-session bookkeeping is stale.
     {noreply, State#state{by_teid = #{}, by_ded = #{},
-                          by_owner = #{}, by_port = #{}}};
+                          by_owner = #{}, by_inner_ip = #{}}};
 handle_cast(_Msg, State) -> {noreply, State}.
 
 handle_info({udp, _Sock, _FromIP, _FromPort, Packet}, State) ->
@@ -218,11 +269,13 @@ handle_info({udp, _Sock, _FromIP, _FromPort, Packet}, State) ->
         {ok, Teid, Payload} ->
             epdg_metrics:inc(gtpu_rx_pkts),
             epdg_metrics:inc(gtpu_rx_bytes, byte_size(Payload)),
-            %% Downlink for a default OR dedicated bearer both land on the same
-            %% UE TUN (dedicated bearers share the default's IPsec SA).
-            case find_tun_port(Teid, State) of
-                {ok, TP} -> tun_write(TP, Payload);
-                error    -> ok
+            %% Downlink for default and dedicated bearers alike goes out
+            %% the shared TUN; the kernel XFRM OUT policy keyed on the
+            %% inner destination IP selects the right SA. Unknown TEIDs
+            %% (stale session, PGW misdelivery) are dropped as before.
+            case known_teid(Teid, State) of
+                true  -> tun_write(State#state.tun_port, Payload);
+                false -> ok
             end,
             {noreply, State#state{last_rx_ts = erlang:system_time(second)}};
         _ ->
@@ -230,44 +283,38 @@ handle_info({udp, _Sock, _FromIP, _FromPort, Packet}, State) ->
     end;
 handle_info({tun_packet, LocalTeid, Pkt}, State) ->
     {noreply, do_send_inner(LocalTeid, Pkt, State)};
-%% Packet read from a per-UE TUN by the C port helper — forward uplink.
-handle_info({Port, {data, Pkt}}, #state{by_port = PMap} = State)
+%% Uplink packet read from the shared TUN by the C port helper.
+handle_info({Port, {data, Pkt}}, #state{tun_port = Port} = State)
   when is_port(Port) ->
-    case maps:find(Port, PMap) of
-        {ok, Teid} -> {noreply, do_send_inner(Teid, Pkt, State)};
-        error      -> {noreply, State}
-    end;
-%% Port helper exited — treat as TUN loss for the bearer.
-handle_info({'EXIT', Port, Reason}, #state{by_port = PMap} = State)
+    {noreply, handle_uplink(Pkt, State)};
+%% The shared TUN helper died — without it there is no datapath at all,
+%% so fail loudly and let the supervisor restart us; init/1 re-creates
+%% the device and rules idempotently.
+handle_info({'EXIT', Port, Reason}, #state{tun_port = Port} = State)
   when is_port(Port) ->
-    case maps:find(Port, PMap) of
-        {ok, Teid} ->
-            logger:warning("GTP-U: tun port exited teid=~B reason=~p",
-                           [Teid, Reason]),
-            {noreply, do_unregister_teid(Teid, State)};
-        error ->
-            {noreply, State}
-    end;
+    logger:error("GTP-U: shared TUN helper exited: ~p — restarting "
+                 "forwarder", [Reason]),
+    {stop, {shared_tun_exit, Reason}, State#state{tun_port = undefined}};
+handle_info({Port, {exit_status, Status}}, #state{tun_port = Port} = State)
+  when is_port(Port) ->
+    logger:error("GTP-U: shared TUN helper exited with status ~B — "
+                 "restarting forwarder", [Status]),
+    {stop, {shared_tun_exit, {exit_status, Status}},
+     State#state{tun_port = undefined}};
 handle_info({'DOWN', _MRef, process, Pid, _Reason},
             #state{by_owner = Owners} = State) ->
     case maps:find(Pid, Owners) of
         {ok, Teid} -> {noreply, do_unregister_teid(Teid, State)};
         error      -> {noreply, State}
     end;
-handle_info(gc_tun, #state{by_teid = Map} = State) ->
-    Stale = find_orphaned_tuns(Map),
-    lists:foreach(fun({Name, Ip, Teid}) ->
-        teardown_ue_routing(Ip, Teid),
-        delete_tun_dev(Name),
-        epdg_metrics:inc(tun_gc_cleaned_total),
-        logger:info("GC: removed orphaned TUN ~s (teid=~B)", [Name, Teid])
-    end, Stale),
-    schedule_gc(),
-    {noreply, State};
 handle_info(_Info, State) -> {noreply, State}.
 
-terminate(_Reason, #state{socket = S, by_teid = Map}) ->
-    maps:fold(fun(_, Ent, _) -> close_tun_ent(Ent), ok end, ok, Map),
+terminate(_Reason, #state{socket = S, tun_port = TP, pools = Pools}) ->
+    case TP of
+        TP when is_port(TP) -> catch erlang:port_close(TP);
+        _                   -> ok
+    end,
+    teardown_shared_tun(Pools),
     case S of undefined -> ok; _ -> gen_udp:close(S) end,
     ok.
 
@@ -279,9 +326,25 @@ code_change(_OldVsn, State, _Extra) -> {ok, State}.
 
 do_register_ue(#{pgw_u_teid := PgwTeid, pgw_u_ip := PgwIP,
                  ue_inner_ip := InnerIP} = P,
-               #state{by_teid = Map, next_teid = N,
-                      by_owner = Owners, by_port = PMap} = State) ->
+               #state{by_teid = Map, next_teid = N, by_owner = Owners,
+                      by_inner_ip = ByIp, pools = Pools} = State) ->
     InnerIP6 = maps:get(ue_inner_ip6, P, undefined),
+    case validate_inner_ips(InnerIP, InnerIP6, Pools) of
+        {error, BadIps} ->
+            logger:error("GTP-U: rejecting UE registration — inner IP(s) ~s "
+                         "outside every configured UE pool "
+                         "(EPDG_UE_IP_POOLS); check the PGW PAA ranges "
+                         "against the pool config",
+                         [lists:join(", ", [inet:ntoa(Ip) || Ip <- BadIps])]),
+            epdg_metrics:inc(ue_ip_outside_pool_total),
+            {{error, ue_ip_outside_configured_pools}, State};
+        ok ->
+            do_register_ue_valid(P, InnerIP, InnerIP6, PgwTeid, PgwIP,
+                                 Map, N, Owners, ByIp, State)
+    end.
+
+do_register_ue_valid(P, InnerIP, InnerIP6, PgwTeid, PgwIP,
+                     Map, N, Owners, ByIp, State) ->
     %% The FSM generates a 32-bit TEID in new_teid/0, advertises it to
     %% the PGW-U in the Create-Session F-TEID IE, and passes it in
     %% here as `local_teid_hint`. The PGW-U then uses THAT value as
@@ -293,9 +356,7 @@ do_register_ue(#{pgw_u_teid := PgwTeid, pgw_u_ip := PgwIP,
                     I when is_integer(I), I > 0 -> I;
                     _                           -> N
                 end,
-    TunName   = tun_name_for(P),
-    TunPort   = maybe_open_tun(TunName, InnerIP, InnerIP6, LocalTeid),
-    Owner     = maps:get(owner_pid, P, undefined),
+    Owner = maps:get(owner_pid, P, undefined),
     case is_pid(Owner) of
         true  -> erlang:monitor(process, Owner);
         false -> ok
@@ -303,8 +364,6 @@ do_register_ue(#{pgw_u_teid := PgwTeid, pgw_u_ip := PgwIP,
     Ent = #ue_ent{local_teid = LocalTeid,
                   pgw_u_teid = PgwTeid,
                   pgw_u_ip = PgwIP,
-                  tun_name = TunName,
-                  tun_port = TunPort,
                   ue_inner_ip = InnerIP,
                   ue_inner_ip6 = InnerIP6,
                   owner_pid = Owner},
@@ -312,22 +371,23 @@ do_register_ue(#{pgw_u_teid := PgwTeid, pgw_u_ip := PgwIP,
         undefined -> Owners;
         _         -> Owners#{Owner => LocalTeid}
     end,
-    PMap1 = case is_port(TunPort) of
-        true  -> PMap#{TunPort => LocalTeid};
-        false -> PMap
-    end,
-    {{ok, #{local_teid => LocalTeid, tun_name => TunName}},
+    %% Last-writer-wins on a re-attach that reuses the same inner IP
+    %% before the stale session's cleanup ran (the FSM-level IMSI
+    %% supersede tears the old session down shortly after); the guarded
+    %% delete in do_unregister_teid/2 keeps the fresh mapping intact.
+    ByIp1 = lists:foldl(fun(K, Acc) -> Acc#{K => LocalTeid} end,
+                        ByIp, inner_ip_keys(InnerIP, InnerIP6)),
+    {{ok, #{local_teid => LocalTeid, tun_name => State#state.tun_name}},
      State#state{by_teid = Map#{LocalTeid => Ent},
                  by_owner = Owners1,
-                 by_port = PMap1,
+                 by_inner_ip = ByIp1,
                  next_teid = N + 1}}.
 
 do_unregister_teid(Teid, #state{by_teid = Map, by_ded = Ded, by_owner = Owners,
-                                 by_port = PMap} = State) ->
+                                 by_inner_ip = ByIp} = State) ->
     case maps:take(Teid, Map) of
-        {#ue_ent{tun_port = TP, owner_pid = Owner,
-                 ded_teids = DedTeids} = Ent, Rest} ->
-            close_tun_ent(Ent),
+        {#ue_ent{owner_pid = Owner, ded_teids = DedTeids,
+                 ue_inner_ip = InnerIP, ue_inner_ip6 = InnerIP6}, Rest} ->
             %% Drop this UE's dedicated bearers along with its default bearer.
             Ded1 = lists:foldl(fun(DT, Acc) ->
                        case maps:is_key(DT, Acc) of
@@ -340,15 +400,71 @@ do_unregister_teid(Teid, #state{by_teid = Map, by_ded = Ded, by_owner = Owners,
                 undefined -> Owners;
                 _         -> maps:remove(Owner, Owners)
             end,
-            PMap1 = case is_port(TP) of
-                true  -> maps:remove(TP, PMap);
-                false -> PMap
-            end,
+            %% Remove the inner-IP mappings — but only those still owned
+            %% by this TEID, so tearing down a superseded session cannot
+            %% break the re-attached one that took over the IP.
+            ByIp1 = lists:foldl(
+                      fun(K, Acc) ->
+                              case Acc of
+                                  #{K := T} when T =:= Teid -> maps:remove(K, Acc);
+                                  _                         -> Acc
+                              end
+                      end, ByIp, inner_ip_keys(InnerIP, InnerIP6)),
             State#state{by_teid = Rest, by_ded = Ded1,
-                        by_owner = Owners1, by_port = PMap1};
+                        by_owner = Owners1, by_inner_ip = ByIp1};
         error ->
             State
     end.
+
+%% The by_inner_ip keys for a UE's assigned addresses: exact IPv4 address
+%% (skipped for a v6-only bearer, where IPv4 is unset or the unspecified
+%% address) and the /64 prefix of the IPv6 address when present.
+inner_ip_keys(Ip4, Ip6) ->
+    K4 = case Ip4 of
+             {A, B, C, D} when {A, B, C, D} =/= {0, 0, 0, 0} -> [{A, B, C, D}];
+             _                                               -> []
+         end,
+    K6 = case Ip6 of
+             {S1, S2, S3, S4, _, _, _, _} -> [{v6, {S1, S2, S3, S4}}];
+             _                            -> []
+         end,
+    K4 ++ K6.
+
+%% Check the PGW-assigned inner address(es) against the configured pools.
+%% Only present addresses are validated; a UE with no inner address at
+%% all still registers (downlink by TEID works, uplink is impossible),
+%% matching the previous behaviour.
+validate_inner_ips(Ip4, Ip6, Pools) ->
+    Addrs = [Ip || Ip <- [Ip4, Ip6],
+                   is_tuple(Ip),
+                   Ip =/= {0, 0, 0, 0}],
+    case [Ip || Ip <- Addrs, not in_any_pool(Ip, Pools)] of
+        []  -> ok;
+        Bad -> {error, Bad}
+    end.
+
+in_any_pool(Ip, Pools) ->
+    lists:any(fun(Pool) -> ip_in_cidr(Ip, Pool) end, Pools).
+
+ip_in_cidr({_, _, _, _} = Ip, {{_, _, _, _} = Base, Len}) ->
+    prefix_match(ip_to_int(Ip), ip_to_int(Base), 32, Len);
+ip_in_cidr({_, _, _, _, _, _, _, _} = Ip,
+           {{_, _, _, _, _, _, _, _} = Base, Len}) ->
+    prefix_match(ip_to_int(Ip), ip_to_int(Base), 128, Len);
+ip_in_cidr(_, _) ->
+    false.
+
+prefix_match(A, B, Bits, Len) when Len >= 0, Len =< Bits ->
+    Shift = Bits - Len,
+    (A bsr Shift) =:= (B bsr Shift);
+prefix_match(_, _, _, _) ->
+    false.
+
+ip_to_int({A, B, C, D}) ->
+    (A bsl 24) bor (B bsl 16) bor (C bsl 8) bor D;
+ip_to_int({S1, S2, S3, S4, S5, S6, S7, S8}) ->
+    lists:foldl(fun(S, Acc) -> (Acc bsl 16) bor S end, 0,
+                [S1, S2, S3, S4, S5, S6, S7, S8]).
 
 %%====================================================================
 %% Dedicated bearer registration
@@ -396,25 +512,54 @@ do_unregister_bearer(DedTeid, #state{by_teid = Map, by_ded = Ded} = State) ->
             State
     end.
 
-%% Resolve the TUN port for a downlink TEID: default bearers own their TUN;
-%% dedicated bearers borrow their owning default bearer's TUN.
-find_tun_port(Teid, #state{by_teid = Map, by_ded = Ded}) ->
-    case maps:find(Teid, Map) of
-        {ok, #ue_ent{tun_port = TP}} -> {ok, TP};
-        error ->
-            case maps:find(Teid, Ded) of
-                {ok, #ded_ent{default_teid = DefTeid}} ->
-                    case maps:find(DefTeid, Map) of
-                        {ok, #ue_ent{tun_port = TP}} -> {ok, TP};
-                        error                        -> error
-                    end;
-                error -> error
-            end
-    end.
+%% A downlink TEID is deliverable if it belongs to a registered default
+%% or dedicated bearer.
+known_teid(Teid, #state{by_teid = Map, by_ded = Ded}) ->
+    maps:is_key(Teid, Map) orelse maps:is_key(Teid, Ded).
 
 %%====================================================================
 %% Forwarding
 %%====================================================================
+
+%% Uplink from the shared TUN: attribute the packet to its default
+%% bearer via the inner source IP, then run the normal TFT
+%% classification for dedicated bearers.
+handle_uplink(Pkt, #state{by_inner_ip = ByIp} = State) ->
+    case uplink_teid(Pkt, ByIp) of
+        {ok, Teid} ->
+            do_send_inner(Teid, Pkt, State);
+        _NoBearer -> %% unknown_src | malformed
+            epdg_metrics:inc(gtpu_uplink_unknown_src_total),
+            State
+    end.
+
+uplink_teid(Pkt, ByInnerIp) ->
+    case inner_src_key(Pkt) of
+        {ok, Key} ->
+            case ByInnerIp of
+                #{Key := Teid} -> {ok, Teid};
+                _              -> unknown_src
+            end;
+        error ->
+            malformed
+    end.
+
+%% Extract the classification key from an uplink inner IP packet:
+%% IPv4 -> the exact source address, IPv6 -> {v6, /64 source prefix}.
+%%
+%% The IPv6 key is the /64 prefix rather than the full address because
+%% the PGW delegates a whole /64 per UE (open5gs carves /64s out of the
+%% configured pool prefix) and the UE may source traffic from ANY
+%% address it forms inside it (SLAAC, RFC 4941 privacy addresses) —
+%% exact-address matching would drop everything except the single PAA
+%% interface identifier.
+inner_src_key(<<4:4, _IHL:4, _:11/binary, A, B, C, D, _:4/binary, _/binary>>) ->
+    {ok, {A, B, C, D}};
+inner_src_key(<<6:4, _:4, _:7/binary, S1:16, S2:16, S3:16, S4:16,
+                _:8/binary, _:16/binary, _/binary>>) ->
+    {ok, {v6, {S1, S2, S3, S4}}};
+inner_src_key(_) ->
+    error.
 
 do_send_inner(_Teid, _Pkt, #state{socket = undefined} = State) -> State;
 do_send_inner(Teid, Pkt,
@@ -500,50 +645,62 @@ skip_ext_hdrs(<<Len:8, Rest/binary>>) when Len > 0 ->
 skip_ext_hdrs(Bin) -> Bin.
 
 %%====================================================================
-%% TUN device plumbing
+%% Shared TUN device plumbing
 %%
-%% Each per-UE bearer owns one Linux TUN device (IFF_TUN | IFF_NO_PI).
-%% The device is created via `ip tuntap add`, addressed with the UE's
-%% inner IP, and brought up. A small C helper (`epdg_tun_port`, see
-%% c_src/epdg_tun_port.c) is spawned to own the /dev/net/tun fd and
-%% bridge it to the BEAM over stdio using the standard `{packet, 2}`
-%% framing. We talk to it via `port_command/2` (downlink: GTP-U payload
-%% → TUN) and receive `{Port, {data, Pkt}}` messages (uplink: UE-originated
-%% IP packet → GTP-U to PGW).
+%% One Linux TUN device (IFF_TUN | IFF_NO_PI) per ePDG pod, created once
+%% in init/1. A small C helper (`epdg_tun_port', see
+%% c_src/epdg_tun_port.c) owns the /dev/net/tun fd and bridges it to the
+%% BEAM over stdio with {packet, 2} framing: port_command/2 writes
+%% downlink GTP-U payloads into the TUN, {Port, {data, Pkt}} messages
+%% carry UE-originated uplink packets.
 %%
-%% With this plumbing in place, after the kernel XFRM subsystem
-%% decrypts inbound ESP from the UE, the cleartext packet is routed
-%% toward `dst = ue_inner_ip` — which lives on our TUN — so the C
-%% helper reads it on /dev/net/tun and hands it up. The reverse path
-%% (PGW T-PDU → TUN write) triggers the kernel's outbound XFRM policy
-%% for `src 0.0.0.0/0 dst UE_IP/32`, which encrypts and emits ESP-in-UDP
-%% toward the UE.
+%% After the kernel XFRM subsystem decrypts inbound ESP from a UE, the
+%% cleartext packet (src = UE inner IP, inside one of the configured
+%% pools) matches the per-pool `from <pool> lookup ?SHARED_TABLE' rule
+%% and rides the shared table's default route out the TUN, where the
+%% helper reads it. The reverse path (PGW T-PDU written into the TUN)
+%% re-enters routing via the `iif epdg0' rule; the shared table's
+%% default route satisfies the FIB lookup and the kernel's outbound
+%% XFRM policy for `dst UE_IP' encrypts and emits ESP-in-UDP toward the
+%% UE. The rule/route count is constant in the number of configured
+%% pools — nothing here scales with the session count.
+%%
+%% CRITICAL: the shared table's default route must NOT live in MAIN.
+%% The ePDG runs on hostNetwork and shares the node routing table with
+%% a co-located PGW-U; polluting MAIN would shadow the PGW-U's ogstun
+%% pool routes and black-hole its traffic. Conversely, PGW-U-decapped
+%% uplink (src inside the same pools, iif ogstun*) must escape the
+%% `from <pool>' rules — see ensure_pgwu_escape_rules/0.
+%%
+%% Scaling note: the single helper process serialises all uplink reads.
+%% If it ever becomes the bottleneck, open the device with
+%% IFF_MULTI_QUEUE and spawn one helper (one queue fd) per BEAM
+%% scheduler; by_inner_ip classification is stateless per packet, so
+%% queues can be consumed concurrently.
 %%====================================================================
 
-maybe_open_tun(Name, Ip4, Ip6, LocalTeid) ->
-    %% Linux IFNAMSIZ = 16 bytes incl. trailing NUL: interface names
-    %% must be <= 15 chars. Guard here so that upstream generation
-    %% mistakes surface as explicit log warnings instead of silent
-    %% "ip tuntap add" failures ("dev not a valid ifname") that used
-    %% to leave the pod without a TUN.
-    case length(Name) =< 15 of
+setup_shared_tun(Pools) ->
+    Name = ?SHARED_TUN,
+    WantV6 = lists:any(fun({Base, _}) -> tuple_size(Base) =:= 8 end, Pools),
+    ensure_forwarding_sysctls(WantV6),
+    %% Idempotent: "File exists" from a device that survived a previous
+    %% run (hostNetwork persists devices across pod restarts) is fine —
+    %% the helper re-attaches to the existing device by name.
+    run_quiet(io_lib:format("ip tuntap add dev ~s mode tun", [Name])),
+    case filelib:is_dir("/sys/class/net/" ++ Name) of
         false ->
-            logger:warning("TUN: refusing to create device with name ~s "
-                           "(~B chars > IFNAMSIZ-1=15)",
-                           [Name, length(Name)]),
+            logger:error("TUN: cannot create shared device ~s (missing "
+                         "NET_ADMIN / /dev/net/tun?) — datapath disabled",
+                         [Name]),
             undefined;
         true ->
-            ensure_forwarding_sysctls(Ip6 =/= undefined),
-            %% Re-run on every TUN setup so ogstun devices created after
-            %% ePDG startup (e.g. a PGW-U pod restart) are covered too.
-            ensure_pgwu_escape_rules(),
-            Table = ue_route_table(LocalTeid),
-            %% NOTE: we intentionally do NOT assign the UE's inner IP to
-            %% the TUN — that would make the kernel treat UE_IP as local
-            %% and deliver downlink packets to us instead of forwarding
-            %% them through the XFRM OUT policy back out to the UE.
+            %% Delete-then-add so a crashed previous run cannot leave
+            %% duplicate rules behind (there is no `ip rule replace').
+            Selectors = shared_rule_selectors(Name, Pools),
+            lists:foreach(fun({Fam, Sel}) ->
+                run_quiet(rule_cmd(Fam, "del", Sel))
+            end, Selectors),
             BaseCmds = [
-                io_lib:format("ip tuntap add dev ~s mode tun", [Name]),
                 io_lib:format("ip link set dev ~s up", [Name]),
                 %% Loose rp_filter on the TUN so decrypted uplink with
                 %% src=UE_IP isn't dropped as a martian (asymmetric path).
@@ -556,89 +713,74 @@ maybe_open_tun(Name, Ip4, Ip6, LocalTeid) ->
                     "2>/dev/null); [ \"$val\" != 1 ] || "
                     "sysctl -wq net.ipv4.conf.~s.rp_filter=2", [Name, Name])
             ],
-            Cmds = BaseCmds ++ v4_tun_cmds(Ip4, Name, Table)
-                            ++ v6_tun_cmds(Ip6, Name, Table),
-            case run_cmds_or_warn(Name, Cmds) of
-                ok    -> open_tun_port(Name);
-                error -> undefined
-            end
+            V6Cmds = case WantV6 of
+                true ->
+                    %% Make sure IPv6 is enabled on the TUN even if the
+                    %% host disables it by default.
+                    [io_lib:format("sysctl -wq net.ipv6.conf.~s.disable_ipv6=0",
+                                   [Name]),
+                     io_lib:format("ip -6 route replace default dev ~s table ~B",
+                                   [Name, ?SHARED_TABLE])];
+                false ->
+                    []
+            end,
+            RouteCmds = [
+                %% The shared table's only route: any destination goes out
+                %% the shared TUN. Satisfies both the uplink lookup (dst =
+                %% arbitrary IMS/internet address, selected by the
+                %% `from <pool>' rules) and the downlink lookup (dst =
+                %% UE IP, selected by the `iif' rule), where the XFRM OUT
+                %% policy then intercepts the packet.
+                io_lib:format("ip route replace default dev ~s table ~B",
+                              [Name, ?SHARED_TABLE])
+            ],
+            RuleCmds = [rule_cmd(Fam, "add", Sel) || {Fam, Sel} <- Selectors],
+            run_cmds_or_warn(Name, BaseCmds ++ RouteCmds ++ V6Cmds ++ RuleCmds),
+            open_tun_port(Name)
     end.
 
-%% IPv4 downlink/uplink routing for the per-UE TUN. Skipped for an
-%% IPv6-only bearer (UE IPv4 is the unspecified address).
-v4_tun_cmds({0,0,0,0}, _Name, _Table) -> [];
-v4_tun_cmds({A,B,C,D}, Name, Table) ->
-    UeIp = io_lib:format("~B.~B.~B.~B", [A,B,C,D]),
-    [
-        %% Uplink policy table: after XFRM decrypt, packets with
-        %% src=UE_IP are sent out the UE's own TUN for the BEAM
-        %% to pick up and wrap into GTP-U.
-        %%
-        %% CRITICAL: a co-located PGW-U also emits packets with src=UE_IP
-        %% (via its ogstun device, post GTP-U decap). Those must NOT match
-        %% this rule — see ensure_pgwu_escape_rules/0 for the higher-
-        %% priority iif-ogstun escape that protects them.
-        io_lib:format("ip rule add from ~s/32 lookup ~B priority ~B",
-                      [UeIp, Table, Table]),
-        %% Downlink route: scoped to the per-UE table, reached only for
-        %% packets the forwarder injects into this UE's TUN (iif rule
-        %% below). The FIB lookup for dst=UE_IP succeeds here and the
-        %% global XFRM OUT bundle (dst=UE_IP/32 tmpl tunnel esp) emits
-        %% ESP toward the UE.
-        %%
-        %% CRITICAL: this /32 must NOT live in the MAIN table. The ePDG
-        %% runs on hostNetwork and shares the node routing table with a
-        %% co-located PGW-U. A main-table UE_IP/32 is more specific than
-        %% the PGW-U's /17 ogstun pool route, so it shadowed it and
-        %% black-holed IMS downlink for every UE whose anchoring PGW-U
-        %% landed on the same node (the packet was swallowed into this
-        %% TUN instead of reaching the PGW-U). Keeping MAIN clean lets
-        %% forwarded downlink reach the PGW-U; the `iif <TUN>` rule still
-        %% routes the ePDG's own injected packets out via XFRM.
-        io_lib:format("ip rule add iif ~s lookup ~B priority ~B",
-                      [Name, Table, Table]),
-        io_lib:format("ip route add ~s/32 dev ~s table ~B",
-                      [UeIp, Name, Table]),
-        io_lib:format("ip route add default dev ~s table ~B", [Name, Table])
-    ];
-v4_tun_cmds(_, _Name, _Table) -> [].
+teardown_shared_tun(Pools) ->
+    Name = ?SHARED_TUN,
+    lists:foreach(fun({Fam, Sel}) ->
+        run_quiet(rule_cmd(Fam, "del", Sel))
+    end, shared_rule_selectors(Name, Pools)),
+    run_quiet(io_lib:format("ip route flush table ~B", [?SHARED_TABLE])),
+    run_quiet(io_lib:format("ip -6 route flush table ~B", [?SHARED_TABLE])),
+    delete_tun_dev(Name).
 
-%% IPv6 analogue of v4_tun_cmds/3. Uses the same per-UE table id (the v4
-%% and v6 routing tables are independent address families in iproute2) so
-%% downlink dst=UE_IP6 and uplink src=UE_IP6 ride the same TUN as IPv4.
-v6_tun_cmds(undefined, _Name, _Table) -> [];
-v6_tun_cmds({_,_,_,_,_,_,_,_} = Ip6, Name, Table) ->
-    UeIp6 = inet:ntoa(Ip6),
-    [
-        %% Make sure IPv6 is enabled on the freshly-created TUN even if the
-        %% host disables it by default.
-        io_lib:format("sysctl -wq net.ipv6.conf.~s.disable_ipv6=0", [Name]),
-        %% Uplink policy (src=UE_IP6 -> UE TUN).
-        io_lib:format("ip -6 rule add from ~s/128 lookup ~B priority ~B",
-                      [UeIp6, Table, Table]),
-        %% Downlink scoped to the per-UE table only -- NOT in the MAIN v6
-        %% table, to avoid shadowing a co-located PGW-U's /48 ogstun pool
-        %% route. See the v4_tun_cmds comment for the full rationale.
-        io_lib:format("ip -6 rule add iif ~s lookup ~B priority ~B",
-                      [Name, Table, Table]),
-        io_lib:format("ip -6 route add ~s/128 dev ~s table ~B",
-                      [UeIp6, Name, Table]),
-        io_lib:format("ip -6 route add default dev ~s table ~B", [Name, Table])
-    ];
-v6_tun_cmds(_, _Name, _Table) -> [].
-
-%% Route-table / rule priority derived from the per-pod local TEID.
+%% The constant set of policy-routing rules for the shared datapath:
 %%
-%% CRITICAL: the returned value is used for BOTH the table id and the
-%% `ip rule ... priority` value. iproute2 orders rules by priority
-%% (lowest first). The main table is consulted at priority 32766, and
-%% since the pod's main table has a default route (`default via
-%% eth0`), any rule with priority >= 32766 is never reached for
-%% uplink traffic — the main lookup wins first. We therefore clamp to
-%% the 1000..31000 range so every per-UE rule sits strictly before
-%% main, regardless of which 32-bit TEID the FSM hands us.
-ue_route_table(LocalTeid) ->
-    1000 + (LocalTeid rem 30000).
+%%   - one `iif <tun>' rule per address family (downlink: packets the
+%%     forwarder injects into the TUN re-enter routing here and must
+%%     resolve via the shared table, NOT via MAIN);
+%%   - one `from <pool>' rule per configured UE pool (uplink:
+%%     XFRM-decrypted SWu packets carry src = UE inner IP and must be
+%%     steered into the TUN for GTP-U encapsulation).
+%%
+%% All rules share ?SHARED_RULE_PRIO: they sort strictly after the
+%% PGW-U escape rules (?PGWU_ESCAPE_PRIO) and strictly before the main
+%% table (32766).
+shared_rule_selectors(Name, Pools) ->
+    Iif = "iif " ++ Name,
+    WantV6 = lists:any(fun({Base, _}) -> tuple_size(Base) =:= 8 end, Pools),
+    IifRules = [{"ip", Iif}] ++ [{"ip -6", Iif} || WantV6],
+    PoolRules = [{family_cmd(Base), "from " ++ cidr_str(Pool)}
+                 || {Base, _} = Pool <- Pools],
+    IifRules ++ PoolRules.
+
+rule_cmd(Fam, Op, Selector) ->
+    io_lib:format("~s rule ~s ~s lookup ~B priority ~B",
+                  [Fam, Op, Selector, ?SHARED_TABLE, ?SHARED_RULE_PRIO]).
+
+family_cmd(Base) when tuple_size(Base) =:= 8 -> "ip -6";
+family_cmd(_)                                -> "ip".
+
+cidr_str({Base, Len}) ->
+    lists:flatten(io_lib:format("~s/~B", [inet:ntoa(Base), Len])).
+
+run_quiet(Cmd) ->
+    _ = os:cmd(lists:flatten(Cmd) ++ " 2>/dev/null"),
+    ok.
 
 run_cmds_or_warn(Name, Cmds) ->
     lists:foldl(
@@ -676,16 +818,17 @@ ensure_forwarding_sysctls(WantV6) ->
 %% co-located PGW-U. When the PGW-U decapsulates GTP-U uplink it injects
 %% the inner packet (src=UE_IP) through its ogstun device for normal
 %% forwarding toward the IMS core. Without an escape rule that packet
-%% matches the per-UE `from UE_IP/32` rule (v4_tun_cmds) — which is meant
-%% for XFRM-decrypted SWu uplink only — and is looped back into the
-%% ePDG's TUN instead of reaching the network: a total uplink black-hole
-%% for every UE whose anchoring PGW-U sits on the ePDG's own node.
+%% matches the shared `from <pool>' rule (shared_rule_selectors/2) —
+%% which is meant for XFRM-decrypted SWu uplink only — and is looped
+%% back into the ePDG's TUN instead of reaching the network: a total
+%% uplink black-hole for every UE whose anchoring PGW-U sits on the
+%% ePDG's own node.
 %%
 %% Fix: anything entering through an ogstun device is routed via the
-%% main table, at a priority strictly below every per-UE rule. The rules
+%% main table, at a priority strictly below the pool rules. The rules
 %% are node-global, idempotent, and intentionally never torn down.
 %% XFRM-decrypted SWu uplink is unaffected (iif = the underlay NIC), as
-%% is downlink the forwarder injects into a UE TUN (iif = the UE TUN).
+%% is downlink the forwarder injects into the shared TUN (iif = epdg0).
 ensure_pgwu_escape_rules() ->
     Prio = ?PGWU_ESCAPE_PRIO,
     Sh = io_lib:format(
@@ -768,57 +911,9 @@ locate_tun_helper() ->
             end
     end.
 
-close_tun_ent(#ue_ent{tun_port = TP, tun_name = Name,
-                      local_teid = Teid, ue_inner_ip = Ip,
-                      ue_inner_ip6 = Ip6}) ->
-    case TP of
-        undefined -> ok;
-        Port when is_port(Port) -> catch erlang:port_close(Port), ok
-    end,
-    teardown_ue_routing(Ip, Ip6, Teid),
-    delete_tun_dev(Name).
-
-teardown_ue_routing(Ip, Teid) ->
-    teardown_ue_routing(Ip, undefined, Teid).
-
-teardown_ue_routing(Ip, Ip6, Teid) ->
-    Table = ue_route_table(Teid),
-    %% The downlink iif rule (v4_tun_cmds / v6_tun_cmds) is keyed on the TUN
-    %% device name, which is derived purely from the TEID -- so we can always
-    %% remove it, even during startup orphan cleanup when the UE IP is unknown.
-    Name = lists:flatten(io_lib:format("ue~B", [Teid])),
-    %% IPv4 teardown.
-    case Ip of
-        {A,B,C,D} when {A,B,C,D} =/= {0,0,0,0} ->
-            UeIp = io_lib:format("~B.~B.~B.~B", [A,B,C,D]),
-            _ = os:cmd(lists:flatten(
-                io_lib:format("ip rule del from ~s/32 lookup ~B priority ~B 2>&1",
-                              [UeIp, Table, Table])));
-        _ -> ok
-    end,
-    _ = os:cmd(lists:flatten(
-        io_lib:format("ip rule del iif ~s lookup ~B priority ~B 2>&1",
-                      [Name, Table, Table]))),
-    _ = os:cmd(lists:flatten(
-        io_lib:format("ip route flush table ~B 2>&1", [Table]))),
-    %% IPv6 teardown. Remove the downlink iif rule by selector, the uplink
-    %% from-rule by priority (works even when we don't know the UE's IPv6,
-    %% e.g. startup orphan cleanup), and flush the per-UE v6 table.
-    _ = os:cmd(lists:flatten(
-        io_lib:format("ip -6 rule del iif ~s lookup ~B priority ~B 2>&1",
-                      [Name, Table, Table]))),
-    _ = os:cmd(lists:flatten(
-        io_lib:format("ip -6 rule del priority ~B 2>&1", [Table]))),
-    _ = os:cmd(lists:flatten(
-        io_lib:format("ip -6 route flush table ~B 2>&1", [Table]))),
-    _ = Ip6,
-    ok.
-
 delete_tun_dev(undefined) -> ok;
 delete_tun_dev(Name) ->
-    _ = os:cmd(lists:flatten(
-                 io_lib:format("ip tuntap del dev ~s mode tun 2>&1", [Name]))),
-    ok.
+    run_quiet(io_lib:format("ip tuntap del dev ~s mode tun", [Name])).
 
 tun_write(undefined, _Pkt) -> ok;
 tun_write(Port, Pkt) when is_port(Port), is_binary(Pkt) ->
@@ -829,19 +924,14 @@ tun_write(Port, Pkt) when is_port(Port), is_binary(Pkt) ->
         error:_ -> ok
     end.
 
-%% Build a Linux interface name for a UE's TUN device.
-%% IFNAMSIZ limits us to 15 usable chars; a 15-digit IMSI would make
-%% "ue" ++ IMSI = 17 chars and `ip tuntap add` silently rejects it. We
-%% instead use the 32-bit local GTP-U TEID (<= 10 decimal digits) with
-%% an "ue" prefix, giving at most 12 chars and guaranteeing uniqueness
-%% per session within this pod. IMSI stays available in logs for
-%% correlation.
-tun_name_for(P) ->
-    Teid = maps:get(local_teid_hint, P, 0),
-    lists:flatten(io_lib:format("ue~B", [Teid])).
-
 %%====================================================================
-%% Startup orphan cleanup
+%% Startup cleanup of legacy per-UE TUN devices
+%%
+%% Releases before the shared-TUN datapath created one TUN device
+%% ("ue<teid>"), one routing table and two-to-four ip rules PER default
+%% bearer. On hostNetwork those survive pod restarts, so the first
+%% start after an upgrade must sweep them or they linger forever. This
+%% whole section exists only for that migration path.
 %%====================================================================
 
 cleanup_stale_tun_devices() ->
@@ -853,13 +943,14 @@ cleanup_stale_tun_devices() ->
     lists:foreach(fun(Name) ->
         Ip = tun_ip_from_route(Name),
         Teid = teid_from_tun_name(Name),
-        teardown_ue_routing(Ip, Teid),
+        teardown_legacy_ue_routing(Ip, Teid),
         delete_tun_dev(Name),
         epdg_metrics:inc(tun_startup_cleaned_total)
     end, Stale),
     case length(Stale) of
         0 -> ok;
-        N -> logger:notice("Startup cleanup: removed ~B stale TUN device(s)", [N])
+        N -> logger:notice("Startup cleanup: removed ~B stale per-UE TUN "
+                           "device(s) from a pre-shared-TUN release", [N])
     end.
 
 extract_ue_tun_name(Line) ->
@@ -874,11 +965,17 @@ teid_from_tun_name("ue" ++ Digits) ->
     end;
 teid_from_tun_name(_) -> 0.
 
+%% Route-table / rule-priority id the LEGACY per-UE datapath derived from
+%% the local TEID. Kept solely so the startup sweep can address the
+%% tables and rules a pre-shared-TUN release left behind.
+legacy_ue_route_table(LocalTeid) ->
+    1000 + (LocalTeid rem 30000).
+
 tun_ip_from_route(Name) ->
-    %% The UE's /32 now lives in the per-UE policy table (see v4_tun_cmds),
-    %% not the main table, so query that table (id derived from the TEID)
-    %% and ignore its default route.
-    Table = ue_route_table(teid_from_tun_name(Name)),
+    %% The legacy datapath kept the UE's /32 in the per-UE policy table
+    %% (not in main), so query that table (id derived from the TEID) and
+    %% ignore its default route.
+    Table = legacy_ue_route_table(teid_from_tun_name(Name)),
     Cmd = lists:flatten(io_lib:format(
         "ip route show table ~B dev ~s 2>/dev/null "
         "| grep -v default | head -1 | awk '{print $1}'", [Table, Name])),
@@ -899,24 +996,30 @@ parse_route_ip(Str) ->
         _        -> error
     end.
 
-%%====================================================================
-%% Periodic GC reconciliation
-%%====================================================================
-
-schedule_gc() ->
-    Interval = epdg_config:get(tun_gc_interval, 300000),
-    erlang:send_after(Interval, self(), gc_tun).
-
-find_orphaned_tuns(ByTeid) ->
-    Raw = os:cmd("ip -o link show type tun 2>/dev/null"),
-    Lines = string:split(Raw, "\n", all),
-    AllNames = [Name || L <- Lines,
-                        Name <- [extract_ue_tun_name(L)],
-                        Name =/= undefined],
-    [{Name, tun_ip_from_route(Name), Teid}
-     || Name <- AllNames,
-        Teid <- [teid_from_tun_name(Name)],
-        not maps:is_key(Teid, ByTeid)].
+teardown_legacy_ue_routing(Ip, Teid) ->
+    Table = legacy_ue_route_table(Teid),
+    %% The legacy downlink iif rule is keyed on the TUN device name,
+    %% which is derived purely from the TEID — so it can always be
+    %% removed, even when the UE IP is unknown.
+    Name = lists:flatten(io_lib:format("ue~B", [Teid])),
+    case Ip of
+        {A,B,C,D} when {A,B,C,D} =/= {0,0,0,0} ->
+            UeIp = io_lib:format("~B.~B.~B.~B", [A,B,C,D]),
+            run_quiet(io_lib:format("ip rule del from ~s/32 lookup ~B priority ~B",
+                                    [UeIp, Table, Table]));
+        _ -> ok
+    end,
+    run_quiet(io_lib:format("ip rule del iif ~s lookup ~B priority ~B",
+                            [Name, Table, Table])),
+    run_quiet(io_lib:format("ip route flush table ~B", [Table])),
+    %% IPv6: remove the downlink iif rule by selector, the uplink
+    %% from-rule by priority (works even though the UE's IPv6 is
+    %% unknown here), and flush the per-UE v6 table.
+    run_quiet(io_lib:format("ip -6 rule del iif ~s lookup ~B priority ~B",
+                            [Name, Table, Table])),
+    run_quiet(io_lib:format("ip -6 rule del priority ~B", [Table])),
+    run_quiet(io_lib:format("ip -6 route flush table ~B", [Table])),
+    ok.
 
 %%====================================================================
 %% Helpers
@@ -929,3 +1032,44 @@ parse_ip_or_any(Str) when is_list(Str) ->
         _        -> {0,0,0,0}
     end;
 parse_ip_or_any(T) when is_tuple(T) -> T.
+
+%%====================================================================
+%% Test helpers
+%%====================================================================
+
+-ifdef(TEST).
+%% Minimal #state{} constructor for the EUnit suite: socket-less and
+%% TUN-less, so tests exercise the pure bookkeeping/classification code
+%% without NET_ADMIN.
+new_state_for_test(Pools) ->
+    #state{socket = undefined, bind_ip = {0,0,0,0}, bind_port = 0,
+           by_teid = #{}, by_ded = #{}, by_owner = #{}, by_inner_ip = #{},
+           tun_port = undefined, tun_name = ?SHARED_TUN, pools = Pools,
+           next_teid = 16#1000, last_rx_ts = 0}.
+
+register_ue_for_test(Params, State) -> do_register_ue(Params, State).
+
+register_bearer_for_test(Params, State) -> do_register_bearer(Params, State).
+
+unregister_ue_for_test(Teid, State) -> do_unregister_teid(Teid, State).
+
+%% Runs the real uplink entry point (metric side effects included) and
+%% returns the possibly-updated state.
+uplink_for_test(Pkt, State) -> handle_uplink(Pkt, State).
+
+%% Returns the uplink classification decision without sending anything:
+%% {ok, DefaultTeid, {PgwTeid, PgwIP}} | unknown_src | malformed.
+classify_for_test(Pkt, #state{by_teid = Map, by_inner_ip = ByIp} = State) ->
+    case uplink_teid(Pkt, ByIp) of
+        {ok, Teid} ->
+            case maps:find(Teid, Map) of
+                {ok, #ue_ent{pgw_u_teid = DT, pgw_u_ip = DIP,
+                             ded_teids = Ded}} ->
+                    {ok, Teid, classify_uplink(Pkt, Ded, State, {DT, DIP})};
+                error ->
+                    unknown_src
+            end;
+        Other ->
+            Other
+    end.
+-endif.

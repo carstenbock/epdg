@@ -55,8 +55,10 @@ BEAM is out of the per-packet path once Child SAs are installed.
 ```
 
 A single Erlang/OTP application owns the whole signalling plane; a per-UE
-`gen_statem` drives one IKEv2/IPsec tunnel each, and the kernel handles
-ESP ↔ GTP-U translation once the bearer is up.
+`gen_statem` drives one IKEv2/IPsec tunnel each. The kernel handles ESP
+(XFRM); GTP-U encapsulation runs in the userspace forwarder behind one
+shared TUN device (`epdg0`) for all UE bearers, with uplink attributed to
+its bearer by the inner source IP.
 
 ### Key modules
 
@@ -71,7 +73,7 @@ ESP ↔ GTP-U translation once the bearer is up.
 | `epdg_diameter_swm` | SWm Diameter client (DER/STR) toward the AAA via one transport per DRA replica |
 | `epdg_gtpc_client` | S2b GTP-C v2 Create/Delete Session; Echo heartbeat, FQDN re-resolve, restart detection |
 | `epdg_gtpc_codec` | GTPv2-C message/IE encode + decode (TS 29.274) |
-| `epdg_gtpu_forwarder` | Userspace GTP-U bridge (per-UE TUN ↔ shared S2b-U socket) for control of the data path |
+| `epdg_gtpu_forwarder` | Userspace GTP-U bridge (shared TUN `epdg0` ↔ S2b-U socket); uplink keyed by inner source IP, downlink demuxed by TEID |
 | `epdg_xfrm` | Linux kernel IPsec SA/SP programming; hardware-offload detection |
 | `epdg_dns_cache` | TTL-aware DNS cache used by the GTP-C client for PGW FQDN resolution |
 | `epdg_config` | Environment-variable driven configuration |
@@ -243,8 +245,7 @@ deployments. Precedence: per-pod → per-node → scalar → default.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `EPDG_UE_IP_POOL` | `10.47.0.0/16` | Informational UE IPv4 pool (the PGW PAA is authoritative) |
-| `EPDG_UE_IP6_POOL` | _(empty)_ | Informational UE IPv6 pool |
+| `EPDG_UE_IP_POOLS` | **required** | Comma-separated CIDR list (IPv4/IPv6 mixed) of every UE inner-IP pool the PGW allocates from, e.g. `10.46.0.0/16,cafe:0:46::/48`. Drives the shared-TUN policy routing and the register-time pool check; the app refuses to boot without it. Replaces the never-evaluated `EPDG_UE_IP_POOL`/`EPDG_UE_IP6_POOL` |
 | `EPDG_IPV6_ENABLED` | `false` | Honour the UE's requested PDN type and grant IPv6 / IPv4v6 (IR.51/IR.92) |
 | `EPDG_ALLOWED_APNS` | `ims` | Comma-separated allow-list (empty = allow all; `ims` always allowed) |
 | `EPDG_DEFAULT_APN` | `ims` | APN used when the UE does not request one |
@@ -254,7 +255,6 @@ deployments. Precedence: per-pod → per-node → scalar → default.
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `EPDG_API_PORT` | `8080` | HTTP API port |
-| `EPDG_TUN_GC_INTERVAL` | `300000` | Orphan TUN-device reconciliation interval (ms) |
 
 ---
 
@@ -285,13 +285,14 @@ Served by Cowboy on `EPDG_API_PORT` (default 8080).
   `epdg_gtpc_latency_ms_*`, `epdg_gtpc_echo_*`, `epdg_gtpc_peer_down_total`,
   `epdg_gtpc_peer_restarts_total`, `epdg_gtpc_dns_resolves_total`
 * `epdg_gtpu_tx_bytes` / `_rx_bytes` / `_tx_pkts` / `_rx_pkts`,
-  `epdg_gtpu_peer_down_total`
+  `epdg_gtpu_peer_down_total`, `epdg_gtpu_uplink_unknown_src_total`,
+  `epdg_ue_ip_outside_pool_total`
 * `epdg_diameter_swm_requests_total`, `epdg_diameter_swm_latency_ms_*`,
   `epdg_diameter_swm_peers` (gauge)
 * `epdg_xfrm_sa_active` (gauge), `epdg_xfrm_sa_created_total` / `_deleted_total` / `_errors_total`
 * `epdg_dpd_probes_sent_total`, `epdg_dpd_timeout_total`
 * `epdg_mobike_update_total`, `epdg_mobike_rr_check_total`, `epdg_mobike_rr_fail_total`
-* `epdg_tun_gc_cleaned_total`, `epdg_tun_startup_cleaned_total`
+* `epdg_tun_startup_cleaned_total`
 
 ---
 
@@ -303,9 +304,14 @@ inbound/outbound ESP SA pair plus matching XFRM policies in the Linux kernel
 RFC 3948. Each session's SA pair and policies are tagged with a unique
 `reqid` (the responder Child-SA SPI) so two UEs sharing one public IP
 (carrier-grade NAT, or two handsets behind one home router) don't clobber
-each other's state. Uplink cleartext is steered into a per-subscriber GTP-U
-tunnel toward the PGW-U; downlink GTP-U is decapsulated and re-encrypted to
-the UE's outer address. The BEAM is not in the per-packet path.
+each other's state. Uplink cleartext is steered by pool-wide policy rules
+(`EPDG_UE_IP_POOLS`) into the shared TUN `epdg0`, where the GTP-U forwarder
+attributes each packet to its bearer by inner source IP and encapsulates it
+toward the PGW-U; downlink GTP-U is TEID-checked, written back through the
+same TUN and re-encrypted to the UE's outer address. The kernel owns all
+ESP crypto; the BEAM owns GTP-U encap/decap. Registering a UE is pure
+bookkeeping — the routing state is constant in the number of pools, not
+sessions.
 
 Hardware ESP offload (Mellanox ConnectX `mlx5`, Intel `ice`/QAT) is detected
 via `ethtool` and used when available, with graceful fallback to software
@@ -354,7 +360,7 @@ rebar3 as prod release
 
 The Docker image (`docker/Dockerfile`, `erlang:26-alpine`) builds the
 release and additionally compiles `apps/epdg/c_src/epdg_tun_port.c` — a tiny
-stdio bridge the GTP-U forwarder uses to plumb per-UE TUN devices to the
+stdio bridge the GTP-U forwarder uses to plumb the shared TUN device to the
 GTP-U socket.
 
 ---

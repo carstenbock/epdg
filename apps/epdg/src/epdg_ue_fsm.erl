@@ -1482,8 +1482,9 @@ proceed_with_s2b(MsgId, InFlags, ISPI, RSPI,
         {ok, #{cause := Cause} = Resp}
           when Cause =:= undefined
                orelse (Cause >= 16 andalso Cause =< 63) ->
-            finalize_ike_auth(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
-                               IDrBody, NonceI, NonceR,
+            register_bearer_then_finalize(MsgId, InFlags, ISPI, RSPI,
+                               InnerPayloads, IMSI, IDrBody,
+                               NonceI, NonceR,
                                IkeSaInitRespBytes, MSK,
                                KeyParams, Keys,
                                LocalCTeid, LocalUTeid, Resp,
@@ -1498,6 +1499,53 @@ proceed_with_s2b(MsgId, InFlags, ISPI, RSPI,
                            [Reason, IMSI]),
             send_ike_notify_and_stop(MsgId, InFlags, ISPI, RSPI,
                                      37, Data0)
+    end.
+
+%% Register the UE's bearer with the GTP-U forwarder BEFORE any kernel
+%% state (Child SAs, XFRM policies) is installed. The forwarder
+%% validates the PGW-assigned inner IP against the configured UE pools
+%% (EPDG_UE_IP_POOLS): a UE outside every pool would complete the attach
+%% but have a dead uplink — its packets could never be attributed to a
+%% bearer on the shared TUN — so abort the IKE_AUTH instead of handing
+%% out a broken tunnel. On rejection nothing needs rolling back except
+%% the S2b session, which terminate/3 Delete-Sessions via #data.
+register_bearer_then_finalize(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
+                              IMSI, IDrBody, NonceI, NonceR,
+                              IkeSaInitRespBytes, MSK, KeyParams, Keys,
+                              LocalCTeid, LocalUTeid, Resp,
+                              PeerIP, PeerPort, Data0) ->
+    Pdn = extract_pdn_attrs(Resp),
+    UeInnerIp  = maps:get(ip4, Pdn),
+    UeInnerIp6 = maps:get(ip6, Pdn),
+    {PgwUIp, PgwUTeid} = pgw_u_from_resp(Resp),
+    case catch epdg_gtpu_forwarder:register_ue(#{
+             pgw_u_teid   => PgwUTeid,
+             pgw_u_ip     => PgwUIp,
+             ue_inner_ip  => UeInnerIp,
+             ue_inner_ip6 => UeInnerIp6,
+             imsi         => IMSI,
+             owner_pid    => self(),
+             local_teid_hint => LocalUTeid}) of
+        {error, ue_ip_outside_configured_pools} ->
+            logger:error("S2b PAA ~p / ~p outside configured UE pools "
+                         "(EPDG_UE_IP_POOLS) — aborting attach IMSI=~p",
+                         [UeInnerIp, UeInnerIp6, IMSI]),
+            Data1 = Data0#data{pgw_session =
+                        Resp#{ue_inner_ip  => UeInnerIp,
+                              ue_inner_ip6 => UeInnerIp6,
+                              local_c_teid => LocalCTeid,
+                              local_u_teid => LocalUTeid}},
+            send_ike_notify_and_stop(MsgId, InFlags, ISPI, RSPI,
+                                     36, Data1); %% INTERNAL_ADDRESS_FAILURE
+        _ ->
+            %% {ok, _} or forwarder unavailable (degraded / dev mode):
+            %% proceed exactly as before, best-effort.
+            finalize_ike_auth(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
+                               IDrBody, NonceI, NonceR,
+                               IkeSaInitRespBytes, MSK,
+                               KeyParams, Keys,
+                               LocalCTeid, LocalUTeid, Resp,
+                               PeerIP, PeerPort, Data0)
     end.
 
 %% RFC 5685 §5: optionally redirect the UE at IKE_AUTH time (the "staging
@@ -1649,18 +1697,10 @@ finalize_ike_auth_setup(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
                        SkEiChild, SkAiChild, SkErChild, SkArChild,
                        UeInnerIp, UeInnerIp6),
 
-    %% Register this UE's bearer with the GTP-U forwarder so the
-    %% inbound GTP-U packets from PGW-U can be demuxed to the right
-    %% TUN device. ue_inner_ip6 is undefined for an IPv4-only PAA.
-    {PgwUIp, PgwUTeid} = pgw_u_from_resp(GtpcResp),
-    catch epdg_gtpu_forwarder:register_ue(#{
-        pgw_u_teid   => PgwUTeid,
-        pgw_u_ip     => PgwUIp,
-        ue_inner_ip  => UeInnerIp,
-        ue_inner_ip6 => UeInnerIp6,
-        imsi         => Data0#data.imsi,
-        owner_pid    => self(),
-        local_teid_hint => LocalUTeid}),
+    %% Bearer registration with the GTP-U forwarder already happened in
+    %% register_bearer_then_finalize/19, before any kernel state was
+    %% installed; only the PGW-U TEID is still needed here (for #data).
+    {_PgwUIp, PgwUTeid} = pgw_u_from_resp(GtpcResp),
 
     %% Route PGW-initiated dedicated bearer requests (Create/Update/Delete
     %% Bearer) to this FSM: they carry the ePDG's local S2b-C TEID in the

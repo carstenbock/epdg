@@ -60,6 +60,8 @@ init() ->
         gtpu_peer_down_total,
         gtpu_dedicated_bearers_active,
         gtpu_uplink_dedicated_pkts_total,
+        gtpu_uplink_unknown_src_total,
+        ue_ip_outside_pool_total,
         dpd_timeout_total,
         dpd_probes_sent_total,
         mobike_update_total,
@@ -67,7 +69,6 @@ init() ->
         mobike_rr_fail_total,
         ike_redirects_sent_total,
         session_superseded_total,
-        tun_gc_cleaned_total,
         tun_startup_cleaned_total
     ]),
     ok.

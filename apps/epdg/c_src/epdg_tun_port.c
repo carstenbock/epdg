@@ -15,6 +15,12 @@
  * The port exits on stdin EOF (BEAM closing the port) or any fatal
  * I/O error. Memory footprint is one 65 KiB read buffer.
  *
+ * Scaling note: one helper process serialises all reads from the shared
+ * TUN. If it becomes the uplink bottleneck, add IFF_MULTI_QUEUE to
+ * ifr_flags below and spawn one helper per BEAM scheduler — each
+ * TUNSETIFF on the same ifname then attaches another queue fd, and the
+ * kernel spreads flows across the queues.
+ *
  * Build:
  *   cc -O2 -Wall -Wextra -o epdg_tun_port epdg_tun_port.c
  */

@@ -12,8 +12,9 @@ RUN apk add --no-cache bash git build-base wget iproute2 ethtool libcap lksctp-t
   && rebar3 as prod release
 
 # Compile the TUN port-driver helper used by epdg_gtpu_forwarder to
-# bridge per-UE TUN devices to the GTP-U socket. The binary is a tiny
-# stdio bridge; see apps/epdg/c_src/epdg_tun_port.c for the protocol.
+# bridge the shared TUN device (epdg0) to the GTP-U socket. The binary
+# is a tiny stdio bridge; see apps/epdg/c_src/epdg_tun_port.c for the
+# protocol.
 RUN cc -O2 -Wall -Wextra \
         -o /app/_build/prod/rel/epdg/bin/epdg_tun_port \
         /app/apps/epdg/c_src/epdg_tun_port.c
