@@ -17,7 +17,8 @@
 %% Internal functions exercised by the EUnit suite (see test/). new_data_for_test/1
 %% is a minimal #data constructor so tests can drive drain_action/1 without a
 %% live SA (the #data record is otherwise private to this module).
--export([drain_action/1, find_notify/2, new_data_for_test/1]).
+-export([drain_action/1, find_notify/2, new_data_for_test/1,
+         classify_register_ue_result/1]).
 -endif.
 
 -define(IKE_SA_INIT_TIMEOUT, 30000).
@@ -1507,8 +1508,16 @@ proceed_with_s2b(MsgId, InFlags, ISPI, RSPI,
 %% (EPDG_UE_IP_POOLS): a UE outside every pool would complete the attach
 %% but have a dead uplink — its packets could never be attributed to a
 %% bearer on the shared TUN — so abort the IKE_AUTH instead of handing
-%% out a broken tunnel. On rejection nothing needs rolling back except
-%% the S2b session, which terminate/3 Delete-Sessions via #data.
+%% out a broken tunnel. The same reasoning applies to ANY other failed
+%% registration (an {error, _} we don't know, a forwarder crash): the
+%% bearer is not in by_inner_ip, so the tunnel would come up with a
+%% dead uplink — abort those too (see classify_register_ue_result/1).
+%% Only a forwarder that is not running / not answering (noproc,
+%% call timeout) keeps the historical best-effort behaviour, as the
+%% documented degraded / dev mode. On rejection nothing needs rolling
+%% back except the S2b session, which terminate/3 Delete-Sessions via
+%% #data; a registration that landed despite a caller-side timeout is
+%% cleaned up by the forwarder's owner_pid monitor when this FSM stops.
 register_bearer_then_finalize(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
                               IMSI, IDrBody, NonceI, NonceR,
                               IkeSaInitRespBytes, MSK, KeyParams, Keys,
@@ -1518,35 +1527,78 @@ register_bearer_then_finalize(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
     UeInnerIp  = maps:get(ip4, Pdn),
     UeInnerIp6 = maps:get(ip6, Pdn),
     {PgwUIp, PgwUTeid} = pgw_u_from_resp(Resp),
-    case catch epdg_gtpu_forwarder:register_ue(#{
-             pgw_u_teid   => PgwUTeid,
-             pgw_u_ip     => PgwUIp,
-             ue_inner_ip  => UeInnerIp,
-             ue_inner_ip6 => UeInnerIp6,
-             imsi         => IMSI,
-             owner_pid    => self(),
-             local_teid_hint => LocalUTeid}) of
-        {error, ue_ip_outside_configured_pools} ->
-            logger:error("S2b PAA ~p / ~p outside configured UE pools "
-                         "(EPDG_UE_IP_POOLS) — aborting attach IMSI=~p",
-                         [UeInnerIp, UeInnerIp6, IMSI]),
+    RegResult = (catch epdg_gtpu_forwarder:register_ue(#{
+                     pgw_u_teid   => PgwUTeid,
+                     pgw_u_ip     => PgwUIp,
+                     ue_inner_ip  => UeInnerIp,
+                     ue_inner_ip6 => UeInnerIp6,
+                     imsi         => IMSI,
+                     owner_pid    => self(),
+                     local_teid_hint => LocalUTeid})),
+    case classify_register_ue_result(RegResult) of
+        proceed ->
+            finalize_ike_auth(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
+                               IDrBody, NonceI, NonceR,
+                               IkeSaInitRespBytes, MSK,
+                               KeyParams, Keys,
+                               LocalCTeid, LocalUTeid, Resp,
+                               PeerIP, PeerPort, Data0);
+        degraded ->
+            logger:warning("GTP-U forwarder unavailable (~p) — proceeding "
+                           "without bearer registration (degraded / dev "
+                           "mode) IMSI=~p", [RegResult, IMSI]),
+            finalize_ike_auth(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
+                               IDrBody, NonceI, NonceR,
+                               IkeSaInitRespBytes, MSK,
+                               KeyParams, Keys,
+                               LocalCTeid, LocalUTeid, Resp,
+                               PeerIP, PeerPort, Data0);
+        Reject ->
+            case Reject of
+                reject_pool ->
+                    logger:error("S2b PAA ~p / ~p outside configured UE "
+                                 "pools (EPDG_UE_IP_POOLS) — aborting "
+                                 "attach IMSI=~p",
+                                 [UeInnerIp, UeInnerIp6, IMSI]);
+                reject_other ->
+                    logger:error("GTP-U bearer registration failed: ~p — "
+                                 "aborting attach rather than handing out "
+                                 "a tunnel with a dead uplink IMSI=~p",
+                                 [RegResult, IMSI])
+            end,
             Data1 = Data0#data{pgw_session =
                         Resp#{ue_inner_ip  => UeInnerIp,
                               ue_inner_ip6 => UeInnerIp6,
                               local_c_teid => LocalCTeid,
                               local_u_teid => LocalUTeid}},
             send_ike_notify_and_stop(MsgId, InFlags, ISPI, RSPI,
-                                     36, Data1); %% INTERNAL_ADDRESS_FAILURE
-        _ ->
-            %% {ok, _} or forwarder unavailable (degraded / dev mode):
-            %% proceed exactly as before, best-effort.
-            finalize_ike_auth(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
-                               IDrBody, NonceI, NonceR,
-                               IkeSaInitRespBytes, MSK,
-                               KeyParams, Keys,
-                               LocalCTeid, LocalUTeid, Resp,
-                               PeerIP, PeerPort, Data0)
+                                     36, Data1) %% INTERNAL_ADDRESS_FAILURE
     end.
+
+%% Classify the (caught) result of epdg_gtpu_forwarder:register_ue/1:
+%%
+%%   proceed      - registration succeeded; continue the attach.
+%%   degraded     - forwarder not running / not answering ({'EXIT',
+%%                  noproc | timeout}): the documented degraded / dev
+%%                  mode — continue best-effort.
+%%   reject_pool  - PGW PAA outside every configured pool: abort the
+%%                  IKE_AUTH with INTERNAL_ADDRESS_FAILURE (36).
+%%   reject_other - any other error or crash: the bearer is NOT in
+%%                  by_inner_ip, so the UE would get a working IPsec
+%%                  tunnel with a dead uplink. A failed attach with a
+%%                  log beats a silent half tunnel — abort with 36.
+-spec classify_register_ue_result(term()) ->
+        proceed | degraded | reject_pool | reject_other.
+classify_register_ue_result({ok, _}) ->
+    proceed;
+classify_register_ue_result({error, ue_ip_outside_configured_pools}) ->
+    reject_pool;
+classify_register_ue_result({'EXIT', {noproc, _}}) ->
+    degraded;
+classify_register_ue_result({'EXIT', {timeout, _}}) ->
+    degraded;
+classify_register_ue_result(_Other) ->
+    reject_other.
 
 %% RFC 5685 §5: optionally redirect the UE at IKE_AUTH time (the "staging
 %% weiche" use case) instead of setting up a Child SA. Gated behind the same
