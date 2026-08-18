@@ -306,14 +306,16 @@ enc_alg_str(chacha20_poly1305) -> "rfc7539esp(chacha20,poly1305)";
 enc_alg_str(_)                 -> "cbc(aes)".
 
 auth_alg_str(hmac_sha1)   -> "hmac(sha1)";
+auth_alg_str(aes_xcbc)    -> "xcbc(aes)";
 auth_alg_str(hmac_sha256) -> "hmac(sha256)";
 auth_alg_str(hmac_sha384) -> "hmac(sha384)";
 auth_alg_str(hmac_sha512) -> "hmac(sha512)";
 auth_alg_str(_)           -> "hmac(sha256)".
 
 %% Kernel ICV truncation length (in bits) for each IKEv2 integrity
-%% transform, per RFC 4868 / RFC 2404.
+%% transform, per RFC 4868 / RFC 2404 / RFC 3566.
 auth_trunc_bits(hmac_sha1)   -> 96;
+auth_trunc_bits(aes_xcbc)    -> 96;
 auth_trunc_bits(hmac_sha256) -> 128;
 auth_trunc_bits(hmac_sha384) -> 192;
 auth_trunc_bits(hmac_sha512) -> 256;

@@ -399,12 +399,14 @@ is_supported_encr(#{id := 12, attrs := #{key_length := KL}})
 is_supported_encr(_) -> false.
 
 is_supported_prf(#{id := 2}) -> true;  %% HMAC-SHA1 (legacy but common)
+is_supported_prf(#{id := 4}) -> true;  %% AES128-XCBC (RFC 4434)
 is_supported_prf(#{id := 5}) -> true;  %% HMAC-SHA256
 is_supported_prf(#{id := 6}) -> true;  %% HMAC-SHA384
 is_supported_prf(#{id := 7}) -> true;  %% HMAC-SHA512
 is_supported_prf(_) -> false.
 
 is_supported_integ(#{id := 2})  -> true; %% HMAC-SHA1-96 (legacy but common)
+is_supported_integ(#{id := 5})  -> true; %% AES-XCBC-96 (RFC 3566)
 is_supported_integ(#{id := 12}) -> true; %% HMAC-SHA256-128
 is_supported_integ(#{id := 13}) -> true; %% HMAC-SHA384-192
 is_supported_integ(#{id := 14}) -> true; %% HMAC-SHA512-256
@@ -874,6 +876,7 @@ child_enc_key_len(_) -> 0.
 -spec child_integ_key_len(map() | none) -> non_neg_integer().
 child_integ_key_len(none)         -> 0;
 child_integ_key_len(#{id :=  2})  -> 20; %% HMAC-SHA1
+child_integ_key_len(#{id :=  5})  -> 16; %% AES-XCBC-96
 child_integ_key_len(#{id := 12})  -> 32; %% HMAC-SHA256-128
 child_integ_key_len(#{id := 13})  -> 48; %% HMAC-SHA384-192
 child_integ_key_len(#{id := 14})  -> 64; %% HMAC-SHA512-256
@@ -954,6 +957,7 @@ keys_params_for_suite(_) ->
     {error, incomplete_suite}.
 
 prf_atom(#{id := 2}) -> {ok, sha, 20};
+prf_atom(#{id := 4}) -> {ok, aes128_xcbc, 16};
 prf_atom(#{id := 5}) -> {ok, sha256, 32};
 prf_atom(#{id := 6}) -> {ok, sha384, 48};
 prf_atom(#{id := 7}) -> {ok, sha512, 64};
@@ -978,6 +982,7 @@ encr_params(_) ->
 integ_params(none, true) ->
     {ok, none, 0};
 integ_params(#{id :=  2}, false) -> {ok, hmac_sha1_96,    20};
+integ_params(#{id :=  5}, false) -> {ok, aes_xcbc_96,     16};
 integ_params(#{id := 12}, false) -> {ok, hmac_sha256_128, 32};
 integ_params(#{id := 13}, false) -> {ok, hmac_sha384_192, 48};
 integ_params(#{id := 14}, false) -> {ok, hmac_sha512_256, 64};

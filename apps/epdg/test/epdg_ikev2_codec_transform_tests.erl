@@ -75,6 +75,22 @@ cbc128_sha1_selects_test() ->
                    is_aead := false}, Params).
 
 %%====================================================================
+%% AES-XCBC suite (PRF_AES128_XCBC = 4, AUTH_AES_XCBC_96 = 5) from the
+%% ESP profile must select and map to key-derivation parameters.
+%%====================================================================
+
+cbc128_xcbc_selects_test() ->
+    Proposals = ike_proposal([{?T_ENCR, ?ENCR_AES_CBC, 128},
+                              {?T_PRF, 4},
+                              {?T_INTEG, 5},
+                              {?T_DH, ?DH_MODP_2048}]),
+    {ok, Suite} = epdg_ikev2_codec:select_proposal(Proposals),
+    {ok, Params} = epdg_ikev2_codec:keys_params_for_suite(Suite),
+    ?assertMatch(#{prf := aes128_xcbc, prf_key_len := 16,
+                   integ_alg := aes_xcbc_96, integ_key_len := 16,
+                   is_aead := false}, Params).
+
+%%====================================================================
 %% AES-CBC-128 with SHA-2 must select (128-bit baseline of the profile).
 %%====================================================================
 

@@ -168,6 +168,87 @@ prf_sha1_rfc2202_test() ->
     ?assertEqual(Expected, epdg_ikev2_crypto:prf(sha, Key, Data)).
 
 %%====================================================================
+%% AES-XCBC: RFC 3566 §4.6 MAC test vectors (all of them). With a
+%% 16-byte key the PRF equals the untruncated MAC (RFC 4434 §2), so
+%% prf/3 is the algorithm under test; AUTH_AES_XCBC_96 additionally
+%% truncates to the first 12 bytes.
+%%====================================================================
+
+unhex(S) ->
+    << <<(binary_to_integer(<<A, B>>, 16))>> || <<A, B>> <= S >>.
+
+iota(N) -> << <<I>> || I <- lists:seq(0, N - 1) >>.
+
+-define(XCBC_KEY, unhex(<<"000102030405060708090a0b0c0d0e0f">>)).
+
+aes_xcbc_rfc3566_vectors_test_() ->
+    Cases = [
+        {"TC1: 0-byte input", <<>>,
+         <<"75f0251d528ac01c4573dfd584d79f29">>},
+        {"TC2: 3-byte input", iota(3),
+         <<"5b376580ae2f19afe7219ceef172756f">>},
+        {"TC3: 16-byte input", iota(16),
+         <<"d2a246fa349b68a79998a4394ff7a263">>},
+        {"TC4: 20-byte input", iota(20),
+         <<"47f51b4564966215b8985c63055ed308">>},
+        {"TC5: 32-byte input", iota(32),
+         <<"f54f0ec8d2b9f3d36807734bd5283fd4">>},
+        {"TC6: 34-byte input", iota(34),
+         <<"becbb3bccdb518a30677d5481fb6b4d8">>},
+        {"TC7: 1000-byte input", binary:copy(<<0>>, 1000),
+         <<"f0dafee895db30253761103b5d84528f">>}
+    ],
+    [{Desc,
+      fun() ->
+          Expected = unhex(ExpectedHex),
+          Mac = epdg_ikev2_crypto:prf(aes128_xcbc, ?XCBC_KEY, Msg),
+          ?assertEqual(Expected, Mac),
+          %% AES-XCBC-MAC-96: first 96 bits of the full MAC.
+          ?assertEqual(binary:part(Expected, 0, 12), binary:part(Mac, 0, 12))
+      end}
+     || {Desc, Msg, ExpectedHex} <- Cases].
+
+%%====================================================================
+%% AES-XCBC-PRF-128: RFC 4434 §2.1 test vectors (16-, 10- and 18-byte
+%% keys exercise the as-is / zero-pad / reduce key rules).
+%%====================================================================
+
+aes_xcbc_prf_rfc4434_vectors_test_() ->
+    Msg = iota(20),
+    Cases = [
+        {"16-byte key", <<"000102030405060708090a0b0c0d0e0f">>,
+         <<"47f51b4564966215b8985c63055ed308">>},
+        {"10-byte key", <<"00010203040506070809">>,
+         <<"0fa087af7d866e7653434e602fdde835">>},
+        {"18-byte key", <<"000102030405060708090a0b0c0d0e0fedcb">>,
+         <<"8cd3c93ae598a9803006ffb67c40e9e4">>}
+    ],
+    [{Desc,
+      fun() ->
+          ?assertEqual(unhex(ExpectedHex),
+                       epdg_ikev2_crypto:prf(aes128_xcbc, unhex(KeyHex), Msg))
+      end}
+     || {Desc, KeyHex, ExpectedHex} <- Cases].
+
+%%====================================================================
+%% Full AES-XCBC IKE suite round-trip: AES-CBC-128 + PRF_AES128_XCBC
+%% + AUTH_AES_XCBC_96 (ESP profile, RFC 4434 / RFC 3566).
+%%====================================================================
+
+xcbc_suite_roundtrip_test() ->
+    Params = suite_params(12, 128, 4, 5),
+    {Msg, _} = roundtrip(Params),
+    %% RFC 3566: 96-bit (12-byte) ICV truncation.
+    ?assertEqual(12, icv_len_of(Msg, 16, cbc_ct_len(?INNER_LEN))).
+
+xcbc_suite_tamper_fails_test() ->
+    Params = suite_params(12, 128, 4, 5),
+    Keys = derive_keys(Params),
+    Msg = encode(Params, Keys),
+    Tampered = flip_first_ct_byte(Msg, 16),
+    ?assertEqual({error, icv_check_failed}, decode(Params, Keys, Tampered)).
+
+%%====================================================================
 %% encrypt_sk / decrypt_sk generalisation across key sizes
 %%====================================================================
 

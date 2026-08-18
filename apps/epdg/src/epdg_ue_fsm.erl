@@ -2297,6 +2297,7 @@ child_enc_alg(_) -> aes_cbc_128.
 
 child_integ_alg(none)          -> none;
 child_integ_alg(#{id := 2})    -> hmac_sha1;
+child_integ_alg(#{id := 5})    -> aes_xcbc;
 child_integ_alg(#{id := 12})   -> hmac_sha256;
 child_integ_alg(#{id := 13})   -> hmac_sha384;
 child_integ_alg(#{id := 14})   -> hmac_sha512;

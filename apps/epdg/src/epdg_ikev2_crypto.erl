@@ -85,7 +85,53 @@ prf(sha256, Key, Data) ->
 prf(sha384, Key, Data) ->
     crypto:mac(hmac, sha384, Key, Data);
 prf(sha512, Key, Data) ->
-    crypto:mac(hmac, sha512, Key, Data).
+    crypto:mac(hmac, sha512, Key, Data);
+prf(aes128_xcbc, Key, Data) ->
+    %% AES-XCBC-PRF-128 (RFC 4434): AES-XCBC-MAC without truncation,
+    %% with the key first brought to exactly 128 bits.
+    aes_xcbc_mac(xcbc_prf_key(Key), Data).
+
+%%====================================================================
+%% AES-XCBC-MAC (RFC 3566 §4)
+%%
+%% K1/K2/K3 are derived by encrypting the constants 0x01…/0x02…/0x03…
+%% with the 128-bit key K. The message is CBC-MACed under K1; the last
+%% block is additionally XORed with K2 when it is a full 128-bit block,
+%% or 10*-padded and XORed with K3 otherwise (an empty message is one
+%% padded block). AUTH_AES_XCBC_96 truncates the result to 96 bits;
+%% the PRF uses the full 128 bits.
+%%====================================================================
+
+-spec aes_xcbc_mac(binary(), binary()) -> binary().
+aes_xcbc_mac(Key, Message) when byte_size(Key) =:= 16 ->
+    K1 = aes_ecb(Key, binary:copy(<<16#01>>, 16)),
+    K2 = aes_ecb(Key, binary:copy(<<16#02>>, 16)),
+    K3 = aes_ecb(Key, binary:copy(<<16#03>>, 16)),
+    xcbc_mac_blocks(Message, K1, K2, K3, <<0:128>>).
+
+xcbc_mac_blocks(<<Block:16/binary>>, K1, K2, _K3, E) ->
+    %% Final full block: XOR with E[n-1] and K2, encrypt with K1.
+    aes_ecb(K1, crypto:exor(crypto:exor(Block, E), K2));
+xcbc_mac_blocks(<<Block:16/binary, Rest/binary>>, K1, K2, K3, E) ->
+    xcbc_mac_blocks(Rest, K1, K2, K3, aes_ecb(K1, crypto:exor(Block, E)));
+xcbc_mac_blocks(Last, K1, _K2, K3, E) when byte_size(Last) < 16 ->
+    %% Final partial (or empty) block: pad with a single "1" bit then
+    %% "0" bits, XOR with E[n-1] and K3, encrypt with K1.
+    PadZeros = 15 - byte_size(Last),
+    Padded = <<Last/binary, 16#80, 0:(PadZeros * 8)>>,
+    aes_ecb(K1, crypto:exor(crypto:exor(Padded, E), K3)).
+
+aes_ecb(Key, Block) ->
+    crypto:crypto_one_time(aes_128_ecb, Key, Block, true).
+
+%% RFC 4434 §2: bring the PRF key to exactly 128 bits — use as-is if
+%% 16 bytes, right-pad with zeros if shorter, or reduce a longer key by
+%% running AES-XCBC-PRF-128 over it with an all-zero 128-bit key.
+xcbc_prf_key(Key) when byte_size(Key) =:= 16 -> Key;
+xcbc_prf_key(Key) when byte_size(Key) < 16 ->
+    <<Key/binary, 0:((16 - byte_size(Key)) * 8)>>;
+xcbc_prf_key(Key) ->
+    aes_xcbc_mac(<<0:128>>, Key).
 
 -spec prf_plus(atom(), binary(), binary(), non_neg_integer()) -> binary().
 prf_plus(PRF, Key, Seed, Needed) ->
@@ -109,7 +155,7 @@ derive_ike_keys(SharedSecret, NonceI, NonceR, #{prf := PRF,
                                                  prf_key_len := PRFKeyLen,
                                                  spi_i := SPIiBin,
                                                  spi_r := SPIrBin}) ->
-    SKEYSEED = prf(PRF, <<NonceI/binary, NonceR/binary>>, SharedSecret),
+    SKEYSEED = prf(PRF, skeyseed_key(PRF, NonceI, NonceR), SharedSecret),
 
     Needed = PRFKeyLen + IntegKeyLen + EncKeyLen +
              PRFKeyLen + IntegKeyLen + EncKeyLen + PRFKeyLen,
@@ -130,6 +176,17 @@ derive_ike_keys(SharedSecret, NonceI, NonceR, #{prf := PRF,
       sk_ai => SK_ai, sk_ar => SK_ar,
       sk_ei => SK_ei, sk_er => SK_er,
       sk_pi => SK_pi, sk_pr => SK_pr}.
+
+%% RFC 7296 §2.14: when the negotiated PRF takes a fixed-length key
+%% (PRF_AES128_XCBC per RFC 4434 key-derivation semantics), half the
+%% SKEYSEED key bits must come from Ni and half from Nr, taking the
+%% first bits of each. Variable-key HMAC PRFs use the full Ni | Nr.
+skeyseed_key(aes128_xcbc, NonceI, NonceR) ->
+    <<NI:8/binary, _/binary>> = NonceI,
+    <<NR:8/binary, _/binary>> = NonceR,
+    <<NI/binary, NR/binary>>;
+skeyseed_key(_PRF, NonceI, NonceR) ->
+    <<NonceI/binary, NonceR/binary>>.
 
 %%====================================================================
 %% Child SA key derivation (RFC 7296 section 2.17)
@@ -278,7 +335,7 @@ encode_encrypted_message(#{is_aead := false, enc_alg := EncAlg,
                ExType:8, Flags:8, MsgId:32, TotalLen:32>>,
     SKHdr = <<FirstInnerType:8, 0:8, SKBodyLen:16>>,
     MacIn = <<IkeHdr/binary, SKHdr/binary, IV/binary, Ciphertext/binary>>,
-    MacFull = crypto:mac(hmac, hmac_hash(IntegAlg), IntegKey, MacIn),
+    MacFull = integ_mac(IntegAlg, IntegKey, MacIn),
     ICV = binary:part(MacFull, 0, IcvLen),
     {ok, <<IkeHdr/binary, SKHdr/binary, IV/binary, Ciphertext/binary, ICV/binary>>};
 encode_encrypted_message(_, _, _, _, _) ->
@@ -360,8 +417,7 @@ decode_encrypted_message(#{is_aead := false, enc_alg := EncAlg,
                                     %% RawMessage[0 .. end-ICV_len] per RFC 7296 §3.14.
                                     MacInLen = byte_size(RawMessage) - IcvLen,
                                     MacIn = binary:part(RawMessage, 0, MacInLen),
-                                    MacFull = crypto:mac(hmac, hmac_hash(IntegAlg),
-                                                          IntegKey, MacIn),
+                                    MacFull = integ_mac(IntegAlg, IntegKey, MacIn),
                                     Expected = binary:part(MacFull, 0, IcvLen),
                                     case Expected =:= ICV of
                                         false -> {error, icv_check_failed};
@@ -393,6 +449,11 @@ aes_gcm_atom(aes_gcm_128) -> aes_128_gcm;
 aes_gcm_atom(aes_gcm_192) -> aes_192_gcm;
 aes_gcm_atom(aes_gcm_256) -> aes_256_gcm.
 
+%% Full-length MAC for an SK-payload integrity algorithm (truncation to
+%% icv_len/1 happens at the call sites).
+integ_mac(aes_xcbc_96, Key, Data) -> aes_xcbc_mac(Key, Data);
+integ_mac(Alg, Key, Data) -> crypto:mac(hmac, hmac_hash(Alg), Key, Data).
+
 hmac_hash(hmac_sha1_96)    -> sha;
 hmac_hash(hmac_sha256_128) -> sha256;
 hmac_hash(hmac_sha384_192) -> sha384;
@@ -400,7 +461,9 @@ hmac_hash(hmac_sha512_256) -> sha512.
 
 %% RFC 4868: truncated output length for HMAC-SHA-2-based integrity algos.
 %% RFC 2404: HMAC-SHA-1-96 truncates to 96 bits (12 bytes).
+%% RFC 3566: AUTH_AES_XCBC_96 truncates to 96 bits (12 bytes).
 icv_len(hmac_sha1_96)    -> 12;
+icv_len(aes_xcbc_96)     -> 12;
 icv_len(hmac_sha256_128) -> 16;
 icv_len(hmac_sha384_192) -> 24;
 icv_len(hmac_sha512_256) -> 32.
