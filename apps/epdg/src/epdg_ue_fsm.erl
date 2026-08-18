@@ -2255,8 +2255,10 @@ ip_bytes({A,B,C,D,E,F,G,H}) ->
 ip_bytes(_) -> <<0,0,0,0>>.
 
 child_enc_alg(#{id := 20, attrs := #{key_length := 256}}) -> aes_gcm_256;
+child_enc_alg(#{id := 20, attrs := #{key_length := 192}}) -> aes_gcm_192;
 child_enc_alg(#{id := 20, attrs := #{key_length := 128}}) -> aes_gcm_128;
 child_enc_alg(#{id := 12, attrs := #{key_length := 256}}) -> aes_cbc_256;
+child_enc_alg(#{id := 12, attrs := #{key_length := 192}}) -> aes_cbc_192;
 child_enc_alg(#{id := 12, attrs := #{key_length := 128}}) -> aes_cbc_128;
 child_enc_alg(_) -> aes_cbc_128.
 

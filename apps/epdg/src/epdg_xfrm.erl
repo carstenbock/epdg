@@ -287,8 +287,10 @@ run_cmd(Cmd) ->
     end.
 
 enc_alg_str(aes_cbc_128)       -> "cbc(aes)";
+enc_alg_str(aes_cbc_192)       -> "cbc(aes)";
 enc_alg_str(aes_cbc_256)       -> "cbc(aes)";
 enc_alg_str(aes_gcm_128)       -> "rfc4106(gcm(aes))";
+enc_alg_str(aes_gcm_192)       -> "rfc4106(gcm(aes))";
 enc_alg_str(aes_gcm_256)       -> "rfc4106(gcm(aes))";
 enc_alg_str(chacha20_poly1305) -> "rfc7539esp(chacha20,poly1305)";
 enc_alg_str(_)                 -> "cbc(aes)".

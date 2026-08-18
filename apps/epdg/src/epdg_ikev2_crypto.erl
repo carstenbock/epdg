@@ -144,28 +144,33 @@ derive_child_keys(PRF, SK_d, NonceI, NonceR, Needed) ->
 %%====================================================================
 
 -spec encrypt_sk(atom(), binary(), binary(), binary()) -> binary().
-encrypt_sk(aes_gcm_256, Key, IV, Plaintext) ->
+encrypt_sk(Alg, Key, IV, Plaintext)
+  when Alg =:= aes_gcm_128; Alg =:= aes_gcm_192; Alg =:= aes_gcm_256 ->
     {Ciphertext, Tag} = crypto:crypto_one_time_aead(
-        aes_256_gcm, Key, IV, Plaintext, <<>>, 16, true),
+        aes_gcm_atom(Alg), Key, IV, Plaintext, <<>>, 16, true),
     <<IV/binary, Ciphertext/binary, Tag/binary>>;
-encrypt_sk(aes_cbc_256, Key, IV, Plaintext) ->
+encrypt_sk(Alg, Key, IV, Plaintext)
+  when Alg =:= aes_cbc_128; Alg =:= aes_cbc_192; Alg =:= aes_cbc_256 ->
     PadLen = 16 - (byte_size(Plaintext) + 1) rem 16,
     Padding = binary:copy(<<PadLen:8>>, PadLen),
     Padded = <<Plaintext/binary, Padding/binary, PadLen:8>>,
-    Ciphertext = crypto:crypto_one_time(aes_256_cbc, Key, IV, Padded, true),
+    Ciphertext = crypto:crypto_one_time(aes_cbc_atom(Alg), Key, IV, Padded, true),
     <<IV/binary, Ciphertext/binary>>.
 
 -spec decrypt_sk(atom(), binary(), binary(), binary()) -> binary() | {error, term()}.
-decrypt_sk(aes_gcm_256, Key, <<IV:12/binary, Rest/binary>>, _AAD) ->
+decrypt_sk(Alg, Key, <<IV:12/binary, Rest/binary>>, _AAD)
+  when Alg =:= aes_gcm_128; Alg =:= aes_gcm_192; Alg =:= aes_gcm_256 ->
     TagLen = 16,
     CTLen = byte_size(Rest) - TagLen,
     <<Ciphertext:CTLen/binary, Tag:TagLen/binary>> = Rest,
-    case crypto:crypto_one_time_aead(aes_256_gcm, Key, IV, Ciphertext, <<>>, Tag, false) of
+    case crypto:crypto_one_time_aead(aes_gcm_atom(Alg), Key, IV, Ciphertext,
+                                     <<>>, Tag, false) of
         error -> {error, decrypt_failed};
         Plain -> Plain
     end;
-decrypt_sk(aes_cbc_256, Key, <<IV:16/binary, Ciphertext/binary>>, _AAD) ->
-    Padded = crypto:crypto_one_time(aes_256_cbc, Key, IV, Ciphertext, false),
+decrypt_sk(Alg, Key, <<IV:16/binary, Ciphertext/binary>>, _AAD)
+  when Alg =:= aes_cbc_128; Alg =:= aes_cbc_192; Alg =:= aes_cbc_256 ->
+    Padded = crypto:crypto_one_time(aes_cbc_atom(Alg), Key, IV, Ciphertext, false),
     PadLen = binary:last(Padded),
     DataLen = byte_size(Padded) - PadLen - 1,
     <<Data:DataLen/binary, _/binary>> = Padded,
@@ -208,7 +213,7 @@ decrypt_sk(aes_cbc_256, Key, <<IV:16/binary, Ciphertext/binary>>, _AAD) ->
 -spec encode_encrypted_message(map(), map(), responder | initiator,
                                 map(), [{atom(), binary()}]) ->
     {ok, binary()} | {error, term()}.
-encode_encrypted_message(#{is_aead := true, enc_alg := aes_gcm_256,
+encode_encrypted_message(#{is_aead := true, enc_alg := EncAlg,
                            enc_base_key_len := EncKeyLen, salt_len := SaltLen},
                          Keys, Direction,
                          #{initiator_spi := ISPI, responder_spi := RSPI,
@@ -239,8 +244,8 @@ encode_encrypted_message(#{is_aead := true, enc_alg := aes_gcm_256,
     AAD     = <<IkeHdr/binary, SKHdr/binary>>,
 
     {Ciphertext, Tag} =
-        crypto:crypto_one_time_aead(aes_256_gcm, EncKey, Nonce, Plaintext,
-                                    AAD, 16, true),
+        crypto:crypto_one_time_aead(aes_gcm_atom(EncAlg), EncKey, Nonce,
+                                    Plaintext, AAD, 16, true),
 
     {ok, <<IkeHdr/binary, SKHdr/binary, IV/binary, Ciphertext/binary, Tag/binary>>};
 encode_encrypted_message(#{is_aead := false, enc_alg := EncAlg,
@@ -250,7 +255,8 @@ encode_encrypted_message(#{is_aead := false, enc_alg := EncAlg,
                          #{initiator_spi := ISPI, responder_spi := RSPI,
                            exchange_type_raw := ExType, flags := Flags,
                            message_id := MsgId}, InnerChain)
-  when EncAlg =:= aes_cbc_256 orelse EncAlg =:= aes_cbc_128 ->
+  when EncAlg =:= aes_cbc_256 orelse EncAlg =:= aes_cbc_192
+       orelse EncAlg =:= aes_cbc_128 ->
     {SK_e, SK_a} = keys_for_direction(Direction, Keys),
     <<EncKey:EncKeyLen/binary, _/binary>> = SK_e,
     <<IntegKey:IntegKeyLen/binary, _/binary>> = SK_a,
@@ -280,7 +286,7 @@ encode_encrypted_message(_, _, _, _, _) ->
 %% decoded inner payload list plus the message header (for convenience).
 -spec decode_encrypted_message(map(), map(), responder | initiator, binary()) ->
     {ok, #{header := map(), payloads := [map()]}} | {error, term()}.
-decode_encrypted_message(#{is_aead := true, enc_alg := aes_gcm_256,
+decode_encrypted_message(#{is_aead := true, enc_alg := EncAlg,
                            enc_base_key_len := EncKeyLen, salt_len := SaltLen},
                          Keys, PeerDirection, RawMessage)
   when byte_size(RawMessage) > (?IKE_HDR_LEN + ?SK_HDR_LEN + 8 + 16) ->
@@ -305,7 +311,8 @@ decode_encrypted_message(#{is_aead := true, enc_alg := aes_gcm_256,
                             SKHdrBytes  =
                                 <<InnerFirstType:8, 0:8, SKPLen:16>>,
                             AAD = <<IkeHdrBytes/binary, SKHdrBytes/binary>>,
-                            case crypto:crypto_one_time_aead(aes_256_gcm, EncKey,
+                            case crypto:crypto_one_time_aead(aes_gcm_atom(EncAlg),
+                                                              EncKey,
                                                               Nonce, Ciphertext,
                                                               AAD, Tag, false) of
                                 error ->
@@ -326,7 +333,8 @@ decode_encrypted_message(#{is_aead := false, enc_alg := EncAlg,
                            enc_base_key_len := EncKeyLen,
                            integ_alg := IntegAlg, integ_key_len := IntegKeyLen},
                          Keys, PeerDirection, RawMessage)
-  when EncAlg =:= aes_cbc_256 orelse EncAlg =:= aes_cbc_128 ->
+  when EncAlg =:= aes_cbc_256 orelse EncAlg =:= aes_cbc_192
+       orelse EncAlg =:= aes_cbc_128 ->
     {SK_e, SK_a} = keys_for_direction(PeerDirection, Keys),
     <<EncKey:EncKeyLen/binary, _/binary>> = SK_e,
     <<IntegKey:IntegKeyLen/binary, _/binary>> = SK_a,
@@ -376,7 +384,12 @@ decode_encrypted_message(_, _, _, _) ->
     {error, unsupported_or_short_message}.
 
 aes_cbc_atom(aes_cbc_128) -> aes_128_cbc;
+aes_cbc_atom(aes_cbc_192) -> aes_192_cbc;
 aes_cbc_atom(aes_cbc_256) -> aes_256_cbc.
+
+aes_gcm_atom(aes_gcm_128) -> aes_128_gcm;
+aes_gcm_atom(aes_gcm_192) -> aes_192_gcm;
+aes_gcm_atom(aes_gcm_256) -> aes_256_gcm.
 
 hmac_hash(hmac_sha256_128) -> sha256;
 hmac_hash(hmac_sha384_192) -> sha384;

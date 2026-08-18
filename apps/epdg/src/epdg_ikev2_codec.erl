@@ -389,8 +389,13 @@ pick_first_supported([T | Rest], Pred) ->
 
 %% Supported algorithm predicates. Keep conservative — only algos we know
 %% the crypto module implements today.
-is_supported_encr(#{id := 20, attrs := #{key_length := 256}}) -> true; %% AES-GCM-16, 256
-is_supported_encr(#{id := 12, attrs := #{key_length := 256}}) -> true; %% AES-CBC, 256
+%% Key lengths 128/192/256 for AES-GCM-16 (ID 20) and AES-CBC (ID 12) per
+%% the 3GPP IKEv2/ESP profile (TS 33.402 §8.2.2/§8.2.3 → TS 33.210);
+%% AES-CBC-128 is the mandatory baseline that conservative UEs propose.
+is_supported_encr(#{id := 20, attrs := #{key_length := KL}})
+  when KL =:= 128; KL =:= 192; KL =:= 256 -> true; %% AES-GCM-16
+is_supported_encr(#{id := 12, attrs := #{key_length := KL}})
+  when KL =:= 128; KL =:= 192; KL =:= 256 -> true; %% AES-CBC
 is_supported_encr(_) -> false.
 
 is_supported_prf(#{id := 5}) -> true;  %% HMAC-SHA256
@@ -950,10 +955,14 @@ prf_atom(_)          -> {error, unsupported_prf}.
 %% {EncAlg, KeyLen, SaltLen, IsAead}
 encr_params(#{id := 20, attrs := #{key_length := 256}}) ->
     {ok, aes_gcm_256, 32, 4, true};
+encr_params(#{id := 20, attrs := #{key_length := 192}}) ->
+    {ok, aes_gcm_192, 24, 4, true};
 encr_params(#{id := 20, attrs := #{key_length := 128}}) ->
     {ok, aes_gcm_128, 16, 4, true};
 encr_params(#{id := 12, attrs := #{key_length := 256}}) ->
     {ok, aes_cbc_256, 32, 0, false};
+encr_params(#{id := 12, attrs := #{key_length := 192}}) ->
+    {ok, aes_cbc_192, 24, 0, false};
 encr_params(#{id := 12, attrs := #{key_length := 128}}) ->
     {ok, aes_cbc_128, 16, 0, false};
 encr_params(_) ->
