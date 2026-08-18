@@ -19,8 +19,16 @@
 %% live SA (the #data record is otherwise private to this module).
 -export([drain_action/1, find_notify/2, new_data_for_test/1,
          classify_register_ue_result/1,
-         build_notify_response/4, process_sa_init_payloads/1]).
+         build_notify_response/4, process_sa_init_payloads/1,
+         %% IPv6 PDN: inner XFRM selectors
+         ue6_selector/1, ip6_mask/2]).
 -endif.
+
+%% Length of the IPv6 prefix a PDN connection gets. 3GPP fixes this at /64
+%% (TS 23.401 §5.3.1.2.2): the network assigns the prefix, the UE picks its own
+%% interface identifier within it. Used for the CFG_REPLY prefix length, the
+%% XFRM inner selectors and the handover PAA so all three agree.
+-define(UE6_PREFIX_LEN, 64).
 
 -define(IKE_SA_INIT_TIMEOUT, 30000).
 -define(IKE_AUTH_TIMEOUT,    60000).
@@ -2191,12 +2199,12 @@ install_child_sas({U_A, U_B, U_C, U_D} = UeOuter, PeerPort, PeerSPI, RespSPI,
     _ = {U_A, U_B, U_C, U_D},  %% silence unused
     ok.
 
-%% Install the in/fwd/out XFRM policies for the UE's IPv6 inner address.
+%% Install the in/fwd/out XFRM policies for the UE's IPv6 inner prefix.
 %% No-op when the UE has no IPv6 (IPv4-only PAA). Reqid pins the policy
 %% templates to this UE's Child SA pair (shared with the IPv4 selectors).
 install_v6_policies(undefined, _UeOuter, _LocalOuter, _Reqid) -> ok;
 install_v6_policies(UeInnerIp6, UeOuter, LocalOuter, Reqid) ->
-    Ue6Cidr  = ip6_cidr(UeInnerIp6, 128),
+    Ue6Cidr  = ue6_selector(UeInnerIp6),
     Any6Cidr = "::/0",
     log_xfrm_result(pol6_in, 0,
         catch epdg_xfrm:create_policy(#{src => Ue6Cidr, dst => Any6Cidr,
@@ -2339,6 +2347,33 @@ ip4_cidr({A,B,C,D}, Prefix) ->
 
 ip6_cidr({_,_,_,_,_,_,_,_} = Ip6, Prefix) ->
     lists:flatten(io_lib:format("~s/~B", [inet:ntoa(Ip6), Prefix])).
+
+%% XFRM selector covering all of a UE's IPv6 inner traffic.
+%%
+%% The PGW allocates a /64 PDN prefix (TS 23.401 §5.3.1.2.2) and the UE derives
+%% its own interface identifier from it — an iPhone handed fd00:230:babe:24::1
+%% sources traffic from fd00:230:babe:24:ff75:386e:bef4:74ad. Selecting on the
+%% single address the PAA named therefore matches nothing the UE actually sends
+%% or receives: the kernel drops the uplink on the inbound policy check and
+%% never encapsulates the downlink, so the tunnel comes up and then carries no
+%% traffic at all (observed as a SIP REGISTER stuck in "Trying" until the UE's
+%% 100 s IMS registration timer tore the tunnel down).
+%%
+%% The host bits are zeroed rather than left in place: the kernel stores and
+%% prints the masked form, and delete_ue6_policies/1 has to hand `ip xfrm' a
+%% string that matches what create_policy installed or the delete silently
+%% no-ops and the policy leaks to the next session.
+ue6_selector({_,_,_,_,_,_,_,_} = Ip6) ->
+    ip6_cidr(ip6_mask(Ip6, ?UE6_PREFIX_LEN), ?UE6_PREFIX_LEN).
+
+%% Zero everything below PrefixLen. Derived from the prefix length rather than
+%% hardcoding "keep 4 hextets" so the two cannot drift apart.
+ip6_mask({_,_,_,_,_,_,_,_} = Ip6, PrefixLen)
+  when PrefixLen >= 0, PrefixLen =< 128 ->
+    <<N:128>> = encode_ip6(Ip6),
+    Mask = ((1 bsl PrefixLen) - 1) bsl (128 - PrefixLen),
+    <<A:16,B:16,C:16,D:16,E:16,F:16,G:16,H:16>> = <<(N band Mask):128>>,
+    {A,B,C,D,E,F,G,H}.
 
 binary_to_int(<<N:32>>) -> N;
 binary_to_int(<<N:64>>) -> N;
@@ -2794,7 +2829,8 @@ delete_ue_policies(UeInnerIp, UeInnerIp6) ->
 
 delete_ue6_policies(undefined) -> ok;
 delete_ue6_policies(UeInnerIp6) ->
-    Ue6Cidr  = ip6_cidr(UeInnerIp6, 128),
+    %% Must derive the selector exactly as install_v6_policies/4 did.
+    Ue6Cidr  = ue6_selector(UeInnerIp6),
     Any6Cidr = "::/0",
     catch epdg_xfrm:delete_policy(#{src => Ue6Cidr,  dst => Any6Cidr,
                                     direction => in}),
