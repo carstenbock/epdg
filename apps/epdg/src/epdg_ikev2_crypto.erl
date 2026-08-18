@@ -78,6 +78,8 @@ dh_compute(_, _, _) ->
 %%====================================================================
 
 -spec prf(atom(), binary(), binary()) -> binary().
+prf(sha, Key, Data) ->
+    crypto:mac(hmac, sha, Key, Data);
 prf(sha256, Key, Data) ->
     crypto:mac(hmac, sha256, Key, Data);
 prf(sha384, Key, Data) ->
@@ -391,11 +393,14 @@ aes_gcm_atom(aes_gcm_128) -> aes_128_gcm;
 aes_gcm_atom(aes_gcm_192) -> aes_192_gcm;
 aes_gcm_atom(aes_gcm_256) -> aes_256_gcm.
 
+hmac_hash(hmac_sha1_96)    -> sha;
 hmac_hash(hmac_sha256_128) -> sha256;
 hmac_hash(hmac_sha384_192) -> sha384;
 hmac_hash(hmac_sha512_256) -> sha512.
 
 %% RFC 4868: truncated output length for HMAC-SHA-2-based integrity algos.
+%% RFC 2404: HMAC-SHA-1-96 truncates to 96 bits (12 bytes).
+icv_len(hmac_sha1_96)    -> 12;
 icv_len(hmac_sha256_128) -> 16;
 icv_len(hmac_sha384_192) -> 24;
 icv_len(hmac_sha512_256) -> 32.

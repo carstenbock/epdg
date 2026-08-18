@@ -50,6 +50,31 @@ ike_proposal(Specs) ->
        transforms_data => transforms_bin(Specs)}].
 
 %%====================================================================
+%% Classic conservative Samsung/Qualcomm profile:
+%% AES-CBC-128 + PRF_HMAC_SHA1 + AUTH_HMAC_SHA1_96 + MODP-2048.
+%% Must select, not reject.
+%%====================================================================
+
+cbc128_sha1_selects_test() ->
+    Proposals = ike_proposal([{?T_ENCR, ?ENCR_AES_CBC, 128},
+                              {?T_PRF, ?PRF_HMAC_SHA1},
+                              {?T_INTEG, ?AUTH_HMAC_SHA1_96},
+                              {?T_DH, ?DH_MODP_2048}]),
+    {ok, Suite} = epdg_ikev2_codec:select_proposal(Proposals),
+    ?assertMatch(#{encr := #{id := ?ENCR_AES_CBC,
+                             attrs := #{key_length := 128}},
+                   prf := #{id := ?PRF_HMAC_SHA1},
+                   integ := #{id := ?AUTH_HMAC_SHA1_96},
+                   dh := #{id := ?DH_MODP_2048}}, Suite),
+    %% The selected suite must map to usable key-derivation parameters:
+    %% OTP hash atom sha, 20-byte PRF/integrity keys.
+    {ok, Params} = epdg_ikev2_codec:keys_params_for_suite(Suite),
+    ?assertMatch(#{enc_alg := aes_cbc_128, enc_key_len := 16,
+                   prf := sha, prf_key_len := 20,
+                   integ_alg := hmac_sha1_96, integ_key_len := 20,
+                   is_aead := false}, Params).
+
+%%====================================================================
 %% AES-CBC-128 with SHA-2 must select (128-bit baseline of the profile).
 %%====================================================================
 

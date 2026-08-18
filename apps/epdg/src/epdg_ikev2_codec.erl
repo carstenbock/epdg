@@ -398,11 +398,13 @@ is_supported_encr(#{id := 12, attrs := #{key_length := KL}})
   when KL =:= 128; KL =:= 192; KL =:= 256 -> true; %% AES-CBC
 is_supported_encr(_) -> false.
 
+is_supported_prf(#{id := 2}) -> true;  %% HMAC-SHA1 (legacy but common)
 is_supported_prf(#{id := 5}) -> true;  %% HMAC-SHA256
 is_supported_prf(#{id := 6}) -> true;  %% HMAC-SHA384
 is_supported_prf(#{id := 7}) -> true;  %% HMAC-SHA512
 is_supported_prf(_) -> false.
 
+is_supported_integ(#{id := 2})  -> true; %% HMAC-SHA1-96 (legacy but common)
 is_supported_integ(#{id := 12}) -> true; %% HMAC-SHA256-128
 is_supported_integ(#{id := 13}) -> true; %% HMAC-SHA384-192
 is_supported_integ(#{id := 14}) -> true; %% HMAC-SHA512-256
@@ -853,10 +855,10 @@ pick_child_suite(Transforms) ->
             {error, unsupported_child_transforms}
     end.
 
-%% For ESP we accept the same AES/GCM/CBC set as for IKE.
-is_supported_child_encr(T) -> is_supported_encr(T).
-is_supported_child_integ(#{id := 2}) -> true; %% HMAC-SHA1-96 (legacy but common)
-is_supported_child_integ(T)          -> is_supported_integ(T).
+%% For ESP we accept the same AES/GCM/CBC and integrity sets as for IKE
+%% (HMAC-SHA1-96 included in is_supported_integ/1).
+is_supported_child_encr(T)  -> is_supported_encr(T).
+is_supported_child_integ(T) -> is_supported_integ(T).
 
 %% Length of the ESP enc key (including AES-GCM salt for AEAD).
 -spec child_enc_key_len(map()) -> non_neg_integer().
@@ -947,6 +949,7 @@ keys_params_for_suite(#{encr := Encr, prf := Prf, integ := Integ}) ->
 keys_params_for_suite(_) ->
     {error, incomplete_suite}.
 
+prf_atom(#{id := 2}) -> {ok, sha, 20};
 prf_atom(#{id := 5}) -> {ok, sha256, 32};
 prf_atom(#{id := 6}) -> {ok, sha384, 48};
 prf_atom(#{id := 7}) -> {ok, sha512, 64};
@@ -970,6 +973,7 @@ encr_params(_) ->
 
 integ_params(none, true) ->
     {ok, none, 0};
+integ_params(#{id :=  2}, false) -> {ok, hmac_sha1_96,    20};
 integ_params(#{id := 12}, false) -> {ok, hmac_sha256_128, 32};
 integ_params(#{id := 13}, false) -> {ok, hmac_sha384_192, 48};
 integ_params(#{id := 14}, false) -> {ok, hmac_sha512_256, 64};

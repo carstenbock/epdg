@@ -81,8 +81,16 @@ flip_first_ct_byte(Msg, IvLen) ->
 %% Round-trips (encrypt then decrypt) per suite
 %%====================================================================
 
-%% PRF_HMAC_SHA2_256 = 5, AUTH_HMAC_SHA2_256_128 = 12 (SHA-1 IDs are
-%% covered by the sha1-specific tests below).
+%% PRF_HMAC_SHA1 = 2, PRF_HMAC_SHA2_256 = 5,
+%% AUTH_HMAC_SHA1_96 = 2, AUTH_HMAC_SHA2_256_128 = 12.
+
+cbc128_sha1_roundtrip_test() ->
+    %% Full SHA-1 suite: also exercises the prf+ key-derivation loop
+    %% with 20-byte PRF blocks (not a multiple of 32).
+    Params = suite_params(12, 128, 2, 2),
+    {Msg, _} = roundtrip(Params),
+    %% RFC 2404: HMAC-SHA-1-96 truncates to 12 bytes, not 16.
+    ?assertEqual(12, icv_len_of(Msg, 16, cbc_ct_len(?INNER_LEN))).
 
 cbc192_sha256_roundtrip_test() ->
     Params = suite_params(12, 192, 5, 12),
@@ -119,6 +127,13 @@ cbc128_sha256_roundtrip_test() ->
 %% Tamper detection: one flipped ciphertext byte must fail integrity
 %%====================================================================
 
+sha1_tamper_fails_test() ->
+    Params = suite_params(12, 128, 2, 2),
+    Keys = derive_keys(Params),
+    Msg = encode(Params, Keys),
+    Tampered = flip_first_ct_byte(Msg, 16),
+    ?assertEqual({error, icv_check_failed}, decode(Params, Keys, Tampered)).
+
 cbc_tamper_fails_test() ->
     Params = suite_params(12, 192, 5, 12),
     Keys = derive_keys(Params),
@@ -139,6 +154,18 @@ gcm192_tamper_fails_test() ->
     Msg = encode(Params, Keys),
     Tampered = flip_first_ct_byte(Msg, 8),
     ?assertEqual({error, icv_check_failed}, decode(Params, Keys, Tampered)).
+
+%%====================================================================
+%% PRF known-answer test: RFC 2202 §3 test case 1 for HMAC-SHA-1
+%%====================================================================
+
+prf_sha1_rfc2202_test() ->
+    Key = binary:copy(<<16#0b>>, 20),
+    Data = <<"Hi There">>,
+    Expected = <<16#b6, 16#17, 16#31, 16#86, 16#55, 16#05, 16#72, 16#64,
+                 16#e2, 16#8b, 16#c0, 16#b6, 16#fb, 16#37, 16#8c, 16#8e,
+                 16#f1, 16#46, 16#be, 16#00>>,
+    ?assertEqual(Expected, epdg_ikev2_crypto:prf(sha, Key, Data)).
 
 %%====================================================================
 %% encrypt_sk / decrypt_sk generalisation across key sizes
