@@ -193,6 +193,27 @@ init([]) ->
     %% helper port arrives as {'EXIT', Port, _} instead of killing us
     %% without cleanup.
     process_flag(trap_exit, true),
+    %% An empty pool list means setup_shared_tun/1 installs no
+    %% `from <pool>' rule at all: every session would attach fine but no
+    %% uplink packet could ever reach the shared TUN. epdg_config:init/0
+    %% refuses to boot without EPDG_UE_IP_POOLS, so hitting this means
+    %% the forwarder was started without the config having run — fail
+    %% loudly (CrashLoopBackOff) instead of coming up seemingly healthy.
+    %% Test environments without pools must opt in explicitly via the
+    %% `allow_empty_ue_pools' application env.
+    Pools = epdg_config:get(ue_ip_pools, []),
+    AllowEmpty = application:get_env(epdg, allow_empty_ue_pools, false),
+    case {Pools, AllowEmpty} of
+        {[], false} ->
+            logger:error("GTP-U: no UE IP pools configured — no uplink "
+                         "would ever work; check EPDG_UE_IP_POOLS. "
+                         "Refusing to start."),
+            {stop, no_ue_ip_pools};
+        _ ->
+            init_datapath(Pools)
+    end.
+
+init_datapath(Pools) ->
     cleanup_stale_tun_devices(),
     %% Node-global and idempotent; runs once per forwarder start (NOT per
     %% attach — re-running it on every TUN setup used to dump the whole
@@ -200,7 +221,6 @@ init([]) ->
     %% (PGW-U pod restart) keep their escape because the rules match the
     %% device name, which open5gs reuses.
     ensure_pgwu_escape_rules(),
-    Pools = epdg_config:get(ue_ip_pools, []),
     TunPort = setup_shared_tun(Pools),
     BindIpStr = epdg_config:get(gtpu_bind_addr, "0.0.0.0"),
     BindIp    = parse_ip_or_any(BindIpStr),

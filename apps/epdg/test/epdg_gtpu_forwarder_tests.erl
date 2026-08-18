@@ -225,6 +225,51 @@ reattach_same_ip_supersedes_test() ->
     ?assertEqual(unknown_src, epdg_gtpu_forwarder:classify_for_test(Pkt, S4)).
 
 %%====================================================================
+%% Startup pool-list guard
+%%====================================================================
+
+%% A forwarder started without any configured UE pool installs no
+%% `from <pool>' rule: sessions would attach fine but no uplink packet
+%% could ever reach the shared TUN. The start must fail loudly
+%% (CrashLoopBackOff) instead of coming up seemingly healthy.
+init_empty_pools_refuses_to_start_test() ->
+    Saved = save_pool_env(),
+    application:unset_env(epdg, ue_ip_pools),
+    application:unset_env(epdg, allow_empty_ue_pools),
+    try
+        ?assertEqual({stop, no_ue_ip_pools}, epdg_gtpu_forwarder:init([]))
+    after
+        restore_pool_env(Saved)
+    end.
+
+%% Unit-test environments (no pools, no NET_ADMIN) must opt in via the
+%% explicit allow_empty_ue_pools switch — no guessing from eaddrinuse.
+init_empty_pools_allowed_by_switch_test() ->
+    epdg_metrics:init(),
+    Saved = save_pool_env(),
+    application:unset_env(epdg, ue_ip_pools),
+    application:set_env(epdg, allow_empty_ue_pools, true),
+    %% Ephemeral port: the real GTP-U port may be taken on the build host.
+    application:set_env(epdg, gtpu_port, 0),
+    try
+        ?assertMatch({ok, _}, epdg_gtpu_forwarder:init([]))
+    after
+        application:unset_env(epdg, gtpu_port),
+        restore_pool_env(Saved)
+    end.
+
+save_pool_env() ->
+    {application:get_env(epdg, ue_ip_pools),
+     application:get_env(epdg, allow_empty_ue_pools)}.
+
+restore_pool_env({Pools, Allow}) ->
+    set_or_unset(ue_ip_pools, Pools),
+    set_or_unset(allow_empty_ue_pools, Allow).
+
+set_or_unset(Key, undefined)   -> application:unset_env(epdg, Key);
+set_or_unset(Key, {ok, Value}) -> application:set_env(epdg, Key, Value).
+
+%%====================================================================
 %% Dedicated bearer regression
 %%====================================================================
 
