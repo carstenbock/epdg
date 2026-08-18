@@ -405,3 +405,61 @@ dedicated_bearer_tft_still_applies_test() ->
     %% Tearing down the default bearer also drops the dedicated one.
     S3 = epdg_gtpu_forwarder:unregister_ue_for_test(1001, S2),
     ?assertEqual(unknown_src, epdg_gtpu_forwarder:classify_for_test(Rtp, S3)).
+
+%%====================================================================
+%% GTP-U message dispatch (TS 29.281 §5.1, §7.2)
+%%
+%% Echo Requests must be recognised and answered.
+%%====================================================================
+
+%% Echo Request as the PGW-U sends it: S=1, TEID 0, no IEs.
+echo_request(Seq) ->
+    <<16#32, 16#01, 4:16, 0:32, Seq:16, 0:8, 0:8>>.
+
+decode_echo_request_test() ->
+    ?assertEqual({echo_request, 16#1234},
+                 epdg_gtpu_forwarder:decode_gtpu(echo_request(16#1234))).
+
+%% A peer that omits the (mandatory) Sequence Number still gets answered
+%% rather than silently dropped.
+decode_echo_request_without_seq_test() ->
+    ?assertEqual({echo_request, 0},
+                 epdg_gtpu_forwarder:decode_gtpu(
+                   <<16#30, 16#01, 0:16, 0:32>>)).
+
+decode_echo_response_test() ->
+    ?assertEqual({echo_response, 7},
+                 epdg_gtpu_forwarder:decode_gtpu(
+                   <<16#32, 16#02, 6:16, 0:32, 7:16, 0:8, 0:8, 16#0E, 0:8>>)).
+
+%% Echo handling must not have disturbed the T-PDU hot path.
+decode_tpdu_still_works_test() ->
+    ?assertEqual({ok, 16#1000, <<1, 2, 3, 4>>},
+                 epdg_gtpu_forwarder:decode_gtpu(
+                   <<16#30, 16#FF, 4:16, 16#1000:32, 1, 2, 3, 4>>)),
+    %% Same, with the optional Sequence Number present (S=1).
+    ?assertEqual({ok, 16#1000, <<1, 2, 3, 4>>},
+                 epdg_gtpu_forwarder:decode_gtpu(
+                   <<16#32, 16#FF, 8:16, 16#1000:32, 9:16, 0:8, 0:8,
+                     1, 2, 3, 4>>)).
+
+decode_rejects_gtpv2_and_garbage_test() ->
+    %% Version 2 on port 2152 is not ours.
+    ?assertEqual(error, epdg_gtpu_forwarder:decode_gtpu(
+                          <<16#48, 16#01, 4:16, 0:32, 0:16, 0:8, 0:8>>)),
+    ?assertEqual(error, epdg_gtpu_forwarder:decode_gtpu(<<>>)),
+    ?assertEqual(error, epdg_gtpu_forwarder:decode_gtpu(<<16#30, 16#FF>>)).
+
+%% The response must echo the request's sequence and carry the Recovery IE,
+%% or the PGW-U discards it and keeps counting the path as dead.
+encode_echo_response_test() ->
+    Rsp = epdg_gtpu_forwarder:encode_gtpu_echo_response(16#1234),
+    ?assertEqual(<<16#32, 16#02, 6:16, 0:32,
+                   16#1234:16, 0:8, 0:8, 16#0E, 0:8>>, Rsp),
+    %% Length field counts the octets after the 8 mandatory ones.
+    <<_:2/binary, Len:16, _/binary>> = Rsp,
+    ?assertEqual(byte_size(Rsp) - 8, Len),
+    %% ...and it decodes back as an Echo Response with the same sequence,
+    %% which is what a peer's own echo handler will do with it.
+    ?assertEqual({echo_response, 16#1234},
+                 epdg_gtpu_forwarder:decode_gtpu(Rsp)).

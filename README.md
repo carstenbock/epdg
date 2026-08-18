@@ -329,6 +329,11 @@ Served by Cowboy on `EPDG_API_PORT` (default 8080).
   `epdg_ue_ip_outside_pool_total`, `epdg_ue_inner_ip_key_collision_total`
   (two different subscribers mapped onto one uplink inner-IP key — check
   the PGW address allocation)
+* `epdg_gtpu_echo_req_rx_total` / `epdg_gtpu_echo_rsp_tx_total` — user-plane
+  path supervision from the PGW-U. These must track each other; a growing gap
+  (or a flat `req_rx` while the PGW logs GTP-U path timeouts) means our echo
+  replies are not reaching it. `epdg_gtpu_rx_undecodable_total` counts
+  datagrams on 2152 that are neither a T-PDU nor an echo
 * `epdg_diameter_swm_requests_total`, `epdg_diameter_swm_latency_ms_*`,
   `epdg_diameter_swm_peers` (gauge)
 * `epdg_xfrm_sa_active` (gauge), `epdg_xfrm_sa_created_total` / `_deleted_total` / `_errors_total`
