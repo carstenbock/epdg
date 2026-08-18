@@ -18,7 +18,8 @@
 %% is a minimal #data constructor so tests can drive drain_action/1 without a
 %% live SA (the #data record is otherwise private to this module).
 -export([drain_action/1, find_notify/2, new_data_for_test/1,
-         classify_register_ue_result/1]).
+         classify_register_ue_result/1,
+         build_notify_response/4, process_sa_init_payloads/1]).
 -endif.
 
 -define(IKE_SA_INIT_TIMEOUT, 30000).
@@ -828,7 +829,10 @@ with_ke_and_nonce(Suite, Payloads) ->
                         true ->
                             with_nonce(Suite, PeerPub, Payloads);
                         false ->
-                            {error, invalid_ke_payload}
+                            %% Carry the group we accepted from the UE's own
+                            %% SA proposal so the INVALID_KE_PAYLOAD notify
+                            %% tells it which group to retry with.
+                            {error, {invalid_ke_payload, SelectedDH}}
                     end;
                 {error, _} -> {error, invalid_syntax}
             end;
@@ -956,26 +960,47 @@ send_sa_init_response(ISPI, MsgId,
 send_notify_and_stop(ISPI, MsgId, Reason,
                       #data{responder_spi = RSPI, peer_ip = PeerIP,
                             peer_port = PeerPort} = Data) ->
+    RespBytes = build_notify_response(ISPI, RSPI, MsgId, Reason),
+    catch epdg_ikev2_listener:send(PeerIP, PeerPort, 500, RespBytes),
+    {stop, normal, Data}.
+
+%% Build the unprotected IKE_SA_INIT error response for a rejection reason.
+%% For INVALID_KE_PAYLOAD the responder has not committed to an IKE SA
+%% (the UE will retry IKE_SA_INIT from scratch with the indicated group),
+%% so per RFC 7296 the response carries a zero responder SPI — our
+%% pre-generated RSPI must not leak into it.
+build_notify_response(ISPI, RSPI, MsgId, Reason) ->
     NotifyType = notify_type_for_reason(Reason),
-    NotifyPayload = epdg_ikev2_codec:encode_notify_payload(0, NotifyType,
-                                                            <<>>, <<>>),
+    RSPI1 = case NotifyType of
+        17 -> 0;
+        _  -> RSPI
+    end,
+    NotifyPayload = epdg_ikev2_codec:encode_notify_payload(
+        0, NotifyType, <<>>, notify_data_for_reason(Reason)),
     {FirstPL, PayloadBin} = epdg_ikev2_codec:encode_payloads(
         [{notify, NotifyPayload}]),
-    RespBytes = epdg_ikev2_codec:encode_header(
+    epdg_ikev2_codec:encode_header(
         #{initiator_spi     => ISPI,
-          responder_spi     => RSPI,
+          responder_spi     => RSPI1,
           next_payload      => FirstPL,
           exchange_type_raw => 34,
           flags             => 16#20,
           message_id        => MsgId,
-          payload_bin       => PayloadBin}),
-    catch epdg_ikev2_listener:send(PeerIP, PeerPort, 500, RespBytes),
-    {stop, normal, Data}.
+          payload_bin       => PayloadBin}).
 
-notify_type_for_reason(no_proposal_chosen) -> 14;
-notify_type_for_reason(invalid_ke_payload) -> 17;
-notify_type_for_reason(invalid_syntax)     -> 7;
-notify_type_for_reason(_)                  -> 7.
+notify_type_for_reason(no_proposal_chosen)        -> 14;
+notify_type_for_reason({invalid_ke_payload, _})   -> 17;
+notify_type_for_reason(invalid_ke_payload)        -> 17;
+notify_type_for_reason(invalid_syntax)            -> 7;
+notify_type_for_reason(_)                         -> 7.
+
+%% RFC 7296 §1.2/§2.7: an INVALID_KE_PAYLOAD notification carries the
+%% responder's accepted DH group as a two-octet big-endian integer so the
+%% UE can retry with that group in a single re-negotiation round trip.
+%% Fallback group is 14 (2048-bit MODP, RFC 3526).
+notify_data_for_reason({invalid_ke_payload, Group}) -> <<Group:16>>;
+notify_data_for_reason(invalid_ke_payload)          -> <<14:16>>;
+notify_data_for_reason(_)                           -> <<>>.
 
 value_or_zero(undefined) -> 0;
 value_or_zero(N)         -> N.
