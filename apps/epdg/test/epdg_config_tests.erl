@@ -71,3 +71,49 @@ ue_ip_pools_v6_wider_than_64_accepted_test() ->
 ue_ip_pools_v4_narrow_pool_still_valid_test() ->
     ?assertEqual([{{10, 46, 1, 0}, 24}],
                  epdg_config:parse_ue_ip_pools("10.46.1.0/24")).
+
+%% Instance-id derivation (EPDG_INSTANCE_ID / POD_NAME): several ePDG
+%% pods on one hostNetwork node share the network namespace, and the
+%% instance id is the ONLY thing keeping their TUN devices, routing
+%% tables and rules apart — the derivation must be stable, predictable
+%% and hard-fail on invalid explicit values.
+
+instance_id_explicit_env_wins_test() ->
+    %% An explicit id beats any POD_NAME-derived value.
+    ?assertEqual(7, epdg_config:parse_instance_id("7", "epdg-3")),
+    ?assertEqual(0, epdg_config:parse_instance_id("0", false)),
+    ?assertEqual(63, epdg_config:parse_instance_id(" 63 ", false)).
+
+%% A typo silently mapping onto some other id would recreate exactly
+%% the device/table collision the id exists to prevent — fail the boot.
+instance_id_invalid_explicit_fails_boot_test() ->
+    ?assertError({invalid_config, _},
+                 epdg_config:parse_instance_id("64", false)),
+    ?assertError({invalid_config, _},
+                 epdg_config:parse_instance_id("-1", false)),
+    ?assertError({invalid_config, _},
+                 epdg_config:parse_instance_id("abc", false)),
+    ?assertError({invalid_config, _},
+                 epdg_config:parse_instance_id("", false)).
+
+%% StatefulSet ordinals are the expected steady-state source: epdg-0 /
+%% epdg-1 on one node get distinct, predictable ids.
+instance_id_statefulset_ordinal_test() ->
+    ?assertEqual(0, epdg_config:parse_instance_id(false, "epdg-0")),
+    ?assertEqual(1, epdg_config:parse_instance_id(false, "epdg-1")),
+    ?assertEqual(5, epdg_config:parse_instance_id(false, "epdg-gw-5")),
+    %% Ordinals beyond the 64-instance space wrap into 0..63.
+    ?assertEqual(2, epdg_config:parse_instance_id(false, "epdg-66")).
+
+%% Non-ordinal pod names (e.g. Deployment hash suffixes) hash stably
+%% into the id space: the same pod always derives the same id.
+instance_id_hash_fallback_is_stable_test() ->
+    Name = "epdg-7f9c4d8b6d-x2v4q",
+    Id = epdg_config:parse_instance_id(false, Name),
+    ?assertEqual(Id, epdg_config:parse_instance_id(false, Name)),
+    ?assert(Id >= 0 andalso Id =< 63).
+
+%% Single instance / local development: no env at all means id 0.
+instance_id_defaults_to_zero_test() ->
+    ?assertEqual(0, epdg_config:parse_instance_id(false, false)),
+    ?assertEqual(0, epdg_config:parse_instance_id(false, "")).

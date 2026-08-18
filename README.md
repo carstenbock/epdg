@@ -57,8 +57,10 @@ BEAM is out of the per-packet path once Child SAs are installed.
 A single Erlang/OTP application owns the whole signalling plane; a per-UE
 `gen_statem` drives one IKEv2/IPsec tunnel each. The kernel handles ESP
 (XFRM); GTP-U encapsulation runs in the userspace forwarder behind one
-shared TUN device (`epdg0`) for all UE bearers, with uplink attributed to
-its bearer by the inner source IP.
+shared TUN device per pod (`epdg<N>`, `epdg0` for a single instance — see
+[`EPDG_INSTANCE_ID`](#multiple-epdg-pods-per-node-epdg_instance_id)) for
+all UE bearers, with uplink attributed to its bearer by the inner source
+IP.
 
 ### Key modules
 
@@ -73,7 +75,7 @@ its bearer by the inner source IP.
 | `epdg_diameter_swm` | SWm Diameter client (DER/STR) toward the AAA via one transport per DRA replica |
 | `epdg_gtpc_client` | S2b GTP-C v2 Create/Delete Session; Echo heartbeat, FQDN re-resolve, restart detection |
 | `epdg_gtpc_codec` | GTPv2-C message/IE encode + decode (TS 29.274) |
-| `epdg_gtpu_forwarder` | Userspace GTP-U bridge (shared TUN `epdg0` ↔ S2b-U socket); uplink keyed by inner source IP, downlink demuxed by TEID |
+| `epdg_gtpu_forwarder` | Userspace GTP-U bridge (per-instance shared TUN `epdg<N>` ↔ S2b-U socket); uplink keyed by inner source IP, downlink demuxed by TEID |
 | `epdg_xfrm` | Linux kernel IPsec SA/SP programming; hardware-offload detection |
 | `epdg_dns_cache` | TTL-aware DNS cache used by the GTP-C client for PGW FQDN resolution |
 | `epdg_config` | Environment-variable driven configuration |
@@ -229,6 +231,43 @@ The IKE and GTP-U bind/advertise addresses additionally accept
 `*_BY_NODE` (matched on `NODE_NAME`), used for `hostNetwork` active-active
 deployments. Precedence: per-pod → per-node → scalar → default.
 
+### Multiple ePDG pods per node (`EPDG_INSTANCE_ID`)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `EPDG_INSTANCE_ID` | _(derived)_ | Explicit pod instance id, integer `0..63`. Any other value fails the boot |
+
+In `hostNetwork` active-active deployments every ePDG pod on a node shares
+the node's network namespace. The shared-TUN datapath identifiers are
+therefore derived from a per-pod **instance id**:
+
+* TUN device: `epdg<id>` (`epdg0`, `epdg1`, …)
+* policy-routing table: `100 + id` (100..163)
+* `ip rule` priority: `1000 + id` (1000..1063 — always strictly between
+  the PGW-U escape rules at 900 and the main table at 32766)
+
+Without distinct ids, two pods on one node would attach to the same
+`epdg0` device, overwrite each other's rules, and a stopping pod would
+tear down the running pod's entire datapath.
+
+The id is resolved in this order:
+
+1. `EPDG_INSTANCE_ID` — explicit integer `0..63`; anything else refuses
+   to boot.
+2. `POD_NAME` — a StatefulSet name with an ordinal suffix (`epdg-0`,
+   `epdg-1`) uses the ordinal (mod 64); any other name is hashed stably
+   into `0..63`. The epdg-chart injects `POD_NAME` automatically.
+3. `0` — single instance / local development.
+
+The forwarder logs the resolved mapping at startup
+(`GTP-U datapath instance N: TUN epdgN, routing table T, rule priority P`)
+so node state can be attributed to pods without guessing. **Two ePDG pods
+scheduled onto the same node must resolve to different ids** — with
+StatefulSet ordinals or explicit per-pod `EPDG_INSTANCE_ID` values this
+holds by construction; with hashed names it holds with high probability,
+but pin `EPDG_INSTANCE_ID` explicitly if you run non-ordinal pod names on
+shared nodes.
+
 ### Diameter SWm (toward AAA via DRA)
 
 | Variable | Default | Purpose |
@@ -307,7 +346,8 @@ RFC 3948. Each session's SA pair and policies are tagged with a unique
 `reqid` (the responder Child-SA SPI) so two UEs sharing one public IP
 (carrier-grade NAT, or two handsets behind one home router) don't clobber
 each other's state. Uplink cleartext is steered by pool-wide policy rules
-(`EPDG_UE_IP_POOLS`) into the shared TUN `epdg0`, where the GTP-U forwarder
+(`EPDG_UE_IP_POOLS`) into the pod's shared TUN (`epdg<N>`, see
+`EPDG_INSTANCE_ID` above), where the GTP-U forwarder
 attributes each packet to its bearer by inner source IP and encapsulates it
 toward the PGW-U; downlink GTP-U is TEID-checked, written back through the
 same TUN and re-encrypted to the UE's outer address. The kernel owns all

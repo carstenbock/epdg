@@ -283,6 +283,56 @@ v4_same_ip_different_imsi_counts_collision_test() ->
                  epdg_metrics:get(ue_inner_ip_key_collision_total)).
 
 %%====================================================================
+%% Per-instance datapath identifiers
+%%====================================================================
+
+%% The rule priorities of ALL 64 possible instances must stay strictly
+%% between the PGW-U escape rules (900) and the main table (32766):
+%% a priority at or below 900 would shadow the escape rules and
+%% black-hole a co-located PGW-U's uplink; one at or above 32766 would
+%% drop the pool rules behind the main table. The device name and table
+%% id must be the documented derivations, or operators cannot attribute
+%% node state to pods.
+instance_rule_prios_stay_between_escape_and_main_test() ->
+    lists:foreach(
+      fun(Id) ->
+              {Name, Table, Prio} = epdg_gtpu_forwarder:instance_params(Id),
+              ?assertEqual("epdg" ++ integer_to_list(Id), Name),
+              ?assertEqual(100 + Id, Table),
+              ?assert(Prio > 900),
+              ?assert(Prio < 32766)
+      end, lists:seq(0, 63)).
+
+%% Ids outside the instance space must not derive a datapath at all.
+instance_params_rejects_out_of_range_test() ->
+    ?assertError(function_clause, epdg_gtpu_forwarder:instance_params(64)),
+    ?assertError(function_clause, epdg_gtpu_forwarder:instance_params(-1)).
+
+%% The startup sweep exists for LEGACY per-UE `ue<N>' devices only. It
+%% must never match a shared `epdg<N>' device — on a hostNetwork node
+%% that would be a starting pod tearing down a running sibling
+%% instance's datapath.
+cleanup_never_matches_shared_devices_test() ->
+    ?assertEqual(undefined, epdg_gtpu_forwarder:extract_ue_tun_name(
+        "12: epdg0: <POINTOPOINT,MULTICAST,NOARP,UP> mtu 1500 state UNKNOWN")),
+    ?assertEqual(undefined, epdg_gtpu_forwarder:extract_ue_tun_name(
+        "13: epdg63: <POINTOPOINT,MULTICAST,NOARP> mtu 1500 state DOWN")),
+    %% ...while genuine legacy devices still get swept.
+    ?assertEqual("ue4660", epdg_gtpu_forwarder:extract_ue_tun_name(
+        "14: ue4660: <POINTOPOINT,MULTICAST,NOARP,UP> mtu 1500 state UNKNOWN")).
+
+%% ...and the legacy tables it may flush (1000..30999) never overlap the
+%% shared instance tables (100..163), for ANY conceivable TEID.
+cleanup_legacy_tables_never_overlap_shared_test() ->
+    lists:foreach(
+      fun(Teid) ->
+              Table = epdg_gtpu_forwarder:legacy_ue_route_table(Teid),
+              ?assert(Table >= 1000),
+              ?assert(Table =< 30999)
+      end, [0, 1, 99, 100, 163, 999, 1000, 29999, 30000, 30999,
+            65535, 16#7FFFFFFF, 16#FFFFFFFF]).
+
+%%====================================================================
 %% Startup pool-list guard
 %%====================================================================
 

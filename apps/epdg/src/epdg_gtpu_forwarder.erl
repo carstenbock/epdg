@@ -2,11 +2,18 @@
 %%% @doc Userspace GTP-U forwarder for the ePDG data plane.
 %%%
 %%% Bridges the UEs' inner IP traffic (coming out of the kernel's ESP
-%%% SAs into ONE shared TUN device, `epdg0') to the PGW-U over
-%%% GTP-U/UDP 2152 and back. One process per ePDG pod owns a single
-%%% UDP socket and the single shared TUN; registration of a UE is pure
-%%% bookkeeping (no per-UE devices, routes or rules), so attach cost is
-%%% constant and independent of the session count.
+%%% SAs into ONE shared TUN device, `epdg<InstanceId>' — `epdg0' for a
+%%% single instance) to the PGW-U over GTP-U/UDP 2152 and back. One
+%%% process per ePDG pod owns a single UDP socket and the single shared
+%%% TUN; registration of a UE is pure bookkeeping (no per-UE devices,
+%%% routes or rules), so attach cost is constant and independent of the
+%%% session count.
+%%%
+%%% The TUN device name, routing-table id and rule priority are all
+%%% derived from the pod instance id (EPDG_INSTANCE_ID / POD_NAME, see
+%%% epdg_config:parse_instance_id/2): several ePDG pods on one
+%%% hostNetwork node share the network namespace and MUST NOT collide
+%%% on any of the three.
 %%%
 %%% Uplink packets are attributed to their bearer by the INNER SOURCE
 %%% IP (IPv4: exact address; IPv6: /64 prefix — see inner_src_key/1),
@@ -48,26 +55,41 @@
 -export([inner_src_key/1, ip_in_cidr/2, validate_inner_ips/3,
          new_state_for_test/1, register_ue_for_test/2,
          register_bearer_for_test/2, unregister_ue_for_test/2,
-         uplink_for_test/2, classify_for_test/2]).
+         uplink_for_test/2, classify_for_test/2,
+         instance_params/1, extract_ue_tun_name/1, legacy_ue_route_table/1]).
 -endif.
 
 -define(SERVER,     ?MODULE).
 -define(GTPU_PORT,  2152).
 -define(GTPU_HDR_FLAGS, 16#30).
 -define(GTPU_MSG_TPDU,  16#FF).
-%% The single TUN device shared by every UE bearer in this pod.
--define(SHARED_TUN, "epdg0").
-%% Policy-routing table shared by all UE pools. Deliberately OUTSIDE the
-%% legacy per-UE range 1000..30999 (pre-shared-TUN releases derived one
-%% table per bearer in that range; cleanup_stale_tun_devices/0 may still
-%% flush those tables on upgrade and must never touch ours).
--define(SHARED_TABLE, 100).
-%% Priority of the shared pool / iif rules. Must sort strictly AFTER the
-%% PGW-U escape rules (?PGWU_ESCAPE_PRIO) and strictly BEFORE the main
-%% table (32766) — see shared_rule_selectors/2.
--define(SHARED_RULE_PRIO, 1000).
+%% Per-instance datapath identifiers, all derived from the pod instance
+%% id (0..?MAX_INSTANCES-1) in instance_params/1:
+%%
+%%   TUN device:  "epdg" ++ Id                  ("epdg0".."epdg63")
+%%   table:       ?SHARED_TABLE_BASE + Id       (100..163)
+%%   rule prio:   ?SHARED_RULE_PRIO_BASE + Id   (1000..1063)
+%%
+%% The tables live deliberately OUTSIDE the legacy per-UE range
+%% 1000..30999 (pre-shared-TUN releases derived one table per bearer in
+%% that range; cleanup_stale_tun_devices/0 may still flush those tables
+%% on upgrade and must never touch ours).
+%%
+%% INVARIANT: for EVERY instance id the rule priority must sort strictly
+%% AFTER the PGW-U escape rules (?PGWU_ESCAPE_PRIO = 900) and strictly
+%% BEFORE the main table (32766):
+%%
+%%   900 < 1000 + Id =< 1063 < 32766   for Id in 0..63
+%%
+%% — otherwise pool rules could shadow the escape rules (uplink
+%% black-hole for a co-located PGW-U) or drop behind main. Checked by
+%% instance_rule_prios_stay_between_escape_and_main_test.
+-define(SHARED_TUN_PREFIX, "epdg").
+-define(SHARED_TABLE_BASE, 100).
+-define(SHARED_RULE_PRIO_BASE, 1000).
+-define(MAX_INSTANCES, 64).
 %% Priority of the PGW-U escape rules (ensure_pgwu_escape_rules/0).
-%% Must sort strictly before the UE-pool rules (?SHARED_RULE_PRIO).
+%% Must sort strictly before the UE-pool rules of every instance.
 -define(PGWU_ESCAPE_PRIO, 900).
 
 -record(ue_ent, {
@@ -114,11 +136,15 @@
     %% lookup. Keys: IPv4 = exact address tuple, IPv6 = {v6, /64 prefix}
     %% (see inner_src_key/1 for why the prefix rather than the address).
     by_inner_ip :: #{tuple() => non_neg_integer()},
-    %% The shared TUN helper port (c_src/epdg_tun_port.c) and device name.
-    %% `undefined' when the TUN could not be created (degraded mode, e.g.
-    %% unit tests without NET_ADMIN).
+    %% The shared TUN helper port (c_src/epdg_tun_port.c) and the
+    %% per-instance device name / routing table / rule priority derived
+    %% from the pod instance id (instance_params/1). tun_port is
+    %% `undefined' when the TUN could not be created (degraded mode,
+    %% e.g. unit tests without NET_ADMIN).
     tun_port   :: port() | undefined,
     tun_name   :: string(),
+    table_id   :: pos_integer(),
+    rule_prio  :: pos_integer(),
     %% Configured UE inner-IP pools ({Base, PrefixLen}) from
     %% EPDG_UE_IP_POOLS; registrations outside every pool are rejected.
     pools      :: [{inet:ip_address(), 0..128}],
@@ -150,8 +176,8 @@ start_link() ->
 %% never be attributed to a bearer — a black hole that is very hard to
 %% diagnose in the field, so fail loudly at registration instead.
 %%
-%% The returned `tun_name' is always the shared device (?SHARED_TUN);
-%% the key is kept for API stability.
+%% The returned `tun_name' is always this instance's shared device
+%% (e.g. "epdg0"); the key is kept for API stability.
 -spec register_ue(map()) ->
     {ok, #{local_teid => non_neg_integer(), tun_name => string()}}
     | {error, term()}.
@@ -219,6 +245,13 @@ init([]) ->
     end.
 
 init_datapath(Pools) ->
+    %% Log the instance mapping up front so operators can attribute
+    %% devices / tables / rules to pods without guessing.
+    InstanceId = epdg_config:get(instance_id, 0),
+    {TunName, TableId, RulePrio} = instance_params(InstanceId),
+    logger:notice("GTP-U datapath instance ~B: TUN ~s, routing table ~B, "
+                  "rule priority ~B",
+                  [InstanceId, TunName, TableId, RulePrio]),
     cleanup_stale_tun_devices(),
     %% Node-global and idempotent; runs once per forwarder start (NOT per
     %% attach — re-running it on every TUN setup used to dump the whole
@@ -226,7 +259,7 @@ init_datapath(Pools) ->
     %% (PGW-U pod restart) keep their escape because the rules match the
     %% device name, which open5gs reuses.
     ensure_pgwu_escape_rules(),
-    TunPort = setup_shared_tun(Pools),
+    TunPort = setup_shared_tun(TunName, TableId, RulePrio, Pools),
     BindIpStr = epdg_config:get(gtpu_bind_addr, "0.0.0.0"),
     BindIp    = parse_ip_or_any(BindIpStr),
     Port      = epdg_config:get(gtpu_port, ?GTPU_PORT),
@@ -239,7 +272,9 @@ init_datapath(Pools) ->
                   by_owner = #{},
                   by_inner_ip = #{},
                   tun_port = TunPort,
-                  tun_name = ?SHARED_TUN,
+                  tun_name = TunName,
+                  table_id = TableId,
+                  rule_prio = RulePrio,
                   pools = Pools,
                   next_teid = 16#1000,
                   last_rx_ts = erlang:system_time(second)},
@@ -251,7 +286,7 @@ init_datapath(Pools) ->
                               {reuseaddr, true}, InetFamily]) of
         {ok, Socket} ->
             logger:info("GTP-U forwarder on ~p:~p (shared TUN ~s, ~B UE "
-                        "pool(s))", [BindIp, Port, ?SHARED_TUN, length(Pools)]),
+                        "pool(s))", [BindIp, Port, TunName, length(Pools)]),
             {ok, Base#state{socket = Socket}};
         {error, eaddrinuse} ->
             %% Running outside a real ePDG pod (e.g. during unit tests)
@@ -334,12 +369,16 @@ handle_info({'DOWN', _MRef, process, Pid, _Reason},
     end;
 handle_info(_Info, State) -> {noreply, State}.
 
-terminate(_Reason, #state{socket = S, tun_port = TP, pools = Pools}) ->
+terminate(_Reason, #state{socket = S, tun_port = TP, pools = Pools,
+                          tun_name = TunName, table_id = TableId,
+                          rule_prio = RulePrio}) ->
     case TP of
         TP when is_port(TP) -> catch erlang:port_close(TP);
         _                   -> ok
     end,
-    teardown_shared_tun(Pools),
+    %% Tears down ONLY this instance's device, table and rules — other
+    %% ePDG pods on the same hostNetwork node keep their datapath.
+    teardown_shared_tun(TunName, TableId, RulePrio, Pools),
     case S of undefined -> ok; _ -> gen_udp:close(S) end,
     ok.
 
@@ -733,18 +772,20 @@ skip_ext_hdrs(Bin) -> Bin.
 %% Shared TUN device plumbing
 %%
 %% One Linux TUN device (IFF_TUN | IFF_NO_PI) per ePDG pod, created once
-%% in init/1. A small C helper (`epdg_tun_port', see
-%% c_src/epdg_tun_port.c) owns the /dev/net/tun fd and bridges it to the
-%% BEAM over stdio with {packet, 2} framing: port_command/2 writes
-%% downlink GTP-U payloads into the TUN, {Port, {data, Pkt}} messages
-%% carry UE-originated uplink packets.
+%% in init/1; name, table and rule priority come from the pod instance
+%% id (instance_params/1), so co-located instances never collide. A
+%% small C helper (`epdg_tun_port', see c_src/epdg_tun_port.c) owns the
+%% /dev/net/tun fd and bridges it to the BEAM over stdio with
+%% {packet, 2} framing: port_command/2 writes downlink GTP-U payloads
+%% into the TUN, {Port, {data, Pkt}} messages carry UE-originated
+%% uplink packets.
 %%
 %% After the kernel XFRM subsystem decrypts inbound ESP from a UE, the
 %% cleartext packet (src = UE inner IP, inside one of the configured
-%% pools) matches the per-pool `from <pool> lookup ?SHARED_TABLE' rule
+%% pools) matches the per-pool `from <pool> lookup <table>' rule
 %% and rides the shared table's default route out the TUN, where the
 %% helper reads it. The reverse path (PGW T-PDU written into the TUN)
-%% re-enters routing via the `iif epdg0' rule; the shared table's
+%% re-enters routing via the `iif <tun>' rule; the shared table's
 %% default route satisfies the FIB lookup and the kernel's outbound
 %% XFRM policy for `dst UE_IP' encrypts and emits ESP-in-UDP toward the
 %% UE. The rule/route count is constant in the number of configured
@@ -764,8 +805,15 @@ skip_ext_hdrs(Bin) -> Bin.
 %% queues can be consumed concurrently.
 %%====================================================================
 
-setup_shared_tun(Pools) ->
-    Name = ?SHARED_TUN,
+%% Derived per-instance datapath identifiers: TUN device name,
+%% policy-routing table id and rule priority. See the invariant note at
+%% ?SHARED_RULE_PRIO_BASE.
+instance_params(Id) when is_integer(Id), Id >= 0, Id < ?MAX_INSTANCES ->
+    {?SHARED_TUN_PREFIX ++ integer_to_list(Id),
+     ?SHARED_TABLE_BASE + Id,
+     ?SHARED_RULE_PRIO_BASE + Id}.
+
+setup_shared_tun(Name, Table, Prio, Pools) ->
     WantV6 = lists:any(fun({Base, _}) -> tuple_size(Base) =:= 8 end, Pools),
     ensure_forwarding_sysctls(WantV6),
     %% Idempotent: "File exists" from a device that survived a previous
@@ -781,9 +829,11 @@ setup_shared_tun(Pools) ->
         true ->
             %% Delete-then-add so a crashed previous run cannot leave
             %% duplicate rules behind (there is no `ip rule replace').
+            %% Safe next to sibling instances: the selectors, table and
+            %% priority are all instance-scoped, so only OUR rules match.
             Selectors = shared_rule_selectors(Name, Pools),
             lists:foreach(fun({Fam, Sel}) ->
-                run_quiet(rule_cmd(Fam, "del", Sel))
+                run_quiet(rule_cmd(Fam, "del", Sel, Table, Prio))
             end, Selectors),
             BaseCmds = [
                 io_lib:format("ip link set dev ~s up", [Name]),
@@ -805,7 +855,7 @@ setup_shared_tun(Pools) ->
                     [io_lib:format("sysctl -wq net.ipv6.conf.~s.disable_ipv6=0",
                                    [Name]),
                      io_lib:format("ip -6 route replace default dev ~s table ~B",
-                                   [Name, ?SHARED_TABLE])];
+                                   [Name, Table])];
                 false ->
                     []
             end,
@@ -817,20 +867,24 @@ setup_shared_tun(Pools) ->
                 %% UE IP, selected by the `iif' rule), where the XFRM OUT
                 %% policy then intercepts the packet.
                 io_lib:format("ip route replace default dev ~s table ~B",
-                              [Name, ?SHARED_TABLE])
+                              [Name, Table])
             ],
-            RuleCmds = [rule_cmd(Fam, "add", Sel) || {Fam, Sel} <- Selectors],
+            RuleCmds = [rule_cmd(Fam, "add", Sel, Table, Prio)
+                        || {Fam, Sel} <- Selectors],
             run_cmds_or_warn(Name, BaseCmds ++ RouteCmds ++ V6Cmds ++ RuleCmds),
             open_tun_port(Name)
     end.
 
-teardown_shared_tun(Pools) ->
-    Name = ?SHARED_TUN,
+%% Tear down exactly ONE instance's datapath: its rules (selector +
+%% table + priority are instance-scoped), its table and its device.
+%% MUST NOT flush anything derived from another instance id — a
+%% stopping pod A would otherwise rip out running pod B's datapath.
+teardown_shared_tun(Name, Table, Prio, Pools) ->
     lists:foreach(fun({Fam, Sel}) ->
-        run_quiet(rule_cmd(Fam, "del", Sel))
+        run_quiet(rule_cmd(Fam, "del", Sel, Table, Prio))
     end, shared_rule_selectors(Name, Pools)),
-    run_quiet(io_lib:format("ip route flush table ~B", [?SHARED_TABLE])),
-    run_quiet(io_lib:format("ip -6 route flush table ~B", [?SHARED_TABLE])),
+    run_quiet(io_lib:format("ip route flush table ~B", [Table])),
+    run_quiet(io_lib:format("ip -6 route flush table ~B", [Table])),
     delete_tun_dev(Name).
 
 %% The constant set of policy-routing rules for the shared datapath:
@@ -842,9 +896,10 @@ teardown_shared_tun(Pools) ->
 %%     XFRM-decrypted SWu packets carry src = UE inner IP and must be
 %%     steered into the TUN for GTP-U encapsulation).
 %%
-%% All rules share ?SHARED_RULE_PRIO: they sort strictly after the
-%% PGW-U escape rules (?PGWU_ESCAPE_PRIO) and strictly before the main
-%% table (32766).
+%% All of an instance's rules share its derived priority: they sort
+%% strictly after the PGW-U escape rules (?PGWU_ESCAPE_PRIO) and
+%% strictly before the main table (32766) — see the invariant note at
+%% ?SHARED_RULE_PRIO_BASE.
 shared_rule_selectors(Name, Pools) ->
     Iif = "iif " ++ Name,
     WantV6 = lists:any(fun({Base, _}) -> tuple_size(Base) =:= 8 end, Pools),
@@ -853,9 +908,9 @@ shared_rule_selectors(Name, Pools) ->
                  || {Base, _} = Pool <- Pools],
     IifRules ++ PoolRules.
 
-rule_cmd(Fam, Op, Selector) ->
+rule_cmd(Fam, Op, Selector, Table, Prio) ->
     io_lib:format("~s rule ~s ~s lookup ~B priority ~B",
-                  [Fam, Op, Selector, ?SHARED_TABLE, ?SHARED_RULE_PRIO]).
+                  [Fam, Op, Selector, Table, Prio]).
 
 family_cmd(Base) when tuple_size(Base) =:= 8 -> "ip -6";
 family_cmd(_)                                -> "ip".
@@ -1017,6 +1072,15 @@ tun_write(Port, Pkt) when is_port(Port), is_binary(Pkt) ->
 %% bearer. On hostNetwork those survive pod restarts, so the first
 %% start after an upgrade must sweep them or they linger forever. This
 %% whole section exists only for that migration path.
+%%
+%% SAFETY: this sweep must ONLY ever touch legacy `ue<N>' devices and
+%% their tables/rules (1000..30999, legacy_ue_route_table/1). It must
+%% NEVER match a shared `epdg<N>' device or a table in the shared range
+%% (?SHARED_TABLE_BASE..?SHARED_TABLE_BASE + ?MAX_INSTANCES - 1, i.e.
+%% 100..163) — on a hostNetwork node a starting pod would otherwise
+%% tear down a running sibling instance's datapath. Checked by
+%% cleanup_never_matches_shared_devices_test and
+%% cleanup_legacy_tables_never_overlap_shared_test.
 %%====================================================================
 
 cleanup_stale_tun_devices() ->
@@ -1127,9 +1191,11 @@ parse_ip_or_any(T) when is_tuple(T) -> T.
 %% TUN-less, so tests exercise the pure bookkeeping/classification code
 %% without NET_ADMIN.
 new_state_for_test(Pools) ->
+    {TunName, TableId, RulePrio} = instance_params(0),
     #state{socket = undefined, bind_ip = {0,0,0,0}, bind_port = 0,
            by_teid = #{}, by_ded = #{}, by_owner = #{}, by_inner_ip = #{},
-           tun_port = undefined, tun_name = ?SHARED_TUN, pools = Pools,
+           tun_port = undefined, tun_name = TunName,
+           table_id = TableId, rule_prio = RulePrio, pools = Pools,
            next_teid = 16#1000, last_rx_ts = 0}.
 
 register_ue_for_test(Params, State) -> do_register_ue(Params, State).

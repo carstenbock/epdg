@@ -4,7 +4,8 @@
 %%%-------------------------------------------------------------------
 -module(epdg_config).
 
--export([init/0, get/1, get/2, parse_gtpc_mode/1, parse_ue_ip_pools/1]).
+-export([init/0, get/1, get/2, parse_gtpc_mode/1, parse_ue_ip_pools/1,
+         parse_instance_id/2]).
 
 -define(APP, epdg).
 
@@ -102,6 +103,13 @@ init() ->
     %% instead. (Replaces the never-evaluated EPDG_UE_IP_POOL /
     %% EPDG_UE_IP6_POOL of pre-shared-TUN releases.)
     set_ue_ip_pools(),
+
+    %% Pod instance id (0..63): makes the shared TUN device name, the
+    %% policy-routing table and the rule priority unique per ePDG pod on
+    %% a hostNetwork node — see epdg_gtpu_forwarder.
+    application:set_env(?APP, instance_id,
+                        parse_instance_id(os:getenv("EPDG_INSTANCE_ID"),
+                                          os:getenv("POD_NAME"))),
 
     %% Dual-stack toggle. When false (default) the ePDG always requests an
     %% IPv4-only S2b PDN and only ever hands the UE an IPv4 inner address --
@@ -296,6 +304,54 @@ check_v6_pool_width(Addr, Len, Str) when tuple_size(Addr) =:= 8,
            "or longer can hold at most one distinguishable UE"});
 check_v6_pool_width(Addr, Len, _Str) ->
     {Addr, Len}.
+
+%% Resolve the pod instance id (0..63) that makes the shared TUN device
+%% name, policy-routing table and rule priority unique per ePDG pod.
+%% Several ePDG pods on one hostNetwork node share the node's network
+%% namespace: without distinct ids the second pod would attach to the
+%% first pod's TUN device, overwrite its rules, and tear the neighbour's
+%% whole datapath down on exit.
+%%
+%% Precedence:
+%%   1. EPDG_INSTANCE_ID — explicit integer 0..63. Anything else fails
+%%      the boot: a typo that silently mapped to some other id would
+%%      recreate exactly the collision this exists to prevent.
+%%   2. POD_NAME — a StatefulSet ordinal suffix ("epdg-1" -> 1, taken
+%%      mod 64); any other shape hashes stably into 0..63.
+%%   3. 0 — single instance / local development.
+-spec parse_instance_id(string() | false, string() | false) -> 0..63.
+parse_instance_id(false, PodName) ->
+    instance_id_from_pod_name(PodName);
+parse_instance_id(Explicit, _PodName) ->
+    case string:to_integer(string:trim(Explicit)) of
+        {Id, ""} when Id >= 0, Id =< 63 ->
+            Id;
+        _ ->
+            error({invalid_config,
+                   "EPDG_INSTANCE_ID must be an integer 0..63, got: \""
+                   ++ Explicit ++ "\""})
+    end.
+
+instance_id_from_pod_name(false) -> 0;
+instance_id_from_pod_name("")    -> 0;
+instance_id_from_pod_name(PodName) ->
+    case ordinal_suffix(PodName) of
+        {ok, Ordinal} -> Ordinal rem 64;
+        error         -> erlang:phash2(PodName, 64)
+    end.
+
+%% "epdg-3" -> {ok, 3}; no all-digit trailing segment -> error
+%% (e.g. Deployment pod names like "epdg-7f9c4d8b6d-x2v4q").
+ordinal_suffix(Name) ->
+    case string:split(Name, "-", trailing) of
+        [_, Digits] when Digits =/= "" ->
+            case lists:all(fun(C) -> C >= $0 andalso C =< $9 end, Digits) of
+                true  -> {ok, list_to_integer(Digits)};
+                false -> error
+            end;
+        _ ->
+            error
+    end.
 
 set_dra_hosts() ->
     Hosts = case os:getenv("DRA_HOSTS") of
