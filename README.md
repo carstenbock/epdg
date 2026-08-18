@@ -286,7 +286,7 @@ shared nodes.
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `EPDG_UE_IP_POOLS` | **required** | Comma-separated CIDR list (IPv4/IPv6 mixed) of every UE inner-IP pool the PGW allocates from, e.g. `10.46.0.0/16,cafe:0:46::/48`. Drives the shared-TUN policy routing and the register-time pool check; the app refuses to boot without it. IPv6 pools must be **wider than /64** (uplink attribution is keyed on the per-UE delegated /64, so a `/64`-or-longer pool could hold only one distinguishable UE and is rejected at boot). Replaces the never-evaluated `EPDG_UE_IP_POOL`/`EPDG_UE_IP6_POOL` |
-| `EPDG_IPV6_ENABLED` | `false` | Honour the UE's requested PDN type and grant IPv6 / IPv4v6 (IR.51/IR.92). An IPv6 PDN is a **/64 prefix**, not a host address: the UE forms its own interface identifier inside it, so the inner XFRM selectors and the uplink bearer lookup both key on the /64. `EPDG_UE_IP_POOLS` must contain the prefixes the PGW allocates from |
+| `EPDG_IPV6_ENABLED` | `false` | Honour the UE's requested PDN type and grant IPv6 / IPv4v6 (IR.51/IR.92). An IPv6 PDN is a **/64 prefix**, not a host address: the UE forms its own interface identifier inside it, so the inner XFRM selectors and the uplink bearer lookup both key on the /64. `EPDG_UE_IP_POOLS` must contain the prefixes the PGW allocates from, and the PGW must return an IPv6 P-CSCF in the PCO for an IPv6-only PDN |
 | `EPDG_ALLOWED_APNS` | `ims` | Comma-separated allow-list (empty = allow all; `ims` always allowed) |
 | `EPDG_DEFAULT_APN` | `ims` | APN used when the UE does not request one |
 

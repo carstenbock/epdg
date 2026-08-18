@@ -20,8 +20,9 @@
 -export([drain_action/1, find_notify/2, new_data_for_test/1,
          classify_register_ue_result/1,
          build_notify_response/4, process_sa_init_payloads/1,
-         %% IPv6 PDN: inner XFRM selectors, CFG_REPLY contents
-         ue6_selector/1, ip6_mask/2, build_cfg_reply/1]).
+         %% IPv6 PDN: inner selectors, CFG_REPLY contents, handover PAA
+         ue6_selector/1, ip6_mask/2, build_cfg_reply/1,
+         requested_handover_addrs/1]).
 -endif.
 
 %% Length of the IPv6 prefix a PDN connection gets. 3GPP fixes this at /64
@@ -1518,19 +1519,20 @@ proceed_with_s2b(MsgId, InFlags, ISPI, RSPI,
     %% say via the Create-Session PAA; we set up whatever it actually grants.
     PdnType = requested_pdn_type(Data0),
     %% 3GPP->non-3GPP handover attach (TS 24.302 §6.4): if the UE requested its
-    %% existing IMS IPv4 in the IKEv2 CFG_REQUEST, relay it to the PGW so the
+    %% existing IMS address in the IKEv2 CFG_REQUEST, relay it to the PGW so the
     %% PDN (and any active call) survive the handover instead of being torn down
-    %% and re-created on a fresh IP.
-    HoV4 = requested_handover_ipv4(Data0#data.cp_body),
+    %% and re-created on a fresh address.
+    #{v4 := HoV4, v6 := HoV6} = requested_handover_addrs(Data0#data.cp_body),
     logger:info("S2b Create-Session IMSI=~p APN=~p pdn_type=~B (1=v4 2=v6 3=v4v6)"
-                " handover_v4=~p",
-                [IMSI, Apn, PdnType, HoV4]),
+                " handover_v4=~p handover_v6=~p",
+                [IMSI, Apn, PdnType, HoV4, HoV6]),
     case epdg_gtpc_client:create_session_request(#{
             imsi         => IMSI,
             apn          => Apn,
             rat_type     => 3,           %% WLAN
             pdn_type     => PdnType,
             handover_v4  => HoV4,
+            handover_v6  => HoV6,
             ebi          => 5,
             local_c_teid => LocalCTeid,
             local_u_teid => LocalUTeid
@@ -1939,30 +1941,63 @@ split_child_keymat(Mat, E, I) ->
     <<SKar:I/binary, _/binary>> = Rest3,
     {SKei, SKai, SKer, SKar}.
 
+%% Requested existing UE address(es) from the IKEv2 CFG_REQUEST, for a
+%% 3GPP->non-3GPP handover attach (TS 24.302 §6.4). A non-zero
+%% INTERNAL_IP4_ADDRESS / INTERNAL_IP6_ADDRESS means the UE wants to keep that
+%% IMS address across the handover; we relay it to the PGW as the Create-Session
+%% PAA. Returns #{v4 => .. | undefined, v6 => .. | undefined}; both undefined
+%% => fresh attach (dynamic allocation).
+%%
+%% The IPv6 half is what the observed iPhone failure needed: handing an IPv6 IMS
+%% PDN over from LTE it asks for its current prefix (INTERNAL_IP6_ADDRESS
+%% fd00:230:babe:22::1/64) and offers no IPv4 attribute at all. Reading only the
+%% IPv4 attribute left this undefined, so no PAA and no Handover Indication went
+%% to the PGW, it allocated a *different* prefix, and the UE found its cellular
+%% and WiFi contexts holding two addresses for one APN
+%% ("kDataProtocolFamilyIPv6 - conflict" -> kDataContextDeactivateHandoverConflict
+%% -> "Error bringing interface online") and deleted the tunnel ~50 ms after it
+%% came up.
+requested_handover_addrs(CpBody) when is_binary(CpBody) ->
+    case epdg_ikev2_codec:decode_cp_payload(CpBody) of
+        {ok, {_CfgType, Attrs}} ->
+            #{v4 => handover_v4_from_attrs(Attrs),
+              v6 => handover_v6_from_attrs(Attrs)};
+        _ ->
+            #{v4 => undefined, v6 => undefined}
+    end;
+requested_handover_addrs(_) ->
+    #{v4 => undefined, v6 => undefined}.
+
+handover_v4_from_attrs(Attrs) ->
+    case lists:keyfind(internal_ip4_address, 1, Attrs) of
+        {_, <<A:8, B:8, C:8, D:8>>} when {A, B, C, D} =/= {0, 0, 0, 0} ->
+            {A, B, C, D};
+        _ ->
+            undefined
+    end.
+
+%% INTERNAL_IP6_ADDRESS is 16 address octets + 1 prefix-length octet
+%% (RFC 7296 §3.15.1). Tolerate a UE that omits the trailing length.
+handover_v6_from_attrs(Attrs) ->
+    case lists:keyfind(internal_ip6_address, 1, Attrs) of
+        {_, <<Addr:16/binary, _PrefixLen:8>>} -> handover_v6_prefix(Addr);
+        {_, <<Addr:16/binary>>}               -> handover_v6_prefix(Addr);
+        _                                     -> undefined
+    end.
+
+handover_v6_prefix(<<0:128>>) ->
+    undefined;
+handover_v6_prefix(<<A:16,B:16,C:16,D:16,E:16,F:16,G:16,H:16>>) ->
+    %% Ask the PGW for the /64, not the UE's full address: the PGW allocates
+    %% prefixes, and the interface identifier in what the UE sent is its own
+    %% (and may rotate for privacy), so it must not be part of the request.
+    ip6_mask({A,B,C,D,E,F,G,H}, ?UE6_PREFIX_LEN).
+
 %% Determine the S2b PDN type to request from the PGW.
 %%   1 = IPv4, 2 = IPv6, 3 = IPv4v6 (TS 29.274 §8.34).
 %% When dual-stack is disabled we always request IPv4 (historical default).
 %% When enabled we honour what the UE asked for in its IKEv2 CFG_REQUEST
 %% (RFC 7296 §3.15): INTERNAL_IP4_ADDRESS (1) and/or INTERNAL_IP6_ADDRESS (8).
-%% Requested existing UE IPv4 from the IKEv2 CFG_REQUEST, for a 3GPP->non-3GPP
-%% handover attach (TS 24.302 §6.4). A non-zero INTERNAL_IP4_ADDRESS means the
-%% UE wants to keep this IMS IP across the handover; we relay it to the PGW as
-%% the Create-Session PAA. undefined => fresh attach (dynamic IP).
-requested_handover_ipv4(CpBody) when is_binary(CpBody) ->
-    case epdg_ikev2_codec:decode_cp_payload(CpBody) of
-        {ok, {_CfgType, Attrs}} ->
-            case lists:keyfind(internal_ip4_address, 1, Attrs) of
-                {_, <<A:8, B:8, C:8, D:8>>} when {A, B, C, D} =/= {0, 0, 0, 0} ->
-                    {A, B, C, D};
-                _ ->
-                    undefined
-            end;
-        _ ->
-            undefined
-    end;
-requested_handover_ipv4(_) ->
-    undefined.
-
 requested_pdn_type(#data{cp_body = CpBody}) ->
     case epdg_config:get(ipv6_enabled, false) of
         true  -> pdn_type_from_cp(CpBody);

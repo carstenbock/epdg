@@ -153,3 +153,81 @@ empty_pdn_yields_empty_reply_test() ->
     Pdn = #{ip4 => {0,0,0,0}, ip6 => undefined,
             dns4 => [], dns6 => [], pcscf4 => [], pcscf6 => []},
     ?assertEqual([], cfg_attrs(epdg_ue_fsm:build_cfg_reply(Pdn))).
+
+%%====================================================================
+%% Handover addresses from the UE's CFG_REQUEST
+%%====================================================================
+
+cfg_request(Attrs) -> epdg_ikev2_codec:encode_cp_payload(1, Attrs).
+
+%% The failure this replaced: iOS handing an IPv6 IMS PDN over from LTE sends
+%% INTERNAL_IP6_ADDRESS and no IPv4 attribute at all. Reading only the IPv4
+%% attribute left the handover address undefined, so no PAA and no Handover
+%% Indication reached the PGW, it allocated a different prefix, and the UE saw
+%% its cellular and WiFi contexts on two addresses for one APN
+%% ("kDataProtocolFamilyIPv6 - conflict" ->
+%% kDataContextDeactivateHandoverConflict -> "Error bringing interface online")
+%% and deleted the tunnel ~50 ms after it came up.
+handover_v6_read_from_ipv6_only_request_test() ->
+    Req = cfg_request([{internal_ip6_address,
+                        <<(ip6_bin(?UE_LTE_ADDR))/binary, 64:8>>},
+                       {internal_ip6_dns, <<0:128>>}]),
+    ?assertEqual(#{v4 => undefined, v6 => ?UE_LTE_PREFIX},
+                 epdg_ue_fsm:requested_handover_addrs(Req)).
+
+%% We ask the PGW for the prefix, not the UE's full address: the interface
+%% identifier is the UE's own and may rotate for privacy.
+handover_v6_masks_ue_interface_identifier_test() ->
+    Req = cfg_request([{internal_ip6_address,
+                        <<(ip6_bin(?UE_ACTUAL_SRC))/binary, 64:8>>}]),
+    ?assertEqual(#{v4 => undefined,
+                   v6 => {16#fd00, 16#230, 16#babe, 16#24, 0, 0, 0, 0}},
+                 epdg_ue_fsm:requested_handover_addrs(Req)).
+
+handover_v6_tolerates_missing_prefix_length_test() ->
+    Req = cfg_request([{internal_ip6_address, ip6_bin(?UE_LTE_ADDR)}]),
+    ?assertMatch(#{v6 := ?UE_LTE_PREFIX},
+                 epdg_ue_fsm:requested_handover_addrs(Req)).
+
+%% Fresh attach: the UE names the family it wants without naming an address.
+fresh_attach_has_no_handover_addrs_test() ->
+    Req = cfg_request([{internal_ip4_address, <<0, 0, 0, 0>>},
+                       {internal_ip6_address, <<0:128, 64:8>>}]),
+    ?assertEqual(#{v4 => undefined, v6 => undefined},
+                 epdg_ue_fsm:requested_handover_addrs(Req)).
+
+handover_v4_still_read_test() ->
+    Req = cfg_request([{internal_ip4_address, <<10, 46, 0, 33>>}]),
+    ?assertEqual(#{v4 => {10,46,0,33}, v6 => undefined},
+                 epdg_ue_fsm:requested_handover_addrs(Req)).
+
+dual_stack_handover_reads_both_families_test() ->
+    Req = cfg_request([{internal_ip4_address, <<10, 46, 0, 33>>},
+                       {internal_ip6_address,
+                        <<(ip6_bin(?UE_LTE_ADDR))/binary, 64:8>>}]),
+    ?assertEqual(#{v4 => {10,46,0,33}, v6 => ?UE_LTE_PREFIX},
+                 epdg_ue_fsm:requested_handover_addrs(Req)).
+
+%% A CFG_REQUEST we cannot parse (or no CP payload at all) is a fresh attach,
+%% not a crash: undefined addresses simply mean dynamic allocation.
+unparseable_cp_body_is_a_fresh_attach_test() ->
+    None = #{v4 => undefined, v6 => undefined},
+    ?assertEqual(None, epdg_ue_fsm:requested_handover_addrs(<<1, 2, 3>>)),
+    ?assertEqual(None, epdg_ue_fsm:requested_handover_addrs(<<>>)),
+    ?assertEqual(None, epdg_ue_fsm:requested_handover_addrs(undefined)).
+
+%% End-to-end over the two modules that have to agree: the address the UE asks
+%% to keep, once granted by the PGW, must produce a selector that covers the
+%% address the UE will actually use inside that prefix.
+handover_prefix_round_trips_into_the_selector_test() ->
+    Req = cfg_request([{internal_ip6_address,
+                        <<(ip6_bin(?UE_LTE_ADDR))/binary, 64:8>>}]),
+    #{v6 := Prefix} = epdg_ue_fsm:requested_handover_addrs(Req),
+    %% PGW honours the PAA and hands the prefix back as the PDN address.
+    ?assertEqual(epdg_ue_fsm:ue6_selector(Prefix),
+                 epdg_ue_fsm:ue6_selector(?UE_LTE_ADDR)),
+    %% ...and the UE's own interface identifier in that prefix is covered too.
+    {A, B, C, D, _, _, _, _} = Prefix,
+    Autoconf = {A, B, C, D, 16#dead, 16#beef, 16#0, 16#1},
+    ?assertEqual(epdg_ue_fsm:ue6_selector(Prefix),
+                 epdg_ue_fsm:ue6_selector(Autoconf)).

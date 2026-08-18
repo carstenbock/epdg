@@ -47,6 +47,53 @@ s2b_fresh_attach_has_dynamic_paa_and_no_indication_test() ->
     ?assertNotEqual(nomatch, binary:match(Bin, paa_dynamic_ie())),
     ?assertEqual(nomatch, binary:match(Bin, indication_hi_ie())).
 
+%% IPv6 handover attach. An iPhone moving an IPv6 IMS PDN from LTE to VoWiFi
+%% asks for its current /64 and offers no IPv4 attribute at all, so the v6 half
+%% has to carry the PAA and the Handover Indication on its own. Without it the
+%% PGW allocates a second prefix beside the live one and the UE tears the tunnel
+%% down on the address conflict.
+ip6_bin({A,B,C,D,E,F,G,H}) -> <<A:16,B:16,C:16,D:16,E:16,F:16,G:16,H:16>>.
+
+%% PAA for IPv6: PDN type 2, then prefix length, then the 16 address octets.
+paa_ho6_ie(Prefix)    -> <<79:8, 18:16, 0:8, 2:8, 64:8, (ip6_bin(Prefix))/binary>>.
+paa_dynamic6_ie()     -> <<79:8, 18:16, 0:8, 2:8, 0:8, 0:128>>.
+
+-define(HO_PREFIX, {16#fd00, 16#230, 16#babe, 16#22, 0, 0, 0, 0}).
+
+s2b_handover_attach_v6_relays_paa_and_sets_hi_test() ->
+    P = (base_params())#{pdn_type => 2, handover_v6 => ?HO_PREFIX},
+    Bin = epdg_gtpc_codec:encode_create_session_request(P),
+    ?assertNotEqual(nomatch, binary:match(Bin, paa_ho6_ie(?HO_PREFIX))),
+    ?assertEqual(nomatch, binary:match(Bin, paa_dynamic6_ie())),
+    ?assertNotEqual(nomatch, binary:match(Bin, indication_hi_ie())).
+
+s2b_fresh_attach_v6_has_dynamic_paa_and_no_indication_test() ->
+    Bin = epdg_gtpc_codec:encode_create_session_request(
+            (base_params())#{pdn_type => 2}),
+    ?assertNotEqual(nomatch, binary:match(Bin, paa_dynamic6_ie())),
+    ?assertEqual(nomatch, binary:match(Bin, indication_hi_ie())).
+
+%% Dual-stack: both halves in one PAA (IPv6 prefix first, then IPv4 —
+%% TS 29.274 §8.14), and a half the UE is not moving goes as zeros.
+paa_ho46_ie({A,B,C,D}, Prefix6) ->
+    <<79:8, 22:16, 0:8, 3:8, 64:8, (ip6_bin(Prefix6))/binary, A:8,B:8,C:8,D:8>>.
+
+s2b_handover_attach_v4v6_relays_both_test() ->
+    P = (base_params())#{pdn_type => 3,
+                         handover_v4 => {10,46,0,33},
+                         handover_v6 => ?HO_PREFIX},
+    Bin = epdg_gtpc_codec:encode_create_session_request(P),
+    ?assertNotEqual(nomatch,
+        binary:match(Bin, paa_ho46_ie({10,46,0,33}, ?HO_PREFIX))),
+    ?assertNotEqual(nomatch, binary:match(Bin, indication_hi_ie())).
+
+s2b_handover_attach_v4v6_with_only_v6_zero_fills_v4_test() ->
+    P = (base_params())#{pdn_type => 3, handover_v6 => ?HO_PREFIX},
+    Bin = epdg_gtpc_codec:encode_create_session_request(P),
+    ?assertNotEqual(nomatch,
+        binary:match(Bin, paa_ho46_ie({0,0,0,0}, ?HO_PREFIX))),
+    ?assertNotEqual(nomatch, binary:match(Bin, indication_hi_ie())).
+
 s5s8_mode_uses_sgw_ifaces_and_rat_eutran_test() ->
     P = (base_params())#{mode => s5s8, rat_type => 6},
     Bin = epdg_gtpc_codec:encode_create_session_request(P),

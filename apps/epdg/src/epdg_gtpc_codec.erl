@@ -61,6 +61,10 @@
 -define(IE_BEARER_CTX,      93).
 -define(IE_CHARGING_ID,     94).
 -define(IE_PDN_TYPE,        99).
+
+%% IPv6 prefix length carried in the PAA IE (TS 29.274 §8.14). 3GPP fixes a PDN
+%% prefix at /64 (TS 23.401 §5.3.1.2.2); mirrors ?UE6_PREFIX_LEN in epdg_ue_fsm.
+-define(V6_PREFIX_LEN,      64).
 -define(IE_PTI,            100).
 -define(IE_UE_TIME_ZONE,   114).
 -define(IE_APN_RESTRICTION, 127).
@@ -101,6 +105,7 @@ encode_create_session_request(#{seq_num := Seq,
     LocalUIP = maps:get(local_u_ip, Params, LIP),
     PdnType  = maps:get(pdn_type, Params, 1), %% 1=IPv4 2=IPv6 3=IPv4v6
     HoV4     = maps:get(handover_v4, Params, undefined), %% {A,B,C,D} on handover
+    HoV6     = maps:get(handover_v6, Params, undefined), %% /64 prefix tuple
     Mode     = maps:get(mode, Params, s2b),
     {CIface, UIface, UInst} =
         case Mode of
@@ -126,8 +131,8 @@ encode_create_session_request(#{seq_num := Seq,
         encode_ie(?IE_APN, encode_apn_labels(APN)),
         encode_ie(?IE_SELECTION_MODE, <<0:8>>),
         encode_ie(?IE_PDN_TYPE, <<0:5, PdnType:3>>),
-        encode_paa_ie(PdnType, HoV4),
-        encode_indication_ho_ie(HoV4),
+        encode_paa_ie(PdnType, HoV4, HoV6),
+        encode_indication_ho_ie(HoV4, HoV6),
         encode_apn_ambr_ie(AmbrUl, AmbrDl),
         encode_pco_request_ie(),
         encode_bearer_context_req_ie(EBI, LocalUTeid, LocalUIP, UIface, UInst),
@@ -493,13 +498,33 @@ encode_fteid_ie(Inst, Iface, TEID, {A,B,C,D,E,F,G,H}) ->
 %% PDN Address Allocation (PAA) — TS 29.274 §8.14
 %%   Spare(5) | PDN Type (3) | Address(es)
 %%     1=IPv4  2=IPv6  3=IPv4v6
-%% Handover attach: when the UE requested its existing IPv4 (via the IKEv2
+%% Handover attach: when the UE requested its existing address (via the IKEv2
 %% CFG_REQUEST), relay it here so the PGW re-uses it. Open5GS treats a non-zero
 %% PAA as a static address (ogs_pfcp_ue_ip_alloc), preserving the PDN/IP across
-%% 3GPP<->non-3GPP handover (TS 23.402 §8). Fresh attach => 0.0.0.0 (dynamic).
-encode_paa_ie(1, {A,B,C,D}) ->
+%% 3GPP<->non-3GPP handover (TS 23.402 §8). Fresh attach => zeros (dynamic).
+%%
+%% For IPv6 the relayed value is the /64 PDN prefix; the PGW allocates prefixes,
+%% not addresses, and the UE forms its own interface identifier inside it.
+encode_paa_ie(1, {A,B,C,D}, _) ->
     encode_ie(?IE_PAA, <<0:5, 1:3, A:8, B:8, C:8, D:8>>);
-encode_paa_ie(PdnType, _) ->
+encode_paa_ie(2, _, {A,B,C,D,E,F,G,H}) ->
+    encode_ie(?IE_PAA, <<0:5, 2:3, ?V6_PREFIX_LEN:8,
+                         A:16,B:16,C:16,D:16,E:16,F:16,G:16,H:16>>);
+%% Dual-stack handover: either half may be absent (the UE is only moving one
+%% family); the missing one goes as zeros so the PGW allocates it dynamically.
+encode_paa_ie(3, HoV4, HoV6) when HoV4 =/= undefined; HoV6 =/= undefined ->
+    {A,B,C,D} = case HoV4 of
+        undefined -> {0,0,0,0};
+        _         -> HoV4
+    end,
+    {A6,B6,C6,D6,E6,F6,G6,H6} = case HoV6 of
+        undefined -> {0,0,0,0,0,0,0,0};
+        _         -> HoV6
+    end,
+    encode_ie(?IE_PAA, <<0:5, 3:3, ?V6_PREFIX_LEN:8,
+                         A6:16,B6:16,C6:16,D6:16,E6:16,F6:16,G6:16,H6:16,
+                         A:8,B:8,C:8,D:8>>);
+encode_paa_ie(PdnType, _, _) ->
     encode_paa_ie(PdnType).
 
 %% In the request we send 0.0.0.0 (dynamic allocation).
@@ -512,12 +537,14 @@ encode_paa_ie(_) -> <<>>.
 %% set (octet 1 bit 6 = 0x20). Signals a 3GPP->non-3GPP handover attach so the
 %% PGW treats the Create-Session as PDN continuity rather than a fresh PDN. The
 %% 10-octet body matches sizeof(ogs_gtp2_indication_t) in the paired Open5GS
-%% build; all other flags are zero. Emitted only on a handover attach.
-encode_indication_ho_ie({_, _, _, _}) ->
+%% build; all other flags are zero. Emitted whenever either family is being
+%% handed over — an IPv6-only handover needs the HI flag just as much as an
+%% IPv4 one, and without it the PGW builds a second PDN alongside the live one.
+encode_indication_ho_ie(undefined, undefined) ->
+    <<>>;
+encode_indication_ho_ie(_HoV4, _HoV6) ->
     encode_ie(?IE_INDICATION,
-              <<16#20, 0, 0, 0, 0, 0, 0, 0, 0, 0>>);
-encode_indication_ho_ie(_) ->
-    <<>>.
+              <<16#20, 0, 0, 0, 0, 0, 0, 0, 0, 0>>).
 
 %% APN Aggregate Maximum Bit Rate (APN-AMBR) — TS 29.274 §8.7
 %%   Uplink (32 bits, kbps) | Downlink (32 bits, kbps)
