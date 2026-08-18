@@ -178,10 +178,20 @@ do_create_sa(#{spi := SPI, src_ip := Src, dst_ip := Dst,
         _ -> ""
     end,
 
+    %% ESN (RFC 4304, negotiated via the IKEv2 ESN transform): set the
+    %% XFRM_STATE_ESN flag so the kernel runs 64-bit extended sequence
+    %% numbers. iproute2 requires a non-zero replay window together with
+    %% the esn flag (it is carried in XFRMA_REPLAY_ESN_VAL); without ESN
+    %% we keep the kernel's default replay handling untouched.
+    EsnPart = case maps:get(esn, Params, false) of
+        true  -> " flag esn replay-window 128";
+        false -> ""
+    end,
+
     Cmd = io_lib:format(
-        "ip xfrm state add src ~s dst ~s proto esp spi 0x~.16B~s "
+        "ip xfrm state add src ~s dst ~s proto esp spi 0x~.16B~s~s "
         "enc '~s' 0x~s~s~s mode tunnel",
-        [ip_str(Src), ip_str(Dst), SPI, ReqidPart,
+        [ip_str(Src), ip_str(Dst), SPI, ReqidPart, EsnPart,
          enc_alg_str(EncAlg), bin2hex(EncKey), AuthPart, EncapPart]),
 
     OffloadPart = case Offload of

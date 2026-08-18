@@ -417,6 +417,7 @@ is_supported_dh(#{id := 31}) -> true;
 is_supported_dh(_) -> false.
 
 is_supported_esn(#{id := 0}) -> true; %% No ESN
+is_supported_esn(#{id := 1}) -> true; %% ESN (RFC 4304 64-bit sequence numbers)
 is_supported_esn(_)          -> false.
 
 is_aead(#{id := 20}) -> true; %% AES-GCM-16
@@ -830,29 +831,32 @@ pick_child_suite(Transforms) ->
                                   fun is_supported_child_encr/1),
     Integ = pick_first_supported(maps:get(integ, Groups, []),
                                   fun is_supported_child_integ/1),
-    Esn   = pick_first_supported(maps:get(esn,   Groups, []),
-                                  fun is_supported_esn/1),
+    Esn   = pick_esn(maps:get(esn, Groups, [])),
     case {Encr, Integ} of
         {{ok, E}, {ok, I}} ->
-            {ok, #{encr  => E,
-                   integ => I,
-                   esn   => case Esn of {ok, Es} -> Es;
-                                       _        -> #{type => esn, type_raw => 5,
-                                                     id => 0, attrs => #{}}
-                            end}};
+            {ok, #{encr => E, integ => I, esn => Esn}};
         {{ok, E}, error} ->
             case is_aead(E) of
-                true  -> {ok, #{encr => E, integ => none,
-                                esn  => case Esn of {ok, Es} -> Es;
-                                                   _        -> #{type => esn,
-                                                                 type_raw => 5,
-                                                                 id => 0,
-                                                                 attrs => #{}}
-                                        end}};
+                true  -> {ok, #{encr => E, integ => none, esn => Esn}};
                 false -> {error, missing_integ_transform}
             end;
         _ ->
             {error, unsupported_child_transforms}
+    end.
+
+%% ESN selection: prefer "no ESN" (ID 0) whenever the UE offers it,
+%% accept ESN (ID 1) only when the UE offers it exclusively. If the UE
+%% omitted the ESN transform entirely (defensive; RFC 7296 §3.3.3
+%% requires it for ESP proposals), answer with ID 0.
+pick_esn(Transforms) ->
+    Supported = [T || T <- Transforms, is_supported_esn(T)],
+    case [T || #{id := 0} = T <- Supported] of
+        [NoEsn | _] -> NoEsn;
+        [] ->
+            case Supported of
+                [Esn | _] -> Esn;
+                []        -> #{type => esn, type_raw => 5, id => 0, attrs => #{}}
+            end
     end.
 
 %% For ESP we accept the same AES/GCM/CBC and integrity sets as for IKE

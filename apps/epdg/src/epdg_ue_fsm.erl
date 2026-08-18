@@ -2059,6 +2059,12 @@ install_child_sas({U_A, U_B, U_C, U_D} = UeOuter, PeerPort, PeerSPI, RespSPI,
     SpiOutInt  = binary_to_int(PeerSPI),
     EncAlgIn   = child_enc_alg(maps:get(encr, Suite)),
     IntegAlgIn = child_integ_alg(maps:get(integ, Suite, none)),
+    %% ESN (RFC 4304): negotiated per Child SA; both kernel SAs must be
+    %% installed with the XFRM ESN flag or sequence numbers desynchronise.
+    EsnFlag    = case maps:get(esn, Suite, none) of
+        #{id := 1} -> true;
+        _          -> false
+    end,
 
     %% Unique reqid per Child SA, applied to BOTH ESP SAs and to all
     %% three XFRM policies installed below. Multiple UEs can share one
@@ -2087,6 +2093,7 @@ install_child_sas({U_A, U_B, U_C, U_D} = UeOuter, PeerPort, PeerSPI, RespSPI,
                         dst_ip => LocalOuter,
                         sa_dir => in,
                         reqid => Reqid,
+                        esn => EsnFlag,
                         enc_alg => EncAlgIn,
                         enc_key => SkEiChild,
                         auth_alg => IntegAlgIn,
@@ -2105,6 +2112,7 @@ install_child_sas({U_A, U_B, U_C, U_D} = UeOuter, PeerPort, PeerSPI, RespSPI,
                          dst_ip => UeOuter,
                          sa_dir => out,
                          reqid => Reqid,
+                         esn => EsnFlag,
                          enc_alg => EncAlgIn,
                          enc_key => SkErChild,
                          auth_alg => IntegAlgIn,

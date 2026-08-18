@@ -168,6 +168,33 @@ child_cbc128_sha1_selects_test() ->
     ?assertEqual(16, epdg_ikev2_codec:child_enc_key_len(maps:get(encr, Suite))),
     ?assertEqual(20, epdg_ikev2_codec:child_integ_key_len(maps:get(integ, Suite))).
 
+%%====================================================================
+%% ESN negotiation (RFC 4304): a UE offering ESN exclusively must be
+%% accepted; when it offers both, "no ESN" (ID 0) is preferred.
+%%====================================================================
+
+child_esp_bin(Specs) ->
+    TBin = transforms_bin(Specs),
+    PropLen = 8 + 4 + byte_size(TBin),
+    <<0:8, 0:8, PropLen:16, 1:8, 3:8, 4:8, (length(Specs)):8,
+      16#AABBCCDD:32, TBin/binary>>.
+
+child_esn_only_accepted_test() ->
+    SaBin = child_esp_bin([{?T_ENCR, ?ENCR_AES_CBC, 128},
+                           {?T_INTEG, ?AUTH_HMAC_SHA2_256_128},
+                           {5, 1}]),
+    {ok, Suite} = epdg_ikev2_codec:decode_child_sa_payload(SaBin),
+    ?assertMatch(#{esn := #{id := 1}}, Suite).
+
+child_esn_prefers_no_esn_test() ->
+    %% UE lists ESN (1) before no-ESN (0); we still answer with 0.
+    SaBin = child_esp_bin([{?T_ENCR, ?ENCR_AES_CBC, 128},
+                           {?T_INTEG, ?AUTH_HMAC_SHA2_256_128},
+                           {5, 1},
+                           {5, 0}]),
+    {ok, Suite} = epdg_ikev2_codec:decode_child_sa_payload(SaBin),
+    ?assertMatch(#{esn := #{id := 0}}, Suite).
+
 child_enc_key_len_gcm_salt_test() ->
     %% GCM ESP keying material = key + 4-byte salt for 128/192/256.
     ?assertEqual(20, epdg_ikev2_codec:child_enc_key_len(
