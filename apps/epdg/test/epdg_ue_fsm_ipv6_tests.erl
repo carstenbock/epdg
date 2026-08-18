@@ -16,6 +16,11 @@
 -define(ASSIGNED,      {16#fd00, 16#230, 16#babe, 16#24, 0, 0, 0, 1}).
 -define(UE_ACTUAL_SRC, {16#fd00, 16#230, 16#babe, 16#24,
                         16#ff75, 16#386e, 16#bef4, 16#74ad}).
+%% The core's real IPv6 P-CSCF, and the IPv4 one the PGW put in the PCO.
+-define(PCSCF6, {16#fd00, 16#230, 16#babe, 1, 0, 0, 0, 1}).
+-define(PCSCF4, {10, 42, 0, 1}).
+
+ip6_bin({A,B,C,D,E,F,G,H}) -> <<A:16,B:16,C:16,D:16,E:16,F:16,G:16,H:16>>.
 
 %%====================================================================
 %% Inner XFRM selector
@@ -67,3 +72,84 @@ ip6_mask_test() ->
     %% Not hextet-aligned, to prove the mask is bit- and not word-based.
     ?assertEqual({16#fd00, 16#200, 0, 0, 0, 0, 0, 0},
                  epdg_ue_fsm:ip6_mask(?UE_LTE_ADDR, 24)).
+
+%%====================================================================
+%% CFG_REPLY contents
+%%====================================================================
+
+cfg_attrs(Reply) ->
+    {ok, {2, Attrs}} = epdg_ikev2_codec:decode_cp_payload(Reply),
+    Attrs.
+
+pick(Key, Attrs) -> [V || {K, V} <- Attrs, K =:= Key].
+
+%% An IPv6-only PDN, with the PGW returning only an IPv4 P-CSCF in the PCO —
+%% exactly what the lab core did.
+v6_only_pdn() ->
+    #{ip4 => {0,0,0,0}, ip6 => ?ASSIGNED,
+      dns4 => [], dns6 => [],
+      pcscf4 => [?PCSCF4], pcscf6 => []}.
+
+%% The failure this replaced: DNS and P-CSCF lived inside the "an IPv4 address
+%% was granted" branch, so on an IPv6-only PDN the reply went out carrying the
+%% address and NOTHING else. The UE had no P-CSCF to register against and only
+%% limped on because it still had one cached from its LTE PCO.
+v6_only_pdn_still_carries_pcscf_test() ->
+    Attrs = cfg_attrs(epdg_ue_fsm:build_cfg_reply(v6_only_pdn())),
+    ?assertEqual([<<10, 42, 0, 1>>], pick(p_cscf_ip4_address, Attrs)),
+    %% The address attribute is still there, with the /64 prefix length.
+    ?assertMatch([<<_:128, 64:8>>], pick(internal_ip6_address, Attrs)),
+    %% ...and no IPv4 address/netmask is invented, since none was granted.
+    ?assertEqual([], pick(internal_ip4_address, Attrs)),
+    ?assertEqual([], pick(internal_ip4_netmask, Attrs)).
+
+%% iOS requests the IPv6 P-CSCF as the 3GPP private attribute 16390 and ignores
+%% RFC 7651's 21; other stacks do the reverse. Send both.
+pcscf6_sent_under_both_attribute_numbers_test() ->
+    Pdn = (v6_only_pdn())#{pcscf6 => [?PCSCF6]},
+    Attrs = cfg_attrs(epdg_ue_fsm:build_cfg_reply(Pdn)),
+    Bin = ip6_bin(?PCSCF6),
+    ?assertEqual([Bin], pick(p_cscf_ip6_address, Attrs)),
+    ?assertEqual([Bin], pick(p_cscf_ip6_address_3gpp, Attrs)).
+
+%% Guards the attribute numbers on the wire: 21 (RFC 7651) and 16390 (3GPP),
+%% never 22 — which is what we used to emit and which IANA assigns to something
+%% else entirely, so no UE read it as a P-CSCF.
+pcscf6_attribute_numbers_on_the_wire_test() ->
+    Pdn = (v6_only_pdn())#{pcscf6 => [?PCSCF6]},
+    Reply = epdg_ue_fsm:build_cfg_reply(Pdn),
+    ?assertNotEqual(nomatch, binary:match(Reply, <<0:1,    21:15, 16:16>>)),
+    ?assertNotEqual(nomatch, binary:match(Reply, <<0:1, 16390:15, 16:16>>)),
+    ?assertEqual(nomatch,    binary:match(Reply, <<0:1,    22:15, 16:16>>)).
+
+dns_sent_for_both_families_test() ->
+    Pdn = (v6_only_pdn())#{dns4 => [{10,42,0,2}], dns6 => [?PCSCF6]},
+    Attrs = cfg_attrs(epdg_ue_fsm:build_cfg_reply(Pdn)),
+    ?assertEqual([<<10, 42, 0, 2>>], pick(internal_ip4_dns, Attrs)),
+    ?assertEqual([ip6_bin(?PCSCF6)], pick(internal_ip6_dns, Attrs)).
+
+v4_only_pdn_unchanged_test() ->
+    Pdn = #{ip4 => {10,42,0,94}, ip6 => undefined,
+            dns4 => [], dns6 => [], pcscf4 => [?PCSCF4], pcscf6 => []},
+    Attrs = cfg_attrs(epdg_ue_fsm:build_cfg_reply(Pdn)),
+    ?assertEqual([<<10, 42, 0, 94>>], pick(internal_ip4_address, Attrs)),
+    ?assertEqual([<<255, 255, 255, 255>>], pick(internal_ip4_netmask, Attrs)),
+    ?assertEqual([<<10, 42, 0, 1>>], pick(p_cscf_ip4_address, Attrs)),
+    ?assertEqual([], pick(internal_ip6_address, Attrs)).
+
+dual_stack_pdn_carries_both_addresses_test() ->
+    Pdn = #{ip4 => {10,42,0,94}, ip6 => ?ASSIGNED,
+            dns4 => [], dns6 => [],
+            pcscf4 => [?PCSCF4], pcscf6 => [?PCSCF6]},
+    Attrs = cfg_attrs(epdg_ue_fsm:build_cfg_reply(Pdn)),
+    ?assertEqual([<<10, 42, 0, 94>>], pick(internal_ip4_address, Attrs)),
+    ?assertMatch([<<_:128, 64:8>>], pick(internal_ip6_address, Attrs)),
+    ?assertEqual([<<10, 42, 0, 1>>], pick(p_cscf_ip4_address, Attrs)),
+    ?assertEqual([ip6_bin(?PCSCF6)], pick(p_cscf_ip6_address, Attrs)).
+
+%% A PDN with nothing granted must still produce a well-formed (empty) reply
+%% rather than crashing the IKE_AUTH response path.
+empty_pdn_yields_empty_reply_test() ->
+    Pdn = #{ip4 => {0,0,0,0}, ip6 => undefined,
+            dns4 => [], dns6 => [], pcscf4 => [], pcscf6 => []},
+    ?assertEqual([], cfg_attrs(epdg_ue_fsm:build_cfg_reply(Pdn))).

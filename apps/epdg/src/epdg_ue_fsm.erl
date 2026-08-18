@@ -20,8 +20,8 @@
 -export([drain_action/1, find_notify/2, new_data_for_test/1,
          classify_register_ue_result/1,
          build_notify_response/4, process_sa_init_payloads/1,
-         %% IPv6 PDN: inner XFRM selectors
-         ue6_selector/1, ip6_mask/2]).
+         %% IPv6 PDN: inner XFRM selectors, CFG_REPLY contents
+         ue6_selector/1, ip6_mask/2, build_cfg_reply/1]).
 -endif.
 
 %% Length of the IPv6 prefix a PDN connection gets. 3GPP fixes this at /64
@@ -1801,8 +1801,14 @@ finalize_ike_auth_setup(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
     Pdn        = extract_pdn_attrs(GtpcResp),
     UeInnerIp  = maps:get(ip4, Pdn),
     UeInnerIp6 = maps:get(ip6, Pdn),
+    %% Both families: build_cfg_reply/1 emits the IPv4 AND IPv6 DNS/P-CSCF
+    %% attributes regardless of which address was granted, so logging only the
+    %% IPv4 lists made an IPv6-only PDN read as if its CFG_REPLY carried no
+    %% P-CSCF at all -- the exact failure this field is here to rule out.
     PdnDns     = maps:get(dns4, Pdn),
+    PdnDns6    = maps:get(dns6, Pdn),
     PdnPcscf   = maps:get(pcscf4, Pdn),
+    PdnPcscf6  = maps:get(pcscf6, Pdn),
     %% Same reasoning as SAi2 above — TSi/TSr were stashed from the
     %% first IKE_AUTH. Fall back to whatever the post-EAP AUTH message
     %% happens to carry only if the stash is empty (defensive).
@@ -1873,9 +1879,11 @@ finalize_ike_auth_setup(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
         {ok, RespBytes} ->
             catch epdg_ikev2_listener:send(PeerIP, PeerPort, RespBytes),
             logger:info("IKE_AUTH final response sent (~B bytes) IMSI=~p "
-                        "ue_inner_ip=~p ue_inner_ip6=~p pcscf=~p dns=~p",
+                        "ue_inner_ip=~p ue_inner_ip6=~p "
+                        "pcscf4=~p pcscf6=~p dns4=~p dns6=~p",
                         [byte_size(RespBytes), Data0#data.imsi,
-                         UeInnerIp, UeInnerIp6, PdnPcscf, PdnDns]),
+                         UeInnerIp, UeInnerIp6,
+                         PdnPcscf, PdnPcscf6, PdnDns, PdnDns6]),
             epdg_metrics:inc(ike_auth_success_total),
             Data1 = Data0#data{
                 child_sa = #{spi_in  => ResponderSPIInt,
@@ -2051,31 +2059,47 @@ encode_ts_or_default(List) when is_list(List), List /= [] ->
     epdg_ikev2_codec:encode_ts_payload(List).
 
 %% Build a CFG_REPLY with the PDN attributes returned by the PGW.
-%% Emits IPv4 attributes when an IPv4 address was granted and IPv6
-%% attributes when an IPv6 address was granted (dual-stack returns both).
+%%
+%% Address attributes follow what the PGW actually granted. DNS and P-CSCF are
+%% emitted for BOTH families regardless: they used to be nested inside the
+%% per-family address branches, so an IPv6-only PDN (ip4 = 0.0.0.0) silently
+%% dropped the IPv4 P-CSCF the PGW had returned and the reply went out carrying
+%% nothing but the address. A UE that cannot use one family filters that entry
+%% itself (iOS: "EffectivePcscfList: Only one IP family ... - filtering P-CSCF
+%% list"), so offering both costs nothing and losing one costs registration.
+%%
 %% RFC 7296 §3.15.1 (INTERNAL_IP6_ADDRESS = 16-byte addr + 1-byte prefix
-%% length) and 3GPP TS 24.302 §8.2 (P_CSCF_IP6_ADDRESS attr 22).
+%% length); P-CSCF attributes per RFC 7651 and 3GPP TS 24.302 §8.2.
 build_cfg_reply(#{ip4 := Ip4, ip6 := Ip6,
                   dns4 := Dns4, dns6 := Dns6,
                   pcscf4 := Pcscf4, pcscf6 := Pcscf6}) ->
-    V4 = case Ip4 of
+    Addr4 = case Ip4 of
         {0,0,0,0} -> [];
         {A,B,C,D} ->
             [{internal_ip4_address, <<A:8,B:8,C:8,D:8>>},
-             {internal_ip4_netmask, <<255:8,255:8,255:8,255:8>>}]
-            ++ [{internal_ip4_dns, encode_ip4(X)} || X <- Dns4]
-            ++ [{p_cscf_ip4_address, encode_ip4(X)} || X <- Pcscf4];
+             {internal_ip4_netmask, <<255:8,255:8,255:8,255:8>>}];
         _ -> []
     end,
-    V6 = case Ip6 of
+    Addr6 = case Ip6 of
         undefined -> [];
         _ ->
-            %% INTERNAL_IP6_ADDRESS: 16-byte address + /64 prefix length.
-            [{internal_ip6_address, <<(encode_ip6(Ip6))/binary, 64:8>>}]
-            ++ [{internal_ip6_dns, encode_ip6(X)} || X <- Dns6]
-            ++ [{p_cscf_ip6_address, encode_ip6(X)} || X <- Pcscf6]
+            [{internal_ip6_address,
+              <<(encode_ip6(Ip6))/binary, ?UE6_PREFIX_LEN:8>>}]
     end,
-    epdg_ikev2_codec:encode_cp_payload(2, V4 ++ V6).
+    Dns = [{internal_ip4_dns, encode_ip4(X)} || X <- Dns4]
+       ++ [{internal_ip6_dns, encode_ip6(X)} || X <- Dns6],
+    Pcscf = [{p_cscf_ip4_address, encode_ip4(X)} || X <- Pcscf4]
+         ++ lists:flatmap(fun pcscf6_attrs/1, Pcscf6),
+    epdg_ikev2_codec:encode_cp_payload(2, Addr4 ++ Addr6 ++ Dns ++ Pcscf).
+
+%% One IPv6 P-CSCF, twice: the RFC 7651 attribute (21) and the 3GPP private-use
+%% one (16390). iOS requests the latter and ignores the former, other stacks do
+%% the reverse, and a UE that understands both just sees the same address listed
+%% twice.
+pcscf6_attrs(Addr) ->
+    Bin = encode_ip6(Addr),
+    [{p_cscf_ip6_address, Bin},
+     {p_cscf_ip6_address_3gpp, Bin}].
 
 encode_ip4({A,B,C,D}) -> <<A:8,B:8,C:8,D:8>>.
 
