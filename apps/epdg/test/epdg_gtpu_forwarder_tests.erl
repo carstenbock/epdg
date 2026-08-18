@@ -49,9 +49,12 @@ remote_port_range(Lo, Hi) -> <<16#51:8, Lo:16, Hi:16>>.
 %%====================================================================
 
 reg(Ip4, Ip6, Teid, PgwTeid, PgwIP, State) ->
+    reg_imsi(Ip4, Ip6, Teid, PgwTeid, PgwIP, <<"001010000000001">>, State).
+
+reg_imsi(Ip4, Ip6, Teid, PgwTeid, PgwIP, Imsi, State) ->
     Params0 = #{pgw_u_teid => PgwTeid, pgw_u_ip => PgwIP,
                 ue_inner_ip => Ip4, local_teid_hint => Teid,
-                imsi => <<"001010000000001">>},
+                imsi => Imsi},
     Params = case Ip6 of
                  undefined -> Params0;
                  _         -> Params0#{ue_inner_ip6 => Ip6}
@@ -223,6 +226,61 @@ reattach_same_ip_supersedes_test() ->
     %% Fresh session unregisters — mapping is gone.
     S4 = epdg_gtpu_forwarder:unregister_ue_for_test(1003, S3),
     ?assertEqual(unknown_src, epdg_gtpu_forwarder:classify_for_test(Pkt, S4)).
+
+%%====================================================================
+%% Inner-IP key collision detection
+%%====================================================================
+
+%% Two DIFFERENT subscribers addressed inside the same /64 collapse onto
+%% one uplink key (the PGW must delegate one /64 per UE). Registration
+%% keeps last-writer-wins — the re-attach path must survive — but the
+%% collision has to become visible: without the metric several
+%% subscribers silently share one GTP tunnel, the same failure class as
+%% the legacy TEID-table collision.
+v6_same_prefix_different_imsi_counts_collision_test() ->
+    epdg_metrics:init(),
+    S0 = epdg_gtpu_forwarder:new_state_for_test(?POOLS),
+    Before = epdg_metrics:get(ue_inner_ip_key_collision_total),
+    Ue1 = {16#cafe, 0, 16#46, 1, 0, 0, 0, 1},
+    Ue2 = {16#cafe, 0, 16#46, 1, 0, 0, 0, 2},  %% same /64 as Ue1
+    {{ok, _}, S1} = reg_imsi({0, 0, 0, 0}, Ue1, 1001, 501, ?PGW_IP1,
+                             <<"001010000000001">>, S0),
+    {{ok, _}, S2} = reg_imsi({0, 0, 0, 0}, Ue2, 1002, 502, ?PGW_IP2,
+                             <<"001010000000002">>, S1),
+    ?assertEqual(Before + 1,
+                 epdg_metrics:get(ue_inner_ip_key_collision_total)),
+    %% Documented last-writer-wins: the shared key now belongs to the
+    %% most recently registered TEID.
+    Pkt = ipv6_udp(Ue1, {16#2001, 16#db8, 0, 0, 0, 0, 0, 1}, 40000, 5060),
+    ?assertEqual({ok, 1002, {502, ?PGW_IP2}},
+                 epdg_gtpu_forwarder:classify_for_test(Pkt, S2)).
+
+%% A re-attach (same IMSI reusing its IP) is NOT a collision and must
+%% not pollute the metric — reattach_same_ip_supersedes_test above stays
+%% the behavioural reference for the mapping semantics.
+reattach_same_imsi_not_counted_as_collision_test() ->
+    epdg_metrics:init(),
+    S0 = epdg_gtpu_forwarder:new_state_for_test(?POOLS),
+    Before = epdg_metrics:get(ue_inner_ip_key_collision_total),
+    Ip = {10, 46, 0, 2},
+    {{ok, _}, S1} = reg(Ip, undefined, 1001, 501, ?PGW_IP1, S0),
+    {{ok, _}, _S2} = reg(Ip, undefined, 1003, 503, ?PGW_IP2, S1),
+    ?assertEqual(Before,
+                 epdg_metrics:get(ue_inner_ip_key_collision_total)).
+
+%% Same IPv4 address handed to two different subscribers is the v4
+%% variant of the same misconfiguration and counts as well.
+v4_same_ip_different_imsi_counts_collision_test() ->
+    epdg_metrics:init(),
+    S0 = epdg_gtpu_forwarder:new_state_for_test(?POOLS),
+    Before = epdg_metrics:get(ue_inner_ip_key_collision_total),
+    Ip = {10, 46, 0, 7},
+    {{ok, _}, S1} = reg_imsi(Ip, undefined, 1001, 501, ?PGW_IP1,
+                             <<"001010000000001">>, S0),
+    {{ok, _}, _S2} = reg_imsi(Ip, undefined, 1002, 502, ?PGW_IP2,
+                              <<"001010000000002">>, S1),
+    ?assertEqual(Before + 1,
+                 epdg_metrics:get(ue_inner_ip_key_collision_total)).
 
 %%====================================================================
 %% Startup pool-list guard

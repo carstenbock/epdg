@@ -76,6 +76,11 @@
     pgw_u_ip     :: inet:ip_address(),
     ue_inner_ip  :: inet:ip_address(),
     ue_inner_ip6 :: inet:ip_address() | undefined,
+    %% Owning subscriber. Log correlation, and the discriminator between
+    %% a re-attach (the same IMSI reuses its inner IP) and a real
+    %% inner-IP key collision (two subscribers mapped onto one uplink
+    %% key) — see detect_inner_key_collision/5.
+    imsi         :: binary() | undefined,
     owner_pid    :: pid() | undefined,
     %% Local TEIDs of this UE's dedicated bearers (S2b dedicated bearer
     %% activation). They share this UE's IPsec SA; kept here so the
@@ -377,6 +382,7 @@ do_register_ue_valid(P, InnerIP, InnerIP6, PgwTeid, PgwIP,
                     _                           -> N
                 end,
     Owner = maps:get(owner_pid, P, undefined),
+    Imsi = maps:get(imsi, P, undefined),
     case is_pid(Owner) of
         true  -> erlang:monitor(process, Owner);
         false -> ok
@@ -386,22 +392,81 @@ do_register_ue_valid(P, InnerIP, InnerIP6, PgwTeid, PgwIP,
                   pgw_u_ip = PgwIP,
                   ue_inner_ip = InnerIP,
                   ue_inner_ip6 = InnerIP6,
+                  imsi = Imsi,
                   owner_pid = Owner},
     Owners1 = case Owner of
         undefined -> Owners;
         _         -> Owners#{Owner => LocalTeid}
     end,
+    Keys = inner_ip_keys(InnerIP, InnerIP6),
+    detect_inner_key_collision(Keys, LocalTeid, Imsi, ByIp, Map),
     %% Last-writer-wins on a re-attach that reuses the same inner IP
     %% before the stale session's cleanup ran (the FSM-level IMSI
     %% supersede tears the old session down shortly after); the guarded
     %% delete in do_unregister_teid/2 keeps the fresh mapping intact.
+    %% When the key belongs to a DIFFERENT subscriber this overwrite is
+    %% a real collision (PGW address-allocation misconfiguration, e.g.
+    %% several UEs inside one IPv6 /64) — made visible above via
+    %% detect_inner_key_collision/5, but deliberately still not
+    %% rejected, so the re-attach path keeps working.
     ByIp1 = lists:foldl(fun(K, Acc) -> Acc#{K => LocalTeid} end,
-                        ByIp, inner_ip_keys(InnerIP, InnerIP6)),
+                        ByIp, Keys),
     {{ok, #{local_teid => LocalTeid, tun_name => State#state.tun_name}},
      State#state{by_teid = Map#{LocalTeid => Ent},
                  by_owner = Owners1,
                  by_inner_ip = ByIp1,
                  next_teid = N + 1}}.
+
+%% A by_inner_ip key that already points at ANOTHER TEID is one of:
+%%
+%%   (a) a re-attach — the same subscriber brings up a new session that
+%%       reuses its inner IP before the stale session's cleanup ran.
+%%       Expected; handled by last-writer-wins in the caller.
+%%   (b) a real collision — the PGW addressed two DIFFERENT subscribers
+%%       onto one uplink key (several UEs inside one IPv6 /64, or a
+%%       duplicate IPv4 PAA): the same failure class as the legacy
+%%       TEID-table collision, one level up, and just as silent.
+%%
+%% The stored IMSI tells the two apart. Collisions are made visible
+%% (error log + ue_inner_ip_key_collision_total) but NOT rejected;
+%% when an IMSI is missing on either side the log says it may also be
+%% a re-attach.
+detect_inner_key_collision(Keys, NewTeid, NewImsi, ByIp, ByTeid) ->
+    lists:foreach(
+      fun(K) ->
+              case ByIp of
+                  #{K := OldTeid} when OldTeid =/= NewTeid ->
+                      OldImsi = case ByTeid of
+                                    #{OldTeid := #ue_ent{imsi = I}} -> I;
+                                    _                               -> undefined
+                                end,
+                      report_inner_key_conflict(K, OldTeid, OldImsi,
+                                                NewTeid, NewImsi);
+                  _ ->
+                      ok
+              end
+      end, Keys).
+
+%% Same subscriber on both sides: a re-attach, not a collision.
+report_inner_key_conflict(_K, _OldTeid, Imsi, _NewTeid, Imsi)
+  when Imsi =/= undefined ->
+    ok;
+report_inner_key_conflict(K, OldTeid, OldImsi, NewTeid, NewImsi) ->
+    epdg_metrics:inc(ue_inner_ip_key_collision_total),
+    Caveat = case OldImsi =:= undefined orelse NewImsi =:= undefined of
+                 true  -> " (an IMSI is unknown, so this may also be a "
+                          "re-attach of the same subscriber)";
+                 false -> ""
+             end,
+    logger:error("GTP-U: inner-IP key ~p already mapped to TEID ~B "
+                 "(IMSI ~s) while registering TEID ~B (IMSI ~s) — "
+                 "several UEs share one uplink key; check the PGW "
+                 "address allocation (one /64 per UE for IPv6)~s",
+                 [K, OldTeid, fmt_imsi(OldImsi), NewTeid,
+                  fmt_imsi(NewImsi), Caveat]).
+
+fmt_imsi(Imsi) when is_binary(Imsi) -> binary_to_list(Imsi);
+fmt_imsi(_)                         -> "unknown".
 
 do_unregister_teid(Teid, #state{by_teid = Map, by_ded = Ded, by_owner = Owners,
                                  by_inner_ip = ByIp} = State) ->

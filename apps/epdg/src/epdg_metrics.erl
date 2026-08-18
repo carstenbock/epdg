@@ -62,6 +62,7 @@ init() ->
         gtpu_uplink_dedicated_pkts_total,
         gtpu_uplink_unknown_src_total,
         ue_ip_outside_pool_total,
+        ue_inner_ip_key_collision_total,
         dpd_timeout_total,
         dpd_probes_sent_total,
         mobike_update_total,

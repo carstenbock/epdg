@@ -245,7 +245,7 @@ deployments. Precedence: per-pod → per-node → scalar → default.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `EPDG_UE_IP_POOLS` | **required** | Comma-separated CIDR list (IPv4/IPv6 mixed) of every UE inner-IP pool the PGW allocates from, e.g. `10.46.0.0/16,cafe:0:46::/48`. Drives the shared-TUN policy routing and the register-time pool check; the app refuses to boot without it. Replaces the never-evaluated `EPDG_UE_IP_POOL`/`EPDG_UE_IP6_POOL` |
+| `EPDG_UE_IP_POOLS` | **required** | Comma-separated CIDR list (IPv4/IPv6 mixed) of every UE inner-IP pool the PGW allocates from, e.g. `10.46.0.0/16,cafe:0:46::/48`. Drives the shared-TUN policy routing and the register-time pool check; the app refuses to boot without it. IPv6 pools must be **wider than /64** (uplink attribution is keyed on the per-UE delegated /64, so a `/64`-or-longer pool could hold only one distinguishable UE and is rejected at boot). Replaces the never-evaluated `EPDG_UE_IP_POOL`/`EPDG_UE_IP6_POOL` |
 | `EPDG_IPV6_ENABLED` | `false` | Honour the UE's requested PDN type and grant IPv6 / IPv4v6 (IR.51/IR.92) |
 | `EPDG_ALLOWED_APNS` | `ims` | Comma-separated allow-list (empty = allow all; `ims` always allowed) |
 | `EPDG_DEFAULT_APN` | `ims` | APN used when the UE does not request one |
@@ -286,7 +286,9 @@ Served by Cowboy on `EPDG_API_PORT` (default 8080).
   `epdg_gtpc_peer_restarts_total`, `epdg_gtpc_dns_resolves_total`
 * `epdg_gtpu_tx_bytes` / `_rx_bytes` / `_tx_pkts` / `_rx_pkts`,
   `epdg_gtpu_peer_down_total`, `epdg_gtpu_uplink_unknown_src_total`,
-  `epdg_ue_ip_outside_pool_total`
+  `epdg_ue_ip_outside_pool_total`, `epdg_ue_inner_ip_key_collision_total`
+  (two different subscribers mapped onto one uplink inner-IP key — check
+  the PGW address allocation)
 * `epdg_diameter_swm_requests_total`, `epdg_diameter_swm_latency_ms_*`,
   `epdg_diameter_swm_peers` (gauge)
 * `epdg_xfrm_sa_active` (gauge), `epdg_xfrm_sa_created_total` / `_deleted_total` / `_errors_total`

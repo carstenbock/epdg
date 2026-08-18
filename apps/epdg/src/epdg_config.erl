@@ -254,6 +254,7 @@ set_ue_ip_pools() ->
 %% Parse a comma-separated CIDR list ("10.46.0.0/16,cafe:0:46::/48") into
 %% [{BaseAddr, PrefixLen}]. Any invalid entry raises {invalid_cidr, Entry}
 %% — silently skipping a pool would strand every UE the PGW puts there.
+%% IPv6 pools must be strictly wider than /64 (see check_v6_pool_width/3).
 -spec parse_ue_ip_pools(string()) -> [{inet:ip_address(), 0..128}].
 parse_ue_ip_pools(Csv) when is_list(Csv) ->
     Entries = [string:trim(E) || E <- string:split(Csv, ",", all)],
@@ -269,7 +270,7 @@ parse_cidr(Str) ->
                               8 -> 128
                           end,
                     case Len >= 0 andalso Len =< Max of
-                        true  -> {Addr, Len};
+                        true  -> check_v6_pool_width(Addr, Len, Str);
                         false -> error({invalid_cidr, Str})
                     end;
                 _ ->
@@ -278,6 +279,23 @@ parse_cidr(Str) ->
         _ ->
             error({invalid_cidr, Str})
     end.
+
+%% The GTP-U forwarder attributes IPv6 uplink to its bearer by the /64
+%% prefix of the inner source address, because the PGW delegates one
+%% /64 per UE (see epdg_gtpu_forwarder:inner_src_key/1). A pool with
+%% prefix length >= 64 therefore contains at most ONE distinguishable
+%% UE: every further UE the PGW addresses inside it collapses onto the
+%% same uplink key and silently shares the first UE's GTP tunnel.
+%% Reject such pools at boot instead. IPv4 pools are unaffected (v4
+%% uplink is keyed on the exact address).
+check_v6_pool_width(Addr, Len, Str) when tuple_size(Addr) =:= 8,
+                                         Len >= 64 ->
+    error({invalid_cidr, Str,
+           "IPv6 UE pools must be wider than /64: uplink attribution is "
+           "keyed on the per-UE delegated /64 prefix, so a pool of /64 "
+           "or longer can hold at most one distinguishable UE"});
+check_v6_pool_width(Addr, Len, _Str) ->
+    {Addr, Len}.
 
 set_dra_hosts() ->
     Hosts = case os:getenv("DRA_HOSTS") of
