@@ -5,7 +5,7 @@
 -module(epdg_config).
 
 -export([init/0, get/1, get/2, parse_gtpc_mode/1, parse_ue_ip_pools/1,
-         parse_instance_id/2, parse_legacy_dh_groups/1]).
+         parse_instance_id/2, parse_legacy_dh_groups/1, parse_bool/2]).
 
 -define(APP, epdg).
 
@@ -36,6 +36,14 @@ init() ->
 
     %% EAP-AKA'
     set_from_env("EPDG_EAP_METHOD", eap_method, "aka-prime"),
+
+    %% RFC 5998 EAP-only authentication. Default on: honour
+    %% N(EAP_ONLY_AUTHENTICATION) and omit CERT+AUTH from message 4.
+    %% false restores strict RFC 7296 (always send CERT+AUTH).
+    set_from_env_bool("EPDG_EAP_ONLY_AUTH", eap_only_auth, true),
+    logger:notice("IKE auth mode: eap_only_auth=~p "
+                  "(RFC 5998; false always sends CERT+AUTH)",
+                  [get(eap_only_auth, true)]),
 
     %% XFRM / IPsec
     set_from_env("EPDG_IPSEC_OFFLOAD", ipsec_offload, "auto"),
@@ -198,18 +206,22 @@ set_from_env_int(EnvVar, AppKey, Default) ->
     application:set_env(?APP, AppKey, Value).
 
 set_from_env_bool(EnvVar, AppKey, Default) ->
-    Value = case os:getenv(EnvVar) of
-        false -> Default;
-        Val ->
-            case string:lowercase(string:trim(Val)) of
-                "1"    -> true;
-                "true" -> true;
-                "yes"  -> true;
-                "on"   -> true;
-                _      -> false
-            end
-    end,
-    application:set_env(?APP, AppKey, Value).
+    application:set_env(?APP, AppKey, parse_bool(os:getenv(EnvVar), Default)).
+
+%% Used by set_from_env_bool/3 and exported so tests can assert the
+%% EPDG_EAP_ONLY_AUTH parser without running init/0 (which requires
+%% EPDG_UE_IP_POOLS). Unset (false) keeps Default; "1"/"true"/"yes"/"on"
+%% are true; everything else is false.
+-spec parse_bool(string() | false, boolean()) -> boolean().
+parse_bool(false, Default) -> Default;
+parse_bool(Val, _Default) ->
+    case string:lowercase(string:trim(Val)) of
+        "1"    -> true;
+        "true" -> true;
+        "yes"  -> true;
+        "on"   -> true;
+        _      -> false
+    end.
 
 set_from_env_resolved_addr(PrimaryEnv, ByPodEnv, ByNodeEnv, AppKey, Default) ->
     Primary = os:getenv(PrimaryEnv, Default),

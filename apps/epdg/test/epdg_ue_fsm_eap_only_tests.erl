@@ -46,6 +46,22 @@ absent_eap_only_notify_test() ->
     ?assertNot(epdg_ue_fsm:find_notify(?N_EAP_ONLY_AUTHENTICATION, Payloads)).
 
 %%====================================================================
+%% Config gate (EPDG_EAP_ONLY_AUTH)
+%%====================================================================
+
+eap_only_selected_flag_on_notify_present_test() ->
+    Payloads = [notify(?N_EAP_ONLY_AUTHENTICATION)],
+    ?assert(epdg_ue_fsm:eap_only_selected(true, Payloads)).
+
+eap_only_selected_flag_off_notify_present_test() ->
+    Payloads = [notify(?N_EAP_ONLY_AUTHENTICATION)],
+    ?assertNot(epdg_ue_fsm:eap_only_selected(false, Payloads)).
+
+eap_only_selected_flag_on_notify_absent_test() ->
+    ?assertNot(epdg_ue_fsm:eap_only_selected(true, [])),
+    ?assertNot(epdg_ue_fsm:eap_only_selected(true, [notify(?N_MOBIKE_SUPPORTED)])).
+
+%%====================================================================
 %% Helpers
 %%====================================================================
 

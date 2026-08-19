@@ -141,3 +141,16 @@ legacy_dh_groups_rejects_other_values_test() ->
                  epdg_config:parse_legacy_dh_groups("2,14")),
     ?assertError({invalid_config, _},
                  epdg_config:parse_legacy_dh_groups("garbage")).
+
+%% EPDG_EAP_ONLY_AUTH (set_from_env_bool): unset defaults true;
+%% 0/false → false; 1/true → true.
+eap_only_auth_unset_defaults_true_test() ->
+    ?assertEqual(true, epdg_config:parse_bool(false, true)).
+
+eap_only_auth_false_values_test() ->
+    ?assertEqual(false, epdg_config:parse_bool("0", true)),
+    ?assertEqual(false, epdg_config:parse_bool("false", true)).
+
+eap_only_auth_true_values_test() ->
+    ?assertEqual(true, epdg_config:parse_bool("1", true)),
+    ?assertEqual(true, epdg_config:parse_bool("true", true)).

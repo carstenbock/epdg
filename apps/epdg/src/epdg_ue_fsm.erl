@@ -18,7 +18,7 @@
 %% is a minimal #data constructor so tests can drive drain_action/1 without a
 %% live SA (the #data record is otherwise private to this module).
 -export([drain_action/1, find_notify/2, new_data_for_test/1,
-         build_first_auth_chain/3,
+         build_first_auth_chain/3, eap_only_selected/2,
          classify_register_ue_result/1,
          build_notify_response/4, process_sa_init_payloads/1]).
 -endif.
@@ -1138,8 +1138,21 @@ handle_ike_auth_request(Header, RawData,
                             %% exchange. Otherwise sign IDr with our key and send
                             %% the cert (this also avoids needing a private key /
                             %% certificate at all in the EAP-only case).
-                            EapOnly = find_notify(?N_EAP_ONLY_AUTHENTICATION,
-                                                  InnerPayloads),
+                            %%
+                            %% SPEC-DEVIATION: TS 33.402 §7.2.1 — public-key
+                            %% signature authentication with certificates SHALL
+                            %% be used to authenticate the ePDG. Honoured only
+                            %% when the UE offers N(EAP_ONLY_AUTHENTICATION)
+                            %% and EPDG_EAP_ONLY_AUTH is on: RFC 5998 §3
+                            %% requires a mutually authenticating, key-
+                            %% generating EAP method (EAP-AKA'), and the UE
+                            %% then knows it talks to a gateway trusted by its
+                            %% home AAA, not necessarily this one (RFC 5998
+                            %% §6.2). false restores the TS 33.402 / RFC 7296
+                            %% CERT+AUTH path.
+                            EapOnly = eap_only_selected(
+                                          epdg_config:get(eap_only_auth, true),
+                                          InnerPayloads),
                             CertAuth =
                                 case EapOnly of
                                     true ->
@@ -1160,10 +1173,8 @@ handle_ike_auth_request(Header, RawData,
                                              AuthMethod, Signature)}
                                 end,
                             logger:info("IKE_AUTH first response auth=~s IMSI=~p",
-                                        [case EapOnly of
-                                             true -> "eap-only";
-                                             false -> "cert"
-                                         end, IMSI]),
+                                        [eap_only_auth_label(EapOnly, InnerPayloads),
+                                         IMSI]),
                             InnerChain = build_first_auth_chain(
                                            IDrPayload, EapBin, CertAuth),
 
@@ -2761,6 +2772,22 @@ build_first_auth_chain(IDrPayload, EapBin, none) ->
     [{idr, IDrPayload}, {eap, EapBin}];
 build_first_auth_chain(IDrPayload, EapBin, {CertBin, AuthBin}) ->
     [{idr, IDrPayload}, {cert, CertBin}, {auth, AuthBin}, {eap, EapBin}].
+
+%% Honour RFC 5998 EAP-only only when the operator flag is on *and* the
+%% UE offered N(EAP_ONLY_AUTHENTICATION). Exported for the gate tests.
+eap_only_selected(Flag, InnerPayloads) ->
+    Flag andalso find_notify(?N_EAP_ONLY_AUTHENTICATION, InnerPayloads).
+
+%% Distinguishes "cert because the UE did not offer EAP-only" from
+%% "cert because the flag is off" so Samsung failures with the flag
+%% disabled are greppable.
+eap_only_auth_label(true, _InnerPayloads) ->
+    "eap-only";
+eap_only_auth_label(false, InnerPayloads) ->
+    case find_notify(?N_EAP_ONLY_AUTHENTICATION, InnerPayloads) of
+        true  -> "cert (eap-only offered, disabled by config)";
+        false -> "cert"
+    end.
 
 %% Scan ALL notify payloads for a given message type (RFC 7296 §3.10).
 %% find_payload/2 returns only the first notify regardless of type, so we
