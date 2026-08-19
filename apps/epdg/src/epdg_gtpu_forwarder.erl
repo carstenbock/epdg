@@ -31,6 +31,12 @@
 %%%   Octets 3-4: Length (payload bytes, not including the 8-byte header)
 %%%   Octets 5-8: TEID
 %%%
+%%% Besides T-PDUs the socket also answers Echo Requests (TS 29.281
+%%% §7.2.1). The PGW-U sends them as a path liveness check and marks the
+%%% path — and with it every bearer riding on it — down when they go
+%%% unanswered, so this is not optional even though we never initiate
+%%% echoes ourselves (GTP-C echo does our own path supervision).
+%%%
 %%% When the PGW restarts or Recovery changes (signalled by the GTP-C
 %%% client via `epdg_ue_registry:broadcast({pgw_restart, _})'), every
 %%% TEID we registered is stale; the forwarder clears its tables and
@@ -56,13 +62,23 @@
          new_state_for_test/1, register_ue_for_test/2,
          register_bearer_for_test/2, unregister_ue_for_test/2,
          uplink_for_test/2, classify_for_test/2,
-         instance_params/1, extract_ue_tun_name/1, legacy_ue_route_table/1]).
+         instance_params/1, extract_ue_tun_name/1, legacy_ue_route_table/1,
+         decode_gtpu/1, encode_gtpu_echo_response/1]).
 -endif.
 
 -define(SERVER,     ?MODULE).
 -define(GTPU_PORT,  2152).
 -define(GTPU_HDR_FLAGS, 16#30).
 -define(GTPU_MSG_TPDU,  16#FF).
+%% As ?GTPU_HDR_FLAGS but with S=1: Echo Request/Response carry a mandatory
+%% Sequence Number, so the four optional octets are always present.
+-define(GTPU_HDR_FLAGS_SEQ, 16#32).
+-define(GTPU_MSG_ECHO_REQ,  16#01).
+-define(GTPU_MSG_ECHO_RSP,  16#02).
+%% GTPv1 Recovery IE (TV format, type 14): mandatory in an Echo Response.
+%% A GTP-U entity sets the restart counter to 0 and the receiver ignores it
+%% (TS 29.281 §7.2.2) — GTP-U has no restart-counter semantics of its own.
+-define(GTPU_IE_RECOVERY,   16#0E).
 %% Per-instance datapath identifiers, all derived from the pod instance
 %% id (0..?MAX_INSTANCES-1) in instance_params/1:
 %%
@@ -324,7 +340,7 @@ handle_cast({pgw_restart, _}, State) ->
                           by_owner = #{}, by_inner_ip = #{}}};
 handle_cast(_Msg, State) -> {noreply, State}.
 
-handle_info({udp, _Sock, _FromIP, _FromPort, Packet}, State) ->
+handle_info({udp, Sock, FromIP, FromPort, Packet}, State) ->
     case decode_gtpu(Packet) of
         {ok, Teid, Payload} ->
             epdg_metrics:inc(gtpu_rx_pkts),
@@ -338,7 +354,27 @@ handle_info({udp, _Sock, _FromIP, _FromPort, Packet}, State) ->
                 false -> ok
             end,
             {noreply, State#state{last_rx_ts = erlang:system_time(second)}};
-        _ ->
+        {echo_request, Seq} ->
+            %% Answer on the socket the request arrived on and back to its
+            %% source port: the PGW-U is entitled to echo from an ephemeral
+            %% port, and replying to 2152 would silently fail its path check.
+            epdg_metrics:inc(gtpu_echo_req_rx_total),
+            case gen_udp:send(Sock, FromIP, FromPort,
+                              encode_gtpu_echo_response(Seq)) of
+                ok ->
+                    epdg_metrics:inc(gtpu_echo_rsp_tx_total);
+                {error, Reason} ->
+                    logger:warning("GTP-U: echo response to ~p:~B failed: ~p",
+                                   [FromIP, FromPort, Reason])
+            end,
+            {noreply, State#state{last_rx_ts = erlang:system_time(second)}};
+        {echo_response, _Seq} ->
+            %% We never initiate user-plane echoes, so this is unsolicited
+            %% (or a late reply to a peer's own retransmit). Count and drop.
+            epdg_metrics:inc(gtpu_echo_rsp_rx_total),
+            {noreply, State#state{last_rx_ts = erlang:system_time(second)}};
+        error ->
+            epdg_metrics:inc(gtpu_rx_undecodable_total),
             {noreply, State}
     end;
 handle_info({tun_packet, LocalTeid, Pkt}, State) ->
@@ -730,21 +766,49 @@ classify_uplink_1([DT | Rest], Pkt, Ded, Default) ->
     end.
 
 %%====================================================================
-%% GTP-U codec (T-PDU only)
+%% GTP-U codec (T-PDU and Echo Request/Response)
 %%====================================================================
 
 encode_gtpu_tpdu(Teid, Payload) ->
     Len = byte_size(Payload),
     <<?GTPU_HDR_FLAGS:8, ?GTPU_MSG_TPDU:8, Len:16, Teid:32, Payload/binary>>.
 
-decode_gtpu(<<Ver:3, _PT:1, E:1, S:1, PN:1, _Spare:1,
+%% Echo Response (TS 29.281 §7.2.2): echoes the request's Sequence Number
+%% and carries the mandatory Recovery IE. TEID is 0 — echo messages are not
+%% tied to a tunnel. Length counts everything after the 8 mandatory octets,
+%% i.e. the four optional octets plus the 2-octet Recovery TV.
+encode_gtpu_echo_response(Seq) ->
+    Body = <<Seq:16, 0:8, 0:8, ?GTPU_IE_RECOVERY:8, 0:8>>,
+    <<?GTPU_HDR_FLAGS_SEQ:8, ?GTPU_MSG_ECHO_RSP:8, (byte_size(Body)):16,
+      0:32, Body/binary>>.
+
+%% Flags octet, MSB first (TS 29.281 §5.1): Version(3) | PT | spare | E | S
+%% | PN. The spare bit sits BETWEEN PT and E — getting that wrong shifts
+%% E/S/PN by one position, which a T-PDU survives (skip_opt/4 skips the
+%% four optional octets whenever any of the three is set) but which makes
+%% an echo message's mandatory Sequence Number unreadable.
+decode_gtpu(<<Ver:3, _PT:1, _Spare:1, E:1, S:1, PN:1,
               ?GTPU_MSG_TPDU:8, _Len:16, Teid:32, Rest/binary>>)
   when Ver =:= 1 ->
     %% Skip optional fields when flagged (TS 29.281 §5.1)
     Payload = skip_opt(E, S, PN, Rest),
     {ok, Teid, Payload};
+decode_gtpu(<<Ver:3, _PT:1, _Spare:1, _E:1, S:1, _PN:1,
+              ?GTPU_MSG_ECHO_REQ:8, _Len:16, _Teid:32, Rest/binary>>)
+  when Ver =:= 1 ->
+    {echo_request, echo_seq(S, Rest)};
+decode_gtpu(<<Ver:3, _PT:1, _Spare:1, _E:1, S:1, _PN:1,
+              ?GTPU_MSG_ECHO_RSP:8, _Len:16, _Teid:32, Rest/binary>>)
+  when Ver =:= 1 ->
+    {echo_response, echo_seq(S, Rest)};
 decode_gtpu(_) ->
     error.
+
+%% Sequence Number of an echo message. Mandatory (S=1) for Echo
+%% Request/Response per TS 29.281 §5.1, but a peer that clears S still gets
+%% an answer — with sequence 0 — rather than silence.
+echo_seq(1, <<Seq:16, _NPdu:8, _NextExt:8, _/binary>>) -> Seq;
+echo_seq(_, _)                                         -> 0.
 
 skip_opt(0, 0, 0, Bin) -> Bin;
 skip_opt(E, S, PN, <<_SeqPnNext:32, Rest/binary>>)
