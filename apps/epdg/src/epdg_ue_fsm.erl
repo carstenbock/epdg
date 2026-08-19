@@ -18,6 +18,7 @@
 %% is a minimal #data constructor so tests can drive drain_action/1 without a
 %% live SA (the #data record is otherwise private to this module).
 -export([drain_action/1, find_notify/2, new_data_for_test/1,
+         build_first_auth_chain/3,
          classify_register_ue_result/1,
          build_notify_response/4, process_sa_init_payloads/1]).
 -endif.
@@ -37,6 +38,8 @@
 -define(N_REDIRECT_SUPPORTED, 16406).
 -define(N_REDIRECT,           16407).
 -define(N_REDIRECT_FROM,      16408).
+%% RFC 5998 section 4
+-define(N_EAP_ONLY_AUTHENTICATION, 16417).
 
 %% MOBIKE return-routability (COOKIE2) check defaults (RFC 4555 §3.7).
 %% Retransmit the COOKIE2 probe a few times (UDP) before giving up.
@@ -1124,30 +1127,45 @@ handle_ike_auth_request(Header, RawData,
                                                 "epdg.localdomain")),
                             IDrPayload = epdg_ikev2_codec:encode_id_payload(2, IDrFqdn),
 
-                            %% Compute AUTH over (IKE_SA_INIT_resp | Nonce_i
-                            %% | prf(SK_pr, IDr')). IDr' = ID payload body.
-                            #{prf := PRF} = KeyParams,
-                            {AuthMethod, Signature} =
-                                epdg_ikev2_crypto:sign_auth_data(
-                                    PRF, IkeSaInitRespBytes, NonceI,
-                                    #{sk_pr => maps:get(sk_pr, Keys),
-                                      id_payload => IDrPayload},
-                                    PrivKey),
-
-                            CertBin = epdg_ikev2_codec:encode_cert_payload(CertDer),
-                            AuthBin = epdg_ikev2_codec:encode_auth_payload(
-                                          AuthMethod, Signature),
                             %% First EAP message: Request/Identity. Replaced
                             %% once SWm DER/DEA is wired in.
                             EapReq  = epdg_ikev2_codec:encode_eap_request_identity(EapId),
                             EapBin  = epdg_ikev2_codec:encode_eap_payload(EapReq),
 
-                            InnerChain = [
-                                {idr,  IDrPayload},
-                                {cert, CertBin},
-                                {auth, AuthBin},
-                                {eap,  EapBin}
-                            ],
+                            %% RFC 5998: if the UE offered EAP-only auth, omit
+                            %% the certificate and the cert-based AUTH — the UE
+                            %% authenticates us via the EAP-AKA' MSK in the final
+                            %% exchange. Otherwise sign IDr with our key and send
+                            %% the cert (this also avoids needing a private key /
+                            %% certificate at all in the EAP-only case).
+                            EapOnly = find_notify(?N_EAP_ONLY_AUTHENTICATION,
+                                                  InnerPayloads),
+                            CertAuth =
+                                case EapOnly of
+                                    true ->
+                                        none;
+                                    false ->
+                                        %% AUTH over (IKE_SA_INIT_resp | Nonce_i
+                                        %% | prf(SK_pr, IDr')).
+                                        #{prf := PRF} = KeyParams,
+                                        {AuthMethod, Signature} =
+                                            epdg_ikev2_crypto:sign_auth_data(
+                                                PRF, IkeSaInitRespBytes, NonceI,
+                                                #{sk_pr => maps:get(sk_pr, Keys),
+                                                  id_payload => IDrPayload},
+                                                PrivKey),
+                                        {epdg_ikev2_codec:encode_cert_payload(
+                                             CertDer),
+                                         epdg_ikev2_codec:encode_auth_payload(
+                                             AuthMethod, Signature)}
+                                end,
+                            logger:info("IKE_AUTH first response auth=~s IMSI=~p",
+                                        [case EapOnly of
+                                             true -> "eap-only";
+                                             false -> "cert"
+                                         end, IMSI]),
+                            InnerChain = build_first_auth_chain(
+                                           IDrPayload, EapBin, CertAuth),
 
                             %% Preserve peer's flag set except we flip Response
                             %% and clear Initiator (we are responder).
@@ -2731,6 +2749,18 @@ send_informational_response(MsgId, ExtraPayloads,
 %%====================================================================
 %% Session / Child-SA lifecycle helpers (dedup, cleanup, MOBIKE)
 %%====================================================================
+
+%% Assemble the first IKE_AUTH response inner payload chain. With EAP-only
+%% authentication (RFC 5998) the certificate and cert-based AUTH are omitted
+%% (CertAuth = none); otherwise CertAuth = {CertPayload, AuthPayload} and both
+%% are inserted between IDr and the EAP request.
+-spec build_first_auth_chain(binary(), binary(),
+                             none | {binary(), binary()}) ->
+          [{atom(), binary()}].
+build_first_auth_chain(IDrPayload, EapBin, none) ->
+    [{idr, IDrPayload}, {eap, EapBin}];
+build_first_auth_chain(IDrPayload, EapBin, {CertBin, AuthBin}) ->
+    [{idr, IDrPayload}, {cert, CertBin}, {auth, AuthBin}, {eap, EapBin}].
 
 %% Scan ALL notify payloads for a given message type (RFC 7296 §3.10).
 %% find_payload/2 returns only the first notify regardless of type, so we
