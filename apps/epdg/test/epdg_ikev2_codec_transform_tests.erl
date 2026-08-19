@@ -205,6 +205,112 @@ dh16_selects_test() ->
     ?assertMatch(#{dh := #{id := ?DH_MODP_4096}}, Suite).
 
 %%====================================================================
+%% Missing Key Length attribute (RFC 7296 §3.3.5 violation seen from
+%% real handsets): AES-CBC (12) and AES-GCM-16 (20) without the
+%% attribute are normalised to 128 bits at decode time, with a
+%% key_length_defaulted marker. INTEG transforms share IDs 12/14
+%% (HMAC-SHA2) and must never be touched.
+%%====================================================================
+
+keylen_defaulted_on_bare_encr12_test() ->
+    TBin = transforms_bin([{?T_ENCR, ?ENCR_AES_CBC}]),
+    {ok, [T]} = epdg_ikev2_codec:decode_transforms(TBin),
+    ?assertMatch(#{id := ?ENCR_AES_CBC,
+                   attrs := #{key_length := 128},
+                   key_length_defaulted := true}, T).
+
+keylen_defaulted_on_bare_encr20_test() ->
+    TBin = transforms_bin([{?T_ENCR, ?ENCR_AES_GCM_16}]),
+    {ok, [T]} = epdg_ikev2_codec:decode_transforms(TBin),
+    ?assertMatch(#{id := ?ENCR_AES_GCM_16,
+                   attrs := #{key_length := 128},
+                   key_length_defaulted := true}, T).
+
+keylen_not_defaulted_on_integ_test() ->
+    %% INTEG 12 = HMAC-SHA2-256-128, same numeric ID as ENCR AES-CBC.
+    TBin = transforms_bin([{?T_INTEG, ?AUTH_HMAC_SHA2_256_128}]),
+    {ok, [T]} = epdg_ikev2_codec:decode_transforms(TBin),
+    ?assertEqual(#{}, maps:get(attrs, T)),
+    ?assertNot(maps:is_key(key_length_defaulted, T)).
+
+keylen_present_no_marker_test() ->
+    TBin = transforms_bin([{?T_ENCR, ?ENCR_AES_CBC, 256}]),
+    {ok, [T]} = epdg_ikev2_codec:decode_transforms(TBin),
+    ?assertMatch(#{attrs := #{key_length := 256}}, T),
+    ?assertNot(maps:is_key(key_length_defaulted, T)).
+
+keylen_not_defaulted_on_other_encr_test() ->
+    %% ENCR 13 = AES-CTR: not in the defaulting set, stays unsupported.
+    TBin = transforms_bin([{?T_ENCR, 13}]),
+    {ok, [T]} = epdg_ikev2_codec:decode_transforms(TBin),
+    ?assertEqual(#{}, maps:get(attrs, T)),
+    ?assertNot(maps:is_key(key_length_defaulted, T)).
+
+%%====================================================================
+%% The two customer-lab lines that omit Key Length must now select.
+%% Note on expectations: the codec picks the last supported transform
+%% of each type in initiator order (per-type lists are accumulated in
+%% reverse), so the legacy line yields integ:5/dh:16 and the modern
+%% line prf:7/dh:20 — not the first-supported entries.
+%%====================================================================
+
+lab_legacy_no_keylen_selects_test() ->
+    %% encr:1..13 (no keylen), prf:1..2, integ:0..5, dh:0,1,2,5,14..18
+    Proposals = ike_proposal(
+        [{?T_ENCR, E} || E <- [1, 2, 3, 4, 6, 7, 8, 9, 11, 12, 13]] ++
+        [{?T_PRF, P} || P <- [1, 2]] ++
+        [{?T_INTEG, I} || I <- [0, 1, 2, 3, 4, 5]] ++
+        [{?T_DH, D} || D <- [0, 1, 2, 5, 14, 15, 16, 17, 18]]),
+    {ok, Suite} = epdg_ikev2_codec:select_proposal(Proposals),
+    ?assertMatch(#{encr := #{id := ?ENCR_AES_CBC,
+                             attrs := #{key_length := 128},
+                             key_length_defaulted := true},
+                   prf := #{id := ?PRF_HMAC_SHA1},
+                   integ := #{id := 5},
+                   dh := #{id := ?DH_MODP_4096}}, Suite).
+
+lab_modern_no_keylen_selects_test() ->
+    %% encr:18,19,20,28 (no keylen), prf:1,2,5,6,7, dh:0,1,2,14,16,19,20
+    Proposals = ike_proposal(
+        [{?T_ENCR, E} || E <- [18, 19, 20, 28]] ++
+        [{?T_PRF, P} || P <- [1, 2, 5, 6, 7]] ++
+        [{?T_DH, D} || D <- [0, 1, 2, 14, 16, 19, 20]]),
+    {ok, Suite} = epdg_ikev2_codec:select_proposal(Proposals),
+    ?assertMatch(#{encr := #{id := ?ENCR_AES_GCM_16,
+                             attrs := #{key_length := 128},
+                             key_length_defaulted := true},
+                   prf := #{id := ?PRF_HMAC_SHA2_512},
+                   integ := none,
+                   dh := #{id := 20}}, Suite).
+
+%%====================================================================
+%% RFC 7296 §3.3.5: our SA response must carry the Key Length
+%% attribute (TV, type 14, value 128) even though the initiator
+%% omitted it — encoded from the normalised map, not the raw bytes.
+%%====================================================================
+
+sa_response_echoes_defaulted_keylen_test_() ->
+    [{Desc,
+      fun() ->
+          Proposals = ike_proposal(Specs),
+          {ok, Suite} = epdg_ikev2_codec:select_proposal(Proposals),
+          Resp = epdg_ikev2_codec:encode_sa_response(Suite),
+          %% TV attribute: AF=1, type 14, value 128 -> 80 0E 00 80.
+          ?assertNotEqual(nomatch,
+                          binary:match(Resp, <<16#80, 16#0E, 0, 128>>))
+      end}
+     || {Desc, Specs} <-
+        [{"AES-CBC without keylen",
+          [{?T_ENCR, ?ENCR_AES_CBC},
+           {?T_PRF, ?PRF_HMAC_SHA1},
+           {?T_INTEG, ?AUTH_HMAC_SHA1_96},
+           {?T_DH, ?DH_MODP_2048}]},
+         {"AES-GCM-16 without keylen",
+          [{?T_ENCR, ?ENCR_AES_GCM_16},
+           {?T_PRF, ?PRF_HMAC_SHA2_256},
+           {?T_DH, ?DH_MODP_2048}]}]].
+
+%%====================================================================
 %% A proposal offering only 3DES must still be rejected.
 %%====================================================================
 

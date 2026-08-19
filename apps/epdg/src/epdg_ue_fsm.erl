@@ -740,6 +740,7 @@ handle_ike_sa_init_request(#{initiator_spi := ISPI, next_payload := NextPL,
             Data1 = Data#data{redirect_supported = RedirectSupported},
             case process_sa_init_payloads(Payloads) of
                 {ok, Parsed} ->
+                    log_key_length_defaulted(Parsed, PeerIP, PeerPort),
                     send_sa_init_response(ISPI, MsgId, Parsed, Data1);
                 {error, Reason} ->
                     logger:warning("IKE_SA_INIT from ~p:~p rejected: ~p "
@@ -752,6 +753,18 @@ handle_ike_sa_init_request(#{initiator_spi := ISPI, next_payload := NextPL,
                            [PeerIP, PeerPort, DecodeErr]),
             send_notify_and_stop(ISPI, MsgId, invalid_syntax, Data)
     end.
+
+%% The selected ENCR transform carries key_length_defaulted when the
+%% initiator omitted the (mandatory) Key Length attribute and the codec
+%% assumed 128 bits — worth an info line for support cases.
+log_key_length_defaulted(#{suite := #{encr := #{id := EId,
+                                                key_length_defaulted := true}}},
+                         PeerIP, PeerPort) ->
+    logger:info("IKE_SA_INIT from ~p:~p offered ENCR transform ~B without "
+                "a Key Length attribute; assuming 128 bits",
+                [PeerIP, PeerPort, EId]);
+log_key_length_defaulted(_, _, _) ->
+    ok.
 
 %% Extract and validate SA / KE / Nonce payloads.
 process_sa_init_payloads(Payloads) ->

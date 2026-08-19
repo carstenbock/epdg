@@ -274,10 +274,11 @@ decode_transforms_acc(<<Last:8, _Res:8, TLen:16,
     AttrLen = TLen - 8,
     case Rest of
         <<AttrData:AttrLen/binary, More/binary>> ->
-            Transform = #{type     => transform_type_atom(TType),
-                          type_raw => TType,
-                          id       => TId,
-                          attrs    => decode_attrs(AttrData)},
+            Transform = normalize_transform(
+                          #{type     => transform_type_atom(TType),
+                            type_raw => TType,
+                            id       => TId,
+                            attrs    => decode_attrs(AttrData)}),
             case Last of
                 0 -> {ok, lists:reverse([Transform | Acc])};
                 3 -> decode_transforms_acc(More, [Transform | Acc]);
@@ -288,6 +289,22 @@ decode_transforms_acc(<<Last:8, _Res:8, TLen:16,
     end;
 decode_transforms_acc(_, _) ->
     {error, malformed_transform}.
+
+%% SPEC-DEVIATION: RFC 7296 §3.3.5 / RFC 5282 §5 -- the Key Length
+%% attribute is a MUST for variable-key ENCR algorithms, but real
+%% handsets offer AES-CBC/AES-GCM-16 without it. Treat the missing
+%% attribute as 128 bits (the RFC 3602/4106 default key size and 3GPP
+%% baseline, matching strongSwan behaviour). Only transform type 1
+%% (ENCR) is normalised -- INTEG shares IDs 12/14 (HMAC-SHA2) and must
+%% not grow a key-length attribute. The marker makes the defaulting
+%% visible downstream (FSM logging); our SA response stays conformant
+%% because the response transform is re-encoded from the normalised
+%% attrs map, which now carries key_length explicitly.
+normalize_transform(#{type_raw := 1, id := Id, attrs := Attrs} = T)
+  when (Id =:= 12 orelse Id =:= 20), not is_map_key(key_length, Attrs) ->
+    T#{attrs => Attrs#{key_length => 128}, key_length_defaulted => true};
+normalize_transform(T) ->
+    T.
 
 %% Decode transform attributes. We only care about Key Length (TV, type 14).
 decode_attrs(Bin) -> decode_attrs_acc(Bin, #{}).
