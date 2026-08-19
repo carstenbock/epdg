@@ -29,6 +29,7 @@ BEAM is out of the per-packet path once Child SAs are installed.
 | GTP-U S2b-U user plane | 3GPP TS 29.281 |
 | ePDG / APN FQDN formats | 3GPP TS 23.003 §19.4, §14 |
 | IKEv2 | IETF RFC 7296 |
+| EAP-only authentication in IKEv2 | IETF RFC 5998 |
 | IKEv2 NAT traversal (UDP-encap ESP) | IETF RFC 3948 |
 | MOBIKE (Wi-Fi ↔ Wi-Fi handover) | IETF RFC 4555 |
 | IKEv2 Redirect (load steering on drain) | IETF RFC 5685 |
@@ -146,6 +147,24 @@ sequenceDiagram
 After `established`, the BEAM only handles control traffic (DPD, MOBIKE,
 GTP-C Echo, teardown); ESP ↔ GTP-U runs in the kernel.
 
+### EAP-only authentication (RFC 5998)
+
+When a UE includes `N(EAP_ONLY_AUTHENTICATION)` (16417) in the first
+`IKE_AUTH` request, it is willing to authenticate the ePDG without a
+certificate and to rely on the EAP-AKA' MSK-based AUTH that already
+runs in the final exchange. Samsung handsets offer this notify and
+reject self-signed or custom-CA certificates even when the CA is
+installed on the UE — so honouring the offer is what makes Samsung
+work for an operator whose certificate is not in Samsung's trust store.
+An operator with a valid, already-trusted certificate loses little by
+honouring it: RFC 5998 §6.2 notes that the UE then knows it talks to
+*a* gateway trusted by its home AAA, not necessarily *this* one. EAP-AKA'
+is mutually authenticating and key-generating, which is the precondition
+RFC 5998 §3 sets. `EPDG_EAP_ONLY_AUTH=false` restores strict RFC 7296
+behaviour: the notify is ignored and CERT + AUTH are always sent. The
+ePDG certificate and key are **still required at boot** in both modes;
+EAP-only only skips sending them on message 4.
+
 ---
 
 ## Configuration
@@ -175,6 +194,7 @@ Empty/unset values fall back to the defaults below.
 | `EPDG_IKE_ID_FQDN` | `epdg.epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org` | IDr FQDN (should match the cert SAN:DNS) |
 | `EPDG_IKE_LEGACY_DH_GROUPS` | _(empty)_ | Comma-separated opt-in for legacy DH groups `2` (MODP-1024) and/or `5` (MODP-1536). **Off by default**: RFC 8247 §2.4 rates both as SHOULD NOT — MODP-1024 in particular is within reach of well-funded attackers (Logjam). Enable only for a known legacy device population that offers no stronger group; a built-in group (14/15/16/19/20/31) offered anywhere in the proposal still wins. Enabling logs a warning at boot |
 | `EPDG_EAP_METHOD` | `aka-prime` | `aka` or `aka-prime` |
+| `EPDG_EAP_ONLY_AUTH` | `true` | Honour RFC 5998 `N(EAP_ONLY_AUTHENTICATION)` and omit CERT + signature AUTH from IKE_AUTH message 4. `false` restores strict RFC 7296 (always send CERT+AUTH) |
 | `EPDG_IPSEC_OFFLOAD` | `auto` | `auto` / `none` / `inline` / `crypto` |
 | `EPDG_IPSEC_IFACE` | `eth0` | NIC for hardware-offload detection |
 
