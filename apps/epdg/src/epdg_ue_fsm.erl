@@ -19,8 +19,17 @@
 %% live SA (the #data record is otherwise private to this module).
 -export([drain_action/1, find_notify/2, new_data_for_test/1,
          classify_register_ue_result/1,
-         build_notify_response/4, process_sa_init_payloads/1]).
+         build_notify_response/4, process_sa_init_payloads/1,
+         %% IPv6 PDN: inner selectors, CFG_REPLY contents, handover PAA
+         ue6_selector/1, ip6_mask/2, build_cfg_reply/1,
+         requested_handover_addrs/1]).
 -endif.
+
+%% Length of the IPv6 prefix a PDN connection gets. 3GPP fixes this at /64
+%% (TS 23.401 §5.3.1.2.2): the network assigns the prefix, the UE picks its own
+%% interface identifier within it. Used for the CFG_REPLY prefix length, the
+%% XFRM inner selectors and the handover PAA so all three agree.
+-define(UE6_PREFIX_LEN, 64).
 
 -define(IKE_SA_INIT_TIMEOUT, 30000).
 -define(IKE_AUTH_TIMEOUT,    60000).
@@ -1510,19 +1519,20 @@ proceed_with_s2b(MsgId, InFlags, ISPI, RSPI,
     %% say via the Create-Session PAA; we set up whatever it actually grants.
     PdnType = requested_pdn_type(Data0),
     %% 3GPP->non-3GPP handover attach (TS 24.302 §6.4): if the UE requested its
-    %% existing IMS IPv4 in the IKEv2 CFG_REQUEST, relay it to the PGW so the
+    %% existing IMS address in the IKEv2 CFG_REQUEST, relay it to the PGW so the
     %% PDN (and any active call) survive the handover instead of being torn down
-    %% and re-created on a fresh IP.
-    HoV4 = requested_handover_ipv4(Data0#data.cp_body),
+    %% and re-created on a fresh address.
+    #{v4 := HoV4, v6 := HoV6} = requested_handover_addrs(Data0#data.cp_body),
     logger:info("S2b Create-Session IMSI=~p APN=~p pdn_type=~B (1=v4 2=v6 3=v4v6)"
-                " handover_v4=~p",
-                [IMSI, Apn, PdnType, HoV4]),
+                " handover_v4=~p handover_v6=~p",
+                [IMSI, Apn, PdnType, HoV4, HoV6]),
     case epdg_gtpc_client:create_session_request(#{
             imsi         => IMSI,
             apn          => Apn,
             rat_type     => 3,           %% WLAN
             pdn_type     => PdnType,
             handover_v4  => HoV4,
+            handover_v6  => HoV6,
             ebi          => 5,
             local_c_teid => LocalCTeid,
             local_u_teid => LocalUTeid
@@ -1793,8 +1803,14 @@ finalize_ike_auth_setup(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
     Pdn        = extract_pdn_attrs(GtpcResp),
     UeInnerIp  = maps:get(ip4, Pdn),
     UeInnerIp6 = maps:get(ip6, Pdn),
+    %% Both families: build_cfg_reply/1 emits the IPv4 AND IPv6 DNS/P-CSCF
+    %% attributes regardless of which address was granted, so logging only the
+    %% IPv4 lists made an IPv6-only PDN read as if its CFG_REPLY carried no
+    %% P-CSCF at all -- the exact failure this field is here to rule out.
     PdnDns     = maps:get(dns4, Pdn),
+    PdnDns6    = maps:get(dns6, Pdn),
     PdnPcscf   = maps:get(pcscf4, Pdn),
+    PdnPcscf6  = maps:get(pcscf6, Pdn),
     %% Same reasoning as SAi2 above — TSi/TSr were stashed from the
     %% first IKE_AUTH. Fall back to whatever the post-EAP AUTH message
     %% happens to carry only if the stash is empty (defensive).
@@ -1865,9 +1881,11 @@ finalize_ike_auth_setup(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
         {ok, RespBytes} ->
             catch epdg_ikev2_listener:send(PeerIP, PeerPort, RespBytes),
             logger:info("IKE_AUTH final response sent (~B bytes) IMSI=~p "
-                        "ue_inner_ip=~p ue_inner_ip6=~p pcscf=~p dns=~p",
+                        "ue_inner_ip=~p ue_inner_ip6=~p "
+                        "pcscf4=~p pcscf6=~p dns4=~p dns6=~p",
                         [byte_size(RespBytes), Data0#data.imsi,
-                         UeInnerIp, UeInnerIp6, PdnPcscf, PdnDns]),
+                         UeInnerIp, UeInnerIp6,
+                         PdnPcscf, PdnPcscf6, PdnDns, PdnDns6]),
             epdg_metrics:inc(ike_auth_success_total),
             Data1 = Data0#data{
                 child_sa = #{spi_in  => ResponderSPIInt,
@@ -1923,30 +1941,63 @@ split_child_keymat(Mat, E, I) ->
     <<SKar:I/binary, _/binary>> = Rest3,
     {SKei, SKai, SKer, SKar}.
 
+%% Requested existing UE address(es) from the IKEv2 CFG_REQUEST, for a
+%% 3GPP->non-3GPP handover attach (TS 24.302 §6.4). A non-zero
+%% INTERNAL_IP4_ADDRESS / INTERNAL_IP6_ADDRESS means the UE wants to keep that
+%% IMS address across the handover; we relay it to the PGW as the Create-Session
+%% PAA. Returns #{v4 => .. | undefined, v6 => .. | undefined}; both undefined
+%% => fresh attach (dynamic allocation).
+%%
+%% The IPv6 half is what the observed iPhone failure needed: handing an IPv6 IMS
+%% PDN over from LTE it asks for its current prefix (INTERNAL_IP6_ADDRESS
+%% fd00:230:babe:22::1/64) and offers no IPv4 attribute at all. Reading only the
+%% IPv4 attribute left this undefined, so no PAA and no Handover Indication went
+%% to the PGW, it allocated a *different* prefix, and the UE found its cellular
+%% and WiFi contexts holding two addresses for one APN
+%% ("kDataProtocolFamilyIPv6 - conflict" -> kDataContextDeactivateHandoverConflict
+%% -> "Error bringing interface online") and deleted the tunnel ~50 ms after it
+%% came up.
+requested_handover_addrs(CpBody) when is_binary(CpBody) ->
+    case epdg_ikev2_codec:decode_cp_payload(CpBody) of
+        {ok, {_CfgType, Attrs}} ->
+            #{v4 => handover_v4_from_attrs(Attrs),
+              v6 => handover_v6_from_attrs(Attrs)};
+        _ ->
+            #{v4 => undefined, v6 => undefined}
+    end;
+requested_handover_addrs(_) ->
+    #{v4 => undefined, v6 => undefined}.
+
+handover_v4_from_attrs(Attrs) ->
+    case lists:keyfind(internal_ip4_address, 1, Attrs) of
+        {_, <<A:8, B:8, C:8, D:8>>} when {A, B, C, D} =/= {0, 0, 0, 0} ->
+            {A, B, C, D};
+        _ ->
+            undefined
+    end.
+
+%% INTERNAL_IP6_ADDRESS is 16 address octets + 1 prefix-length octet
+%% (RFC 7296 §3.15.1). Tolerate a UE that omits the trailing length.
+handover_v6_from_attrs(Attrs) ->
+    case lists:keyfind(internal_ip6_address, 1, Attrs) of
+        {_, <<Addr:16/binary, _PrefixLen:8>>} -> handover_v6_prefix(Addr);
+        {_, <<Addr:16/binary>>}               -> handover_v6_prefix(Addr);
+        _                                     -> undefined
+    end.
+
+handover_v6_prefix(<<0:128>>) ->
+    undefined;
+handover_v6_prefix(<<A:16,B:16,C:16,D:16,E:16,F:16,G:16,H:16>>) ->
+    %% Ask the PGW for the /64, not the UE's full address: the PGW allocates
+    %% prefixes, and the interface identifier in what the UE sent is its own
+    %% (and may rotate for privacy), so it must not be part of the request.
+    ip6_mask({A,B,C,D,E,F,G,H}, ?UE6_PREFIX_LEN).
+
 %% Determine the S2b PDN type to request from the PGW.
 %%   1 = IPv4, 2 = IPv6, 3 = IPv4v6 (TS 29.274 §8.34).
 %% When dual-stack is disabled we always request IPv4 (historical default).
 %% When enabled we honour what the UE asked for in its IKEv2 CFG_REQUEST
 %% (RFC 7296 §3.15): INTERNAL_IP4_ADDRESS (1) and/or INTERNAL_IP6_ADDRESS (8).
-%% Requested existing UE IPv4 from the IKEv2 CFG_REQUEST, for a 3GPP->non-3GPP
-%% handover attach (TS 24.302 §6.4). A non-zero INTERNAL_IP4_ADDRESS means the
-%% UE wants to keep this IMS IP across the handover; we relay it to the PGW as
-%% the Create-Session PAA. undefined => fresh attach (dynamic IP).
-requested_handover_ipv4(CpBody) when is_binary(CpBody) ->
-    case epdg_ikev2_codec:decode_cp_payload(CpBody) of
-        {ok, {_CfgType, Attrs}} ->
-            case lists:keyfind(internal_ip4_address, 1, Attrs) of
-                {_, <<A:8, B:8, C:8, D:8>>} when {A, B, C, D} =/= {0, 0, 0, 0} ->
-                    {A, B, C, D};
-                _ ->
-                    undefined
-            end;
-        _ ->
-            undefined
-    end;
-requested_handover_ipv4(_) ->
-    undefined.
-
 requested_pdn_type(#data{cp_body = CpBody}) ->
     case epdg_config:get(ipv6_enabled, false) of
         true  -> pdn_type_from_cp(CpBody);
@@ -2043,31 +2094,47 @@ encode_ts_or_default(List) when is_list(List), List /= [] ->
     epdg_ikev2_codec:encode_ts_payload(List).
 
 %% Build a CFG_REPLY with the PDN attributes returned by the PGW.
-%% Emits IPv4 attributes when an IPv4 address was granted and IPv6
-%% attributes when an IPv6 address was granted (dual-stack returns both).
+%%
+%% Address attributes follow what the PGW actually granted. DNS and P-CSCF are
+%% emitted for BOTH families regardless: they used to be nested inside the
+%% per-family address branches, so an IPv6-only PDN (ip4 = 0.0.0.0) silently
+%% dropped the IPv4 P-CSCF the PGW had returned and the reply went out carrying
+%% nothing but the address. A UE that cannot use one family filters that entry
+%% itself (iOS: "EffectivePcscfList: Only one IP family ... - filtering P-CSCF
+%% list"), so offering both costs nothing and losing one costs registration.
+%%
 %% RFC 7296 §3.15.1 (INTERNAL_IP6_ADDRESS = 16-byte addr + 1-byte prefix
-%% length) and 3GPP TS 24.302 §8.2 (P_CSCF_IP6_ADDRESS attr 22).
+%% length); P-CSCF attributes per RFC 7651 and 3GPP TS 24.302 §8.2.
 build_cfg_reply(#{ip4 := Ip4, ip6 := Ip6,
                   dns4 := Dns4, dns6 := Dns6,
                   pcscf4 := Pcscf4, pcscf6 := Pcscf6}) ->
-    V4 = case Ip4 of
+    Addr4 = case Ip4 of
         {0,0,0,0} -> [];
         {A,B,C,D} ->
             [{internal_ip4_address, <<A:8,B:8,C:8,D:8>>},
-             {internal_ip4_netmask, <<255:8,255:8,255:8,255:8>>}]
-            ++ [{internal_ip4_dns, encode_ip4(X)} || X <- Dns4]
-            ++ [{p_cscf_ip4_address, encode_ip4(X)} || X <- Pcscf4];
+             {internal_ip4_netmask, <<255:8,255:8,255:8,255:8>>}];
         _ -> []
     end,
-    V6 = case Ip6 of
+    Addr6 = case Ip6 of
         undefined -> [];
         _ ->
-            %% INTERNAL_IP6_ADDRESS: 16-byte address + /64 prefix length.
-            [{internal_ip6_address, <<(encode_ip6(Ip6))/binary, 64:8>>}]
-            ++ [{internal_ip6_dns, encode_ip6(X)} || X <- Dns6]
-            ++ [{p_cscf_ip6_address, encode_ip6(X)} || X <- Pcscf6]
+            [{internal_ip6_address,
+              <<(encode_ip6(Ip6))/binary, ?UE6_PREFIX_LEN:8>>}]
     end,
-    epdg_ikev2_codec:encode_cp_payload(2, V4 ++ V6).
+    Dns = [{internal_ip4_dns, encode_ip4(X)} || X <- Dns4]
+       ++ [{internal_ip6_dns, encode_ip6(X)} || X <- Dns6],
+    Pcscf = [{p_cscf_ip4_address, encode_ip4(X)} || X <- Pcscf4]
+         ++ lists:flatmap(fun pcscf6_attrs/1, Pcscf6),
+    epdg_ikev2_codec:encode_cp_payload(2, Addr4 ++ Addr6 ++ Dns ++ Pcscf).
+
+%% One IPv6 P-CSCF, twice: the RFC 7651 attribute (21) and the 3GPP private-use
+%% one (16390). iOS requests the latter and ignores the former, other stacks do
+%% the reverse, and a UE that understands both just sees the same address listed
+%% twice.
+pcscf6_attrs(Addr) ->
+    Bin = encode_ip6(Addr),
+    [{p_cscf_ip6_address, Bin},
+     {p_cscf_ip6_address_3gpp, Bin}].
 
 encode_ip4({A,B,C,D}) -> <<A:8,B:8,C:8,D:8>>.
 
@@ -2191,12 +2258,12 @@ install_child_sas({U_A, U_B, U_C, U_D} = UeOuter, PeerPort, PeerSPI, RespSPI,
     _ = {U_A, U_B, U_C, U_D},  %% silence unused
     ok.
 
-%% Install the in/fwd/out XFRM policies for the UE's IPv6 inner address.
+%% Install the in/fwd/out XFRM policies for the UE's IPv6 inner prefix.
 %% No-op when the UE has no IPv6 (IPv4-only PAA). Reqid pins the policy
 %% templates to this UE's Child SA pair (shared with the IPv4 selectors).
 install_v6_policies(undefined, _UeOuter, _LocalOuter, _Reqid) -> ok;
 install_v6_policies(UeInnerIp6, UeOuter, LocalOuter, Reqid) ->
-    Ue6Cidr  = ip6_cidr(UeInnerIp6, 128),
+    Ue6Cidr  = ue6_selector(UeInnerIp6),
     Any6Cidr = "::/0",
     log_xfrm_result(pol6_in, 0,
         catch epdg_xfrm:create_policy(#{src => Ue6Cidr, dst => Any6Cidr,
@@ -2339,6 +2406,33 @@ ip4_cidr({A,B,C,D}, Prefix) ->
 
 ip6_cidr({_,_,_,_,_,_,_,_} = Ip6, Prefix) ->
     lists:flatten(io_lib:format("~s/~B", [inet:ntoa(Ip6), Prefix])).
+
+%% XFRM selector covering all of a UE's IPv6 inner traffic.
+%%
+%% The PGW allocates a /64 PDN prefix (TS 23.401 §5.3.1.2.2) and the UE derives
+%% its own interface identifier from it — an iPhone handed fd00:230:babe:24::1
+%% sources traffic from fd00:230:babe:24:ff75:386e:bef4:74ad. Selecting on the
+%% single address the PAA named therefore matches nothing the UE actually sends
+%% or receives: the kernel drops the uplink on the inbound policy check and
+%% never encapsulates the downlink, so the tunnel comes up and then carries no
+%% traffic at all (observed as a SIP REGISTER stuck in "Trying" until the UE's
+%% 100 s IMS registration timer tore the tunnel down).
+%%
+%% The host bits are zeroed rather than left in place: the kernel stores and
+%% prints the masked form, and delete_ue6_policies/1 has to hand `ip xfrm' a
+%% string that matches what create_policy installed or the delete silently
+%% no-ops and the policy leaks to the next session.
+ue6_selector({_,_,_,_,_,_,_,_} = Ip6) ->
+    ip6_cidr(ip6_mask(Ip6, ?UE6_PREFIX_LEN), ?UE6_PREFIX_LEN).
+
+%% Zero everything below PrefixLen. Derived from the prefix length rather than
+%% hardcoding "keep 4 hextets" so the two cannot drift apart.
+ip6_mask({_,_,_,_,_,_,_,_} = Ip6, PrefixLen)
+  when PrefixLen >= 0, PrefixLen =< 128 ->
+    <<N:128>> = encode_ip6(Ip6),
+    Mask = ((1 bsl PrefixLen) - 1) bsl (128 - PrefixLen),
+    <<A:16,B:16,C:16,D:16,E:16,F:16,G:16,H:16>> = <<(N band Mask):128>>,
+    {A,B,C,D,E,F,G,H}.
 
 binary_to_int(<<N:32>>) -> N;
 binary_to_int(<<N:64>>) -> N;
@@ -2794,7 +2888,8 @@ delete_ue_policies(UeInnerIp, UeInnerIp6) ->
 
 delete_ue6_policies(undefined) -> ok;
 delete_ue6_policies(UeInnerIp6) ->
-    Ue6Cidr  = ip6_cidr(UeInnerIp6, 128),
+    %% Must derive the selector exactly as install_v6_policies/4 did.
+    Ue6Cidr  = ue6_selector(UeInnerIp6),
     Any6Cidr = "::/0",
     catch epdg_xfrm:delete_policy(#{src => Ue6Cidr,  dst => Any6Cidr,
                                     direction => in}),
