@@ -188,9 +188,16 @@ do_create_sa(#{spi := SPI, src_ip := Src, dst_ip := Dst,
         false -> ""
     end,
 
+    %% `flag af-unspec' leaves the SA's selector family unset. Without it
+    %% the kernel pins x->sel.family to the SA's own family (the OUTER
+    %% addresses, IPv4 here) in xfrm_state_construct/1, and every inner
+    %% IPv6 packet the SA decrypts is then rejected by xfrm_policy_ok/5
+    %% with XfrmInStateMismatch. One SA pair has to carry both families
+    %% for an IPv4v6 PDN; family selection belongs to the per-/64 policies,
+    %% not the SA. strongSwan sets the same flag unconditionally.
     Cmd = io_lib:format(
         "ip xfrm state add src ~s dst ~s proto esp spi 0x~.16B~s~s "
-        "enc '~s' 0x~s~s~s mode tunnel",
+        "enc '~s' 0x~s~s~s mode tunnel flag af-unspec",
         [ip_str(Src), ip_str(Dst), SPI, ReqidPart, EsnPart,
          enc_alg_str(EncAlg), bin2hex(EncKey), AuthPart, EncapPart]),
 
