@@ -23,7 +23,12 @@
 -define(PRF_HMAC_SHA2_256, 5).
 -define(AUTH_HMAC_SHA1_96, 2).
 -define(AUTH_HMAC_SHA2_256_128, 12).
+-define(AUTH_HMAC_SHA2_512_256, 14).
+-define(PRF_HMAC_SHA2_384, 6).
+-define(PRF_HMAC_SHA2_512, 7).
 -define(DH_MODP_2048,    14).
+-define(DH_MODP_3072,    15).
+-define(DH_MODP_4096,    16).
 
 %%====================================================================
 %% Helpers: encode a transforms binary and wrap it in a proposal map
@@ -149,6 +154,55 @@ gcm192_selects_test() ->
     {ok, Params} = epdg_ikev2_codec:keys_params_for_suite(Suite),
     ?assertMatch(#{enc_alg := aes_gcm_192, enc_key_len := 28,
                    salt_len := 4, is_aead := true}, Params).
+
+%%====================================================================
+%% MODP-3072 (DH 15): the three customer-lab proposal lines that offer
+%% dh:15 as the only group must now select instead of getting
+%% NO_PROPOSAL_CHOSEN. MODP-4096 (DH 16) sanity-checked alongside.
+%%====================================================================
+
+lab_cbc256_sha256_dh15_selects_test() ->
+    %% encr:12/keylen=256, integ:12, prf:5, dh:15
+    Proposals = ike_proposal([{?T_ENCR, ?ENCR_AES_CBC, 256},
+                              {?T_INTEG, ?AUTH_HMAC_SHA2_256_128},
+                              {?T_PRF, ?PRF_HMAC_SHA2_256},
+                              {?T_DH, ?DH_MODP_3072}]),
+    {ok, Suite} = epdg_ikev2_codec:select_proposal(Proposals),
+    ?assertMatch(#{encr := #{id := ?ENCR_AES_CBC,
+                             attrs := #{key_length := 256}},
+                   prf := #{id := ?PRF_HMAC_SHA2_256},
+                   integ := #{id := ?AUTH_HMAC_SHA2_256_128},
+                   dh := #{id := ?DH_MODP_3072}}, Suite).
+
+lab_cbc256_sha512_dh15_selects_test() ->
+    %% encr:12/keylen=256, integ:14, prf:7, dh:15
+    Proposals = ike_proposal([{?T_ENCR, ?ENCR_AES_CBC, 256},
+                              {?T_INTEG, ?AUTH_HMAC_SHA2_512_256},
+                              {?T_PRF, ?PRF_HMAC_SHA2_512},
+                              {?T_DH, ?DH_MODP_3072}]),
+    {ok, Suite} = epdg_ikev2_codec:select_proposal(Proposals),
+    ?assertMatch(#{prf := #{id := ?PRF_HMAC_SHA2_512},
+                   integ := #{id := ?AUTH_HMAC_SHA2_512_256},
+                   dh := #{id := ?DH_MODP_3072}}, Suite).
+
+lab_gcm256_sha384_dh15_selects_test() ->
+    %% encr:20/keylen=256, prf:6, dh:15 (AEAD, no INTEG offered)
+    Proposals = ike_proposal([{?T_ENCR, ?ENCR_AES_GCM_16, 256},
+                              {?T_PRF, ?PRF_HMAC_SHA2_384},
+                              {?T_DH, ?DH_MODP_3072}]),
+    {ok, Suite} = epdg_ikev2_codec:select_proposal(Proposals),
+    ?assertMatch(#{encr := #{id := ?ENCR_AES_GCM_16,
+                             attrs := #{key_length := 256}},
+                   integ := none,
+                   dh := #{id := ?DH_MODP_3072}}, Suite).
+
+dh16_selects_test() ->
+    Proposals = ike_proposal([{?T_ENCR, ?ENCR_AES_CBC, 256},
+                              {?T_PRF, ?PRF_HMAC_SHA2_256},
+                              {?T_INTEG, ?AUTH_HMAC_SHA2_256_128},
+                              {?T_DH, ?DH_MODP_4096}]),
+    {ok, Suite} = epdg_ikev2_codec:select_proposal(Proposals),
+    ?assertMatch(#{dh := #{id := ?DH_MODP_4096}}, Suite).
 
 %%====================================================================
 %% A proposal offering only 3DES must still be rejected.

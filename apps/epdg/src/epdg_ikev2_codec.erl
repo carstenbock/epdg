@@ -412,7 +412,9 @@ is_supported_integ(#{id := 13}) -> true; %% HMAC-SHA384-192
 is_supported_integ(#{id := 14}) -> true; %% HMAC-SHA512-256
 is_supported_integ(_) -> false.
 
-is_supported_dh(#{id := 14}) -> true;
+is_supported_dh(#{id := 14}) -> true; %% 2048-bit MODP (RFC 3526, RFC 8247 MUST)
+is_supported_dh(#{id := 15}) -> true; %% 3072-bit MODP (RFC 3526, RFC 8247 SHOULD+)
+is_supported_dh(#{id := 16}) -> true; %% 4096-bit MODP (RFC 3526, RFC 8247 SHOULD+)
 is_supported_dh(#{id := 19}) -> true;
 is_supported_dh(#{id := 20}) -> true;
 is_supported_dh(#{id := 31}) -> true;

@@ -275,3 +275,61 @@ encrypt_sk_gcm_all_key_sizes_test_() ->
       end}
      || {Alg, KeyLen} <- [{aes_gcm_128, 16}, {aes_gcm_192, 24},
                           {aes_gcm_256, 32}]].
+
+%%====================================================================
+%% Diffie-Hellman MODP groups 14/15/16 (RFC 3526): two-sided round
+%% trips must agree on the shared secret, and per RFC 7296 §3.4/§2.14
+%% both the public value and the shared secret must be zero-padded to
+%% the exact modulus length.
+%%====================================================================
+
+dh_roundtrip(Group, Len) ->
+    {PubA, PrivA} = epdg_ikev2_crypto:dh_generate(Group),
+    {PubB, PrivB} = epdg_ikev2_crypto:dh_generate(Group),
+    ?assertEqual(Len, byte_size(PubA)),
+    ?assertEqual(Len, byte_size(PubB)),
+    SecretA = epdg_ikev2_crypto:dh_compute(Group, PubB, PrivA),
+    SecretB = epdg_ikev2_crypto:dh_compute(Group, PubA, PrivB),
+    ?assertEqual(SecretA, SecretB),
+    ?assertEqual(Len, byte_size(SecretA)).
+
+dh14_roundtrip_test() -> dh_roundtrip(14, 256).
+dh15_roundtrip_test() -> dh_roundtrip(15, 384).
+dh16_roundtrip_test() -> dh_roundtrip(16, 512).
+
+%% RFC 3526 prime sanity: expected modulus length and the
+%% FFFFFFFF FFFFFFFF endpoints all RFC 3526 primes share.
+dh_prime_sanity_test_() ->
+    Ends = binary:copy(<<16#FF>>, 8),
+    [{lists:flatten(io_lib:format("group ~B", [G])),
+      fun() ->
+          P = Prime(),
+          ?assertEqual(Len, byte_size(P)),
+          ?assertEqual(Ends, binary:part(P, 0, 8)),
+          ?assertEqual(Ends, binary:part(P, Len - 8, 8))
+      end}
+     || {G, Len, Prime} <- [{14, 256, fun epdg_ikev2_crypto:dh_group14_prime/0},
+                            {15, 384, fun epdg_ikev2_crypto:dh_group15_prime/0},
+                            {16, 512, fun epdg_ikev2_crypto:dh_group16_prime/0}]].
+
+%% Deterministic padding check through the public API: with peer public
+%% value g^1 = 2 and own private exponent 1 the shared secret is exactly
+%% 2, which OTP returns as a single byte — dh_compute must left-pad it
+%% to the full modulus length.
+dh_modp_secret_padding_test_() ->
+    [{lists:flatten(io_lib:format("group ~B", [G])),
+      fun() ->
+          Secret = epdg_ikev2_crypto:dh_compute(G, <<2>>, <<1>>),
+          ?assertEqual(Len, byte_size(Secret)),
+          ?assertEqual(<<0:(8 * (Len - 1)), 2:8>>, Secret)
+      end}
+     || {G, Len} <- [{14, 256}, {15, 384}, {16, 512}]].
+
+dh_pub_len_test() ->
+    ?assertEqual(256, epdg_ikev2_crypto:dh_pub_len(14)),
+    ?assertEqual(384, epdg_ikev2_crypto:dh_pub_len(15)),
+    ?assertEqual(512, epdg_ikev2_crypto:dh_pub_len(16)),
+    ?assertEqual(32,  epdg_ikev2_crypto:dh_pub_len(31)),
+    %% ECP groups keep OTP's prefixed point encoding; length not pinned.
+    ?assertEqual(any, epdg_ikev2_crypto:dh_pub_len(19)),
+    ?assertEqual(any, epdg_ikev2_crypto:dh_pub_len(20)).

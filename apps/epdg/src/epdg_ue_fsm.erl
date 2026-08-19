@@ -827,7 +827,25 @@ with_ke_and_nonce(Suite, Payloads) ->
                     #{dh := #{id := SelectedDH}} = Suite,
                     case PeerDHGroup =:= SelectedDH of
                         true ->
-                            with_nonce(Suite, PeerPub, Payloads);
+                            %% RFC 7296 §3.4: the KE data length is fixed by
+                            %% the group (MODP values are zero-padded to the
+                            %% modulus length). A wrong-length value is
+                            %% malformed — reject it up front instead of
+                            %% failing later in dh_compute and holding the
+                            %% FSM open until the ike_sa_init timeout.
+                            ExpectedLen = epdg_ikev2_crypto:dh_pub_len(SelectedDH),
+                            case ExpectedLen =:= any orelse
+                                 byte_size(PeerPub) =:= ExpectedLen of
+                                true ->
+                                    with_nonce(Suite, PeerPub, Payloads);
+                                false ->
+                                    logger:warning(
+                                        "KE public value has ~B bytes, group ~B "
+                                        "requires ~B — rejecting",
+                                        [byte_size(PeerPub), SelectedDH,
+                                         ExpectedLen]),
+                                    {error, invalid_syntax}
+                            end;
                         false ->
                             %% Carry the group we accepted from the UE's own
                             %% SA proposal so the INVALID_KE_PAYLOAD notify

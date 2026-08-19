@@ -8,7 +8,7 @@
 -include_lib("public_key/include/public_key.hrl").
 
 -export([generate_nonce/0, generate_spi/0,
-         dh_generate/1, dh_compute/3,
+         dh_generate/1, dh_compute/3, dh_pub_len/1,
          prf/3, prf_plus/4,
          derive_ike_keys/4,
          derive_child_keys/5,
@@ -21,6 +21,12 @@
          build_initiator_psk_auth/6,
          build_responder_psk_auth/6,
          verify_initiator_psk_auth/7]).
+
+-ifdef(TEST).
+%% MODP prime accessors for the EUnit sanity checks (byte length and the
+%% FFFFFFFF FFFFFFFF endpoints all RFC 3526 primes share).
+-export([dh_group14_prime/0, dh_group15_prime/0, dh_group16_prime/0]).
+-endif.
 
 -define(NONCE_LEN, 32).
 
@@ -43,9 +49,14 @@ generate_spi() ->
 
 -spec dh_generate(non_neg_integer()) -> {binary(), binary()}.
 dh_generate(14) ->
-    %% DH Group 14 (2048-bit MODP, RFC 3526)
-    {Pub, Priv} = crypto:generate_key(dh, [dh_group14_prime(), <<2>>]),
-    {Pub, Priv};
+    %% DH Group 14 (2048-bit MODP, RFC 3526 §3)
+    modp_generate(dh_group14_prime());
+dh_generate(15) ->
+    %% DH Group 15 (3072-bit MODP, RFC 3526 §4)
+    modp_generate(dh_group15_prime());
+dh_generate(16) ->
+    %% DH Group 16 (4096-bit MODP, RFC 3526 §5)
+    modp_generate(dh_group16_prime());
 dh_generate(19) ->
     %% ECP 256 (RFC 5903)
     {Pub, Priv} = crypto:generate_key(ecdh, secp256r1),
@@ -63,7 +74,11 @@ dh_generate(_) ->
 
 -spec dh_compute(non_neg_integer(), binary(), binary()) -> binary().
 dh_compute(14, PeerPub, MyPriv) ->
-    crypto:compute_key(dh, PeerPub, MyPriv, [dh_group14_prime(), <<2>>]);
+    modp_compute(dh_group14_prime(), PeerPub, MyPriv);
+dh_compute(15, PeerPub, MyPriv) ->
+    modp_compute(dh_group15_prime(), PeerPub, MyPriv);
+dh_compute(16, PeerPub, MyPriv) ->
+    modp_compute(dh_group16_prime(), PeerPub, MyPriv);
 dh_compute(19, PeerPub, MyPriv) ->
     crypto:compute_key(ecdh, PeerPub, MyPriv, secp256r1);
 dh_compute(20, PeerPub, MyPriv) ->
@@ -72,6 +87,35 @@ dh_compute(31, PeerPub, MyPriv) ->
     crypto:compute_key(ecdh, PeerPub, MyPriv, x25519);
 dh_compute(_, _, _) ->
     error(unsupported_dh_group).
+
+%% MODP groups use generator 2. OTP's crypto returns unsigned big-endian
+%% integers with leading zero bytes stripped, but RFC 7296 requires both
+%% the KE public value (§3.4) and the Diffie-Hellman shared secret used
+%% for SKEYSEED (§2.14) to be zero-padded to the length of the modulus —
+%% without the padding roughly 1 in 256 handshakes emits a short KE or
+%% derives a SKEYSEED the peer cannot reproduce.
+modp_generate(Prime) ->
+    {Pub, Priv} = crypto:generate_key(dh, [Prime, <<2>>]),
+    {pad_to(Pub, byte_size(Prime)), Priv}.
+
+modp_compute(Prime, PeerPub, MyPriv) ->
+    Secret = crypto:compute_key(dh, PeerPub, MyPriv, [Prime, <<2>>]),
+    pad_to(Secret, byte_size(Prime)).
+
+pad_to(Bin, Len) when byte_size(Bin) >= Len -> Bin;
+pad_to(Bin, Len) -> <<0:((Len - byte_size(Bin)) * 8), Bin/binary>>.
+
+%% Expected KE public-value length per DH group: MODP values are exactly
+%% the modulus length (RFC 7296 §3.4), X25519 is 32 bytes (RFC 8031).
+%% ECP groups 19/20 return `any' — the current implementation exchanges
+%% OTP's 0x04-prefixed point encoding, so their on-wire length is not
+%% pinned here.
+-spec dh_pub_len(non_neg_integer()) -> pos_integer() | any.
+dh_pub_len(14) -> 256;
+dh_pub_len(15) -> 384;
+dh_pub_len(16) -> 512;
+dh_pub_len(31) -> 32;
+dh_pub_len(_)  -> any.
 
 %%====================================================================
 %% PRF (RFC 7296 section 2.13)
@@ -673,3 +717,11 @@ constant_time_equal_bytes(<<A:8, RestA/binary>>, <<B:8, RestB/binary>>, Acc) ->
 dh_group14_prime() ->
     %% RFC 3526 group 14 (2048-bit MODP)
     <<16#FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AACAA68FFFFFFFFFFFFFFFF:2048>>.
+
+dh_group15_prime() ->
+    %% RFC 3526 §4 group 15 (3072-bit MODP), copied verbatim
+    <<16#FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6BF12FFA06D98A0864D87602733EC86A64521F2B18177B200CBBE117577A615D6C770988C0BAD946E208E24FA074E5AB3143DB5BFCE0FD108E4B82D120A93AD2CAFFFFFFFFFFFFFFFF:3072>>.
+
+dh_group16_prime() ->
+    %% RFC 3526 §5 group 16 (4096-bit MODP), copied verbatim
+    <<16#FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6BF12FFA06D98A0864D87602733EC86A64521F2B18177B200CBBE117577A615D6C770988C0BAD946E208E24FA074E5AB3143DB5BFCE0FD108E4B82D120A92108011A723C12A787E6D788719A10BDBA5B2699C327186AF4E23C1A946834B6150BDA2583E9CA2AD44CE8DBBBC2DB04DE8EF92E8EFC141FBECAA6287C59474E6BC05D99B2964FA090C3A2233BA186515BE7ED1F612970CEE2D7AFB81BDD762170481CD0069127D5B05AA993B4EA988D8FDDC186FFB7DC90A6C08F4DF435C934063199FFFFFFFFFFFFFFFF:4096>>.

@@ -3,8 +3,10 @@
 %%% an INVALID_KE_PAYLOAD notify must carry the responder's accepted DH
 %%% group as a two-octet big-endian integer (RFC 7296 §1.2) and go out
 %%% with a zero responder SPI, so a UE that opened with an unsupported
-%%% group (2, 5, 15-18) can retry in one round trip instead of treating
-%%% the mismatch as a hard missing-algorithm failure.
+%%% group (2, 5, 17, 18) can retry in one round trip instead of treating
+%%% the mismatch as a hard missing-algorithm failure. Also covers the
+%%% RFC 7296 §3.4 KE length check: a public value whose size does not
+%%% match the agreed group is rejected as malformed.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(epdg_ue_fsm_notify_tests).
@@ -33,9 +35,12 @@ sa_payload(DhGroup) ->
     <<0:8, 0:8, PropLen:16, 1:8, 1:8, 0:8, 4:8, TBin/binary>>.
 
 request_payloads(SaDhGroup, KeDhGroup) ->
+    request_payloads(SaDhGroup, KeDhGroup, 256).
+
+request_payloads(SaDhGroup, KeDhGroup, KeLen) ->
     [#{type => sa,    data => sa_payload(SaDhGroup)},
      #{type => ke,    data => <<KeDhGroup:16, 0:16,
-                                (crypto:strong_rand_bytes(256))/binary>>},
+                                (crypto:strong_rand_bytes(KeLen))/binary>>},
      #{type => nonce, data => crypto:strong_rand_bytes(32)}].
 
 decode_notify(RespBytes) ->
@@ -61,6 +66,33 @@ ke_group_match_proceeds_test() ->
     Payloads = request_payloads(14, 14),
     ?assertMatch({ok, #{suite := _, peer_dh_pub := _, nonce_i := _}},
                  epdg_ue_fsm:process_sa_init_payloads(Payloads)).
+
+%%====================================================================
+%% RFC 7296 §3.4: the KE public value length is fixed by the group —
+%% MODP values are zero-padded to the modulus length. A wrong-length
+%% value (like the truncated garbage KEs seen from internet scanners)
+%% must be rejected as malformed, not fed into dh_compute.
+%%====================================================================
+
+ke_wrong_length_rejected_test() ->
+    %% Group 14 agreed, but only 100 bytes of key data.
+    Payloads = request_payloads(14, 14, 100),
+    ?assertEqual({error, invalid_syntax},
+                 epdg_ue_fsm:process_sa_init_payloads(Payloads)),
+    %% One byte over is just as malformed.
+    Payloads2 = request_payloads(14, 14, 257),
+    ?assertEqual({error, invalid_syntax},
+                 epdg_ue_fsm:process_sa_init_payloads(Payloads2)).
+
+ke_correct_length_dh15_proceeds_test() ->
+    %% MODP-3072: 384-byte public value passes the length check.
+    Payloads = request_payloads(15, 15, 384),
+    ?assertMatch({ok, #{suite := #{dh := #{id := 15}}}},
+                 epdg_ue_fsm:process_sa_init_payloads(Payloads)),
+    %% ...and a 256-byte one (group-14 sized) is rejected.
+    Short = request_payloads(15, 15, 256),
+    ?assertEqual({error, invalid_syntax},
+                 epdg_ue_fsm:process_sa_init_payloads(Short)).
 
 %%====================================================================
 %% The INVALID_KE_PAYLOAD response: data = <<Group:16>>, responder
