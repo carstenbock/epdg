@@ -248,10 +248,11 @@ keylen_not_defaulted_on_other_encr_test() ->
 
 %%====================================================================
 %% The two customer-lab lines that omit Key Length must now select.
-%% Note on expectations: the codec picks the last supported transform
-%% of each type in initiator order (per-type lists are accumulated in
-%% reverse), so the legacy line yields integ:5/dh:16 and the modern
-%% line prf:7/dh:20 — not the first-supported entries.
+%% Note on expectations: for ENCR/PRF/INTEG the codec picks the last
+%% supported transform in initiator order (per-type lists are
+%% accumulated in reverse), so the legacy line yields integ:5 and the
+%% modern line prf:7. DH is picked first-in-initiator-order among the
+%% built-in groups (see pick_dh/1), so both lines yield dh:14.
 %%====================================================================
 
 lab_legacy_no_keylen_selects_test() ->
@@ -267,7 +268,7 @@ lab_legacy_no_keylen_selects_test() ->
                              key_length_defaulted := true},
                    prf := #{id := ?PRF_HMAC_SHA1},
                    integ := #{id := 5},
-                   dh := #{id := ?DH_MODP_4096}}, Suite).
+                   dh := #{id := ?DH_MODP_2048}}, Suite).
 
 lab_modern_no_keylen_selects_test() ->
     %% encr:18,19,20,28 (no keylen), prf:1,2,5,6,7, dh:0,1,2,14,16,19,20
@@ -281,7 +282,7 @@ lab_modern_no_keylen_selects_test() ->
                              key_length_defaulted := true},
                    prf := #{id := ?PRF_HMAC_SHA2_512},
                    integ := none,
-                   dh := #{id := 20}}, Suite).
+                   dh := #{id := ?DH_MODP_2048}}, Suite).
 
 %%====================================================================
 %% RFC 7296 §3.3.5: our SA response must carry the Key Length
@@ -309,6 +310,90 @@ sa_response_echoes_defaulted_keylen_test_() ->
           [{?T_ENCR, ?ENCR_AES_GCM_16},
            {?T_PRF, ?PRF_HMAC_SHA2_256},
            {?T_DH, ?DH_MODP_2048}]}]].
+
+%%====================================================================
+%% Legacy DH groups 2/5 (RFC 8247 SHOULD NOT): rejected by default,
+%% selectable only when enabled via EPDG_IKE_LEGACY_DH_GROUPS (app env
+%% ike_legacy_dh_groups). Even when enabled, a built-in group offered
+%% anywhere in the proposal always wins (two-tier pick), and between
+%% the legacy groups MODP-1536 outranks MODP-1024.
+%%====================================================================
+
+%% The three customer-lab lines offering only legacy groups.
+legacy_lab_proposals() ->
+    [{"encr:12/128 integ:2 prf:2 dh:2",
+      ike_proposal([{?T_ENCR, ?ENCR_AES_CBC, 128},
+                    {?T_INTEG, ?AUTH_HMAC_SHA1_96},
+                    {?T_PRF, ?PRF_HMAC_SHA1},
+                    {?T_DH, 2}]), 2},
+     {"encr:12/256 prf:5 integ:12 dh:2",
+      ike_proposal([{?T_ENCR, ?ENCR_AES_CBC, 256},
+                    {?T_PRF, ?PRF_HMAC_SHA2_256},
+                    {?T_INTEG, ?AUTH_HMAC_SHA2_256_128},
+                    {?T_DH, 2}]), 2},
+     {"encr:12/256 prf:5 integ:12 dh:5",
+      ike_proposal([{?T_ENCR, ?ENCR_AES_CBC, 256},
+                    {?T_PRF, ?PRF_HMAC_SHA2_256},
+                    {?T_INTEG, ?AUTH_HMAC_SHA2_256_128},
+                    {?T_DH, 5}]), 5}].
+
+with_legacy_dh(Groups, Tests) ->
+    {setup,
+     fun() -> application:set_env(epdg, ike_legacy_dh_groups, Groups) end,
+     fun(_) -> application:unset_env(epdg, ike_legacy_dh_groups) end,
+     Tests}.
+
+legacy_dh_disabled_rejects_test_() ->
+    %% Env var unset (default []): all three lab lines are rejected.
+    [{Desc,
+      ?_assertEqual({error, unsupported_transforms},
+                    epdg_ikev2_codec:select_proposal(Proposals))}
+     || {Desc, Proposals, _} <- legacy_lab_proposals()].
+
+legacy_dh_enabled_selects_test_() ->
+    with_legacy_dh([2, 5],
+        [{Desc,
+          fun() ->
+              {ok, Suite} = epdg_ikev2_codec:select_proposal(Proposals),
+              ?assertMatch(#{dh := #{id := Expected}}, Suite)
+          end}
+         || {Desc, Proposals, Expected} <- legacy_lab_proposals()]).
+
+legacy_dh_builtin_still_wins_test_() ->
+    %% dh:2 listed before dh:14 — the built-in group must win even with
+    %% legacy groups enabled.
+    with_legacy_dh([2, 5],
+        [fun() ->
+             Proposals = ike_proposal([{?T_ENCR, ?ENCR_AES_CBC, 128},
+                                       {?T_PRF, ?PRF_HMAC_SHA1},
+                                       {?T_INTEG, ?AUTH_HMAC_SHA1_96},
+                                       {?T_DH, 2},
+                                       {?T_DH, ?DH_MODP_2048}]),
+             {ok, Suite} = epdg_ikev2_codec:select_proposal(Proposals),
+             ?assertMatch(#{dh := #{id := ?DH_MODP_2048}}, Suite)
+         end]).
+
+legacy_dh_prefers_1536_over_1024_test_() ->
+    %% Both legacy groups offered, 2 listed first: MODP-1536 wins.
+    with_legacy_dh([2, 5],
+        [fun() ->
+             Proposals = ike_proposal([{?T_ENCR, ?ENCR_AES_CBC, 128},
+                                       {?T_PRF, ?PRF_HMAC_SHA1},
+                                       {?T_INTEG, ?AUTH_HMAC_SHA1_96},
+                                       {?T_DH, 2},
+                                       {?T_DH, 5}]),
+             {ok, Suite} = epdg_ikev2_codec:select_proposal(Proposals),
+             ?assertMatch(#{dh := #{id := 5}}, Suite)
+         end]).
+
+legacy_dh_partial_enable_test_() ->
+    %% Only group 5 enabled: dh:2-only line stays rejected.
+    with_legacy_dh([5],
+        [fun() ->
+             [{_, Dh2Line, 2} | _] = legacy_lab_proposals(),
+             ?assertEqual({error, unsupported_transforms},
+                          epdg_ikev2_codec:select_proposal(Dh2Line))
+         end]).
 
 %%====================================================================
 %% A proposal offering only 3DES must still be rejected.

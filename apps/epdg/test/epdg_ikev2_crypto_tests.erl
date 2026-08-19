@@ -293,12 +293,14 @@ dh_roundtrip(Group, Len) ->
     ?assertEqual(SecretA, SecretB),
     ?assertEqual(Len, byte_size(SecretA)).
 
+dh2_roundtrip_test()  -> dh_roundtrip(2, 128).
+dh5_roundtrip_test()  -> dh_roundtrip(5, 192).
 dh14_roundtrip_test() -> dh_roundtrip(14, 256).
 dh15_roundtrip_test() -> dh_roundtrip(15, 384).
 dh16_roundtrip_test() -> dh_roundtrip(16, 512).
 
-%% RFC 3526 prime sanity: expected modulus length and the
-%% FFFFFFFF FFFFFFFF endpoints all RFC 3526 primes share.
+%% RFC 2409/3526 prime sanity: expected modulus length and the
+%% FFFFFFFF FFFFFFFF endpoints all these MODP primes share.
 dh_prime_sanity_test_() ->
     Ends = binary:copy(<<16#FF>>, 8),
     [{lists:flatten(io_lib:format("group ~B", [G])),
@@ -308,7 +310,9 @@ dh_prime_sanity_test_() ->
           ?assertEqual(Ends, binary:part(P, 0, 8)),
           ?assertEqual(Ends, binary:part(P, Len - 8, 8))
       end}
-     || {G, Len, Prime} <- [{14, 256, fun epdg_ikev2_crypto:dh_group14_prime/0},
+     || {G, Len, Prime} <- [{2,  128, fun epdg_ikev2_crypto:dh_group2_prime/0},
+                            {5,  192, fun epdg_ikev2_crypto:dh_group5_prime/0},
+                            {14, 256, fun epdg_ikev2_crypto:dh_group14_prime/0},
                             {15, 384, fun epdg_ikev2_crypto:dh_group15_prime/0},
                             {16, 512, fun epdg_ikev2_crypto:dh_group16_prime/0}]].
 
@@ -323,9 +327,11 @@ dh_modp_secret_padding_test_() ->
           ?assertEqual(Len, byte_size(Secret)),
           ?assertEqual(<<0:(8 * (Len - 1)), 2:8>>, Secret)
       end}
-     || {G, Len} <- [{14, 256}, {15, 384}, {16, 512}]].
+     || {G, Len} <- [{2, 128}, {5, 192}, {14, 256}, {15, 384}, {16, 512}]].
 
 dh_pub_len_test() ->
+    ?assertEqual(128, epdg_ikev2_crypto:dh_pub_len(2)),
+    ?assertEqual(192, epdg_ikev2_crypto:dh_pub_len(5)),
     ?assertEqual(256, epdg_ikev2_crypto:dh_pub_len(14)),
     ?assertEqual(384, epdg_ikev2_crypto:dh_pub_len(15)),
     ?assertEqual(512, epdg_ikev2_crypto:dh_pub_len(16)),

@@ -5,7 +5,7 @@
 -module(epdg_config).
 
 -export([init/0, get/1, get/2, parse_gtpc_mode/1, parse_ue_ip_pools/1,
-         parse_instance_id/2]).
+         parse_instance_id/2, parse_legacy_dh_groups/1]).
 
 -define(APP, epdg).
 
@@ -28,6 +28,11 @@ init() ->
     %% IDr (FQDN the ePDG presents as its IKEv2 identity; should match
     %% the SubjectAltName:DNS of the configured certificate).
     set_from_env("EPDG_IKE_ID_FQDN", ike_id_fqdn, fun default_ike_id_fqdn/0),
+
+    %% Legacy IKE DH groups: MODP-1024 (2) and MODP-1536 (5), off by
+    %% default. Parsed once at boot into app env so the per-packet
+    %% proposal check is a cheap ETS read.
+    set_ike_legacy_dh_groups(),
 
     %% EAP-AKA'
     set_from_env("EPDG_EAP_METHOD", eap_method, "aka-prime"),
@@ -351,6 +356,41 @@ ordinal_suffix(Name) ->
             end;
         _ ->
             error
+    end.
+
+%% SPEC-DEVIATION: RFC 8247 §2.4 -- DH groups 2 (MODP-1024) and 5
+%% (MODP-1536) are rated SHOULD NOT. They are accepted only when the
+%% operator explicitly opts in for a known legacy device population,
+%% and the choice is warned about at boot so it shows up in an audit.
+set_ike_legacy_dh_groups() ->
+    Groups = parse_legacy_dh_groups(os:getenv("EPDG_IKE_LEGACY_DH_GROUPS")),
+    case Groups of
+        [] -> ok;
+        _  ->
+            logger:warning("EPDG_IKE_LEGACY_DH_GROUPS enables weak DH "
+                           "group(s) ~w (RFC 8247 rates MODP-1024/1536 as "
+                           "SHOULD NOT); intended only for legacy device "
+                           "populations", [Groups])
+    end,
+    application:set_env(?APP, ike_legacy_dh_groups, Groups).
+
+%% Comma-separated list; only 2 and 5 exist as legacy opt-ins. Any other
+%% value fails the boot: a typo like "14" must not silently enable (or
+%% silently skip) a group the operator did not intend.
+-spec parse_legacy_dh_groups(string() | false) -> [2 | 5].
+parse_legacy_dh_groups(false) -> [];
+parse_legacy_dh_groups(Csv) when is_list(Csv) ->
+    Entries = [string:trim(E) || E <- string:split(Csv, ",", all)],
+    lists:usort([parse_legacy_dh_group(E) || E <- Entries, E =/= ""]).
+
+parse_legacy_dh_group(E) ->
+    case string:to_integer(E) of
+        {2, ""} -> 2;
+        {5, ""} -> 5;
+        _ ->
+            error({invalid_config,
+                   "EPDG_IKE_LEGACY_DH_GROUPS accepts only the values 2 "
+                   "(MODP-1024) and 5 (MODP-1536), got: \"" ++ E ++ "\""})
     end.
 
 set_dra_hosts() ->

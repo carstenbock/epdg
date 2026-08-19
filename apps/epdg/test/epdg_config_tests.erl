@@ -117,3 +117,27 @@ instance_id_hash_fallback_is_stable_test() ->
 instance_id_defaults_to_zero_test() ->
     ?assertEqual(0, epdg_config:parse_instance_id(false, false)),
     ?assertEqual(0, epdg_config:parse_instance_id(false, "")).
+
+%% EPDG_IKE_LEGACY_DH_GROUPS opts weak DH groups (RFC 8247 SHOULD NOT)
+%% back in. Only 2 and 5 exist as opt-ins; any other value must fail
+%% the boot rather than silently enable or skip a group.
+legacy_dh_groups_default_empty_test() ->
+    ?assertEqual([], epdg_config:parse_legacy_dh_groups(false)),
+    ?assertEqual([], epdg_config:parse_legacy_dh_groups("")).
+
+legacy_dh_groups_parses_valid_test() ->
+    ?assertEqual([2], epdg_config:parse_legacy_dh_groups("2")),
+    ?assertEqual([5], epdg_config:parse_legacy_dh_groups("5")),
+    ?assertEqual([2, 5], epdg_config:parse_legacy_dh_groups("2,5")),
+    ?assertEqual([2, 5], epdg_config:parse_legacy_dh_groups(" 5 , 2 ")),
+    ?assertEqual([2], epdg_config:parse_legacy_dh_groups("2,2,")).
+
+legacy_dh_groups_rejects_other_values_test() ->
+    ?assertError({invalid_config, _},
+                 epdg_config:parse_legacy_dh_groups("1")),
+    ?assertError({invalid_config, _},
+                 epdg_config:parse_legacy_dh_groups("14")),
+    ?assertError({invalid_config, _},
+                 epdg_config:parse_legacy_dh_groups("2,14")),
+    ?assertError({invalid_config, _},
+                 epdg_config:parse_legacy_dh_groups("garbage")).

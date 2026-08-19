@@ -24,8 +24,9 @@
 
 -ifdef(TEST).
 %% MODP prime accessors for the EUnit sanity checks (byte length and the
-%% FFFFFFFF FFFFFFFF endpoints all RFC 3526 primes share).
--export([dh_group14_prime/0, dh_group15_prime/0, dh_group16_prime/0]).
+%% FFFFFFFF FFFFFFFF endpoints all RFC 2409/3526 primes share).
+-export([dh_group2_prime/0, dh_group5_prime/0,
+         dh_group14_prime/0, dh_group15_prime/0, dh_group16_prime/0]).
 -endif.
 
 -define(NONCE_LEN, 32).
@@ -48,6 +49,12 @@ generate_spi() ->
 %%====================================================================
 
 -spec dh_generate(non_neg_integer()) -> {binary(), binary()}.
+dh_generate(2) ->
+    %% DH Group 2 (1024-bit MODP, RFC 2409 §6.2) — legacy opt-in only
+    modp_generate(dh_group2_prime());
+dh_generate(5) ->
+    %% DH Group 5 (1536-bit MODP, RFC 3526 §2) — legacy opt-in only
+    modp_generate(dh_group5_prime());
 dh_generate(14) ->
     %% DH Group 14 (2048-bit MODP, RFC 3526 §3)
     modp_generate(dh_group14_prime());
@@ -73,6 +80,10 @@ dh_generate(_) ->
     error(unsupported_dh_group).
 
 -spec dh_compute(non_neg_integer(), binary(), binary()) -> binary().
+dh_compute(2, PeerPub, MyPriv) ->
+    modp_compute(dh_group2_prime(), PeerPub, MyPriv);
+dh_compute(5, PeerPub, MyPriv) ->
+    modp_compute(dh_group5_prime(), PeerPub, MyPriv);
 dh_compute(14, PeerPub, MyPriv) ->
     modp_compute(dh_group14_prime(), PeerPub, MyPriv);
 dh_compute(15, PeerPub, MyPriv) ->
@@ -111,6 +122,8 @@ pad_to(Bin, Len) -> <<0:((Len - byte_size(Bin)) * 8), Bin/binary>>.
 %% OTP's 0x04-prefixed point encoding, so their on-wire length is not
 %% pinned here.
 -spec dh_pub_len(non_neg_integer()) -> pos_integer() | any.
+dh_pub_len(2)  -> 128;
+dh_pub_len(5)  -> 192;
 dh_pub_len(14) -> 256;
 dh_pub_len(15) -> 384;
 dh_pub_len(16) -> 512;
@@ -713,6 +726,14 @@ constant_time_equal_bytes(<<A:8, RestA/binary>>, <<B:8, RestB/binary>>, Acc) ->
 %%====================================================================
 %% Internal
 %%====================================================================
+
+dh_group2_prime() ->
+    %% RFC 2409 §6.2 group 2 (1024-bit MODP), copied verbatim
+    <<16#FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE65381FFFFFFFFFFFFFFFF:1024>>.
+
+dh_group5_prime() ->
+    %% RFC 3526 §2 group 5 (1536-bit MODP), copied verbatim
+    <<16#FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA237327FFFFFFFFFFFFFFFF:1536>>.
 
 dh_group14_prime() ->
     %% RFC 3526 group 14 (2048-bit MODP)

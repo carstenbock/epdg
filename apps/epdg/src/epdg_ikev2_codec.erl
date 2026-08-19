@@ -376,7 +376,9 @@ pick_suite(Transforms) ->
     Encr  = pick_first_supported(maps:get(encr,  Groups, []), fun is_supported_encr/1),
     Prf   = pick_first_supported(maps:get(prf,   Groups, []), fun is_supported_prf/1),
     Integ = pick_first_supported(maps:get(integ, Groups, []), fun is_supported_integ/1),
-    DH    = pick_first_supported(maps:get(dh,    Groups, []), fun is_supported_dh/1),
+    %% The fold above accumulates per-type lists in reverse; restore the
+    %% initiator's order for the DH pick (see pick_dh/1).
+    DH    = pick_dh(lists:reverse(maps:get(dh, Groups, []))),
     %% Transform Type 5 (ESN) is defined only for ESP/AH Child SA proposals
     %% per RFC 7296 §3.3.3 and MUST NOT appear in IKE SA proposals. Real UEs
     %% (observed: Samsung VoWiFi dialer proposing AES-CBC-256/HMAC-SHA{256,512}/
@@ -404,6 +406,24 @@ pick_first_supported([T | Rest], Pred) ->
         false -> pick_first_supported(Rest, Pred)
     end.
 
+%% Two-tier DH selection. Tier 1: the first *built-in* group in the
+%% initiator's order — the UE's KE payload normally carries its
+%% first-listed group, so honouring that order avoids an
+%% INVALID_KE_PAYLOAD retry round trip. Tier 2: only when no built-in
+%% group is offered at all, the strongest enabled legacy group
+%% (MODP-1536 over MODP-1024), regardless of initiator order — for
+%% weak groups we do impose our own ranking.
+pick_dh(DHs) ->
+    case pick_first_supported(DHs, fun is_builtin_dh/1) of
+        {ok, T} -> {ok, T};
+        error ->
+            case lists:sort(fun(#{id := A}, #{id := B}) -> A >= B end,
+                            [T || T <- DHs, is_enabled_legacy_dh(T)]) of
+                [T | _] -> {ok, T};
+                []      -> error
+            end
+    end.
+
 %% Supported algorithm predicates. Keep conservative — only algos we know
 %% the crypto module implements today.
 %% Key lengths 128/192/256 for AES-GCM-16 (ID 20) and AES-CBC (ID 12) per
@@ -429,13 +449,24 @@ is_supported_integ(#{id := 13}) -> true; %% HMAC-SHA384-192
 is_supported_integ(#{id := 14}) -> true; %% HMAC-SHA512-256
 is_supported_integ(_) -> false.
 
-is_supported_dh(#{id := 14}) -> true; %% 2048-bit MODP (RFC 3526, RFC 8247 MUST)
-is_supported_dh(#{id := 15}) -> true; %% 3072-bit MODP (RFC 3526, RFC 8247 SHOULD+)
-is_supported_dh(#{id := 16}) -> true; %% 4096-bit MODP (RFC 3526, RFC 8247 SHOULD+)
-is_supported_dh(#{id := 19}) -> true;
-is_supported_dh(#{id := 20}) -> true;
-is_supported_dh(#{id := 31}) -> true;
-is_supported_dh(_) -> false.
+is_supported_dh(T) -> is_builtin_dh(T) orelse is_enabled_legacy_dh(T).
+
+%% Always-on groups.
+is_builtin_dh(#{id := 14}) -> true; %% 2048-bit MODP (RFC 3526, RFC 8247 MUST)
+is_builtin_dh(#{id := 15}) -> true; %% 3072-bit MODP (RFC 3526, RFC 8247 SHOULD+)
+is_builtin_dh(#{id := 16}) -> true; %% 4096-bit MODP (RFC 3526, RFC 8247 SHOULD+)
+is_builtin_dh(#{id := 19}) -> true;
+is_builtin_dh(#{id := 20}) -> true;
+is_builtin_dh(#{id := 31}) -> true;
+is_builtin_dh(_) -> false.
+
+%% SPEC-DEVIATION: RFC 8247 §2.4 -- MODP-1024 (2) and MODP-1536 (5) are
+%% SHOULD NOT. Accepted only when the operator opted in via
+%% EPDG_IKE_LEGACY_DH_GROUPS (parsed once at boot into app env, so this
+%% per-packet lookup is an ETS read).
+is_enabled_legacy_dh(#{id := Id}) when Id =:= 2; Id =:= 5 ->
+    lists:member(Id, epdg_config:get(ike_legacy_dh_groups, []));
+is_enabled_legacy_dh(_) -> false.
 
 is_supported_esn(#{id := 0}) -> true; %% No ESN
 is_supported_esn(#{id := 1}) -> true; %% ESN (RFC 4304 64-bit sequence numbers)

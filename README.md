@@ -173,6 +173,7 @@ Empty/unset values fall back to the defaults below.
 | `EPDG_IKE_CERT_FILE` | _(empty)_ | PEM X.509 certificate the ePDG presents (TS 33.402 §7.2.1) |
 | `EPDG_IKE_KEY_FILE` | _(empty)_ | PEM private key matching the certificate |
 | `EPDG_IKE_ID_FQDN` | `epdg.epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org` | IDr FQDN (should match the cert SAN:DNS) |
+| `EPDG_IKE_LEGACY_DH_GROUPS` | _(empty)_ | Comma-separated opt-in for legacy DH groups `2` (MODP-1024) and/or `5` (MODP-1536). **Off by default**: RFC 8247 §2.4 rates both as SHOULD NOT — MODP-1024 in particular is within reach of well-funded attackers (Logjam). Enable only for a known legacy device population that offers no stronger group; a built-in group (14/15/16/19/20/31) offered anywhere in the proposal still wins. Enabling logs a warning at boot |
 | `EPDG_EAP_METHOD` | `aka-prime` | `aka` or `aka-prime` |
 | `EPDG_IPSEC_OFFLOAD` | `auto` | `auto` / `none` / `inline` / `crypto` |
 | `EPDG_IPSEC_IFACE` | `eth0` | NIC for hardware-offload detection |
