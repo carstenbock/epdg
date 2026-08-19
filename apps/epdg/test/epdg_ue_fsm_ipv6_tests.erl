@@ -122,6 +122,27 @@ pcscf6_attribute_numbers_on_the_wire_test() ->
     ?assertNotEqual(nomatch, binary:match(Reply, <<0:1, 16390:15, 16:16>>)),
     ?assertEqual(nomatch,    binary:match(Reply, <<0:1,    22:15, 16:16>>)).
 
+%% The IPv4 sibling: one P-CSCF, sent as RFC 7651's 20 and as 3GPP's
+%% private-use 16389 (TS 24.302 §8.1.2.2) with the same 4-byte value, exactly
+%% like the 21/16390 pair above.
+pcscf4_sent_under_both_attribute_numbers_test() ->
+    Attrs = cfg_attrs(epdg_ue_fsm:build_cfg_reply(v6_only_pdn())),
+    Bin = <<10, 42, 0, 1>>,
+    ?assertEqual([Bin], pick(p_cscf_ip4_address, Attrs)),
+    ?assertEqual([Bin], pick(p_cscf_ip4_address_3gpp, Attrs)).
+
+pcscf4_attribute_numbers_on_the_wire_test() ->
+    Reply = epdg_ue_fsm:build_cfg_reply(v6_only_pdn()),
+    ?assertNotEqual(nomatch, binary:match(Reply, <<0:1,    20:15, 4:16>>)),
+    ?assertNotEqual(nomatch, binary:match(Reply, <<0:1, 16389:15, 4:16>>)).
+
+%% No IPv4 P-CSCF granted -> neither attribute number is invented.
+no_pcscf4_means_neither_attribute_test() ->
+    Pdn = (v6_only_pdn())#{pcscf4 => []},
+    Attrs = cfg_attrs(epdg_ue_fsm:build_cfg_reply(Pdn)),
+    ?assertEqual([], pick(p_cscf_ip4_address, Attrs)),
+    ?assertEqual([], pick(p_cscf_ip4_address_3gpp, Attrs)).
+
 dns_sent_for_both_families_test() ->
     Pdn = (v6_only_pdn())#{dns4 => [{10,42,0,2}], dns6 => [?PCSCF6]},
     Attrs = cfg_attrs(epdg_ue_fsm:build_cfg_reply(Pdn)),

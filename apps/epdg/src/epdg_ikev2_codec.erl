@@ -717,6 +717,10 @@ cp_attr_atom(20) -> p_cscf_ip4_address;
 %% assigns to something else entirely, so the attribute we emitted for an
 %% IPv6-only PDN was not one any UE would recognise as a P-CSCF.
 cp_attr_atom(21) -> p_cscf_ip6_address;
+%% 3GPP private-use number for the IPv4 P-CSCF (TS 24.302 §8.1.2.2), the
+%% sibling of 16390 below: emitted alongside 20 so a UE that only reads the
+%% 3GPP numbering still gets its P-CSCF — see build_cfg_reply/1 in epdg_ue_fsm.
+cp_attr_atom(16389) -> p_cscf_ip4_address_3gpp;
 %% 3GPP private-use number for the same thing. iOS asks for the IPv6 P-CSCF
 %% with THIS one (observed: CFG_REQUEST attribute "AssignedPCSCFIPv6 /
 %% Unknown(16390)") while recognising 20 for IPv4, so a reply has to carry
@@ -737,6 +741,7 @@ cp_attr_raw(internal_ip4_subnet)  -> 13;
 cp_attr_raw(internal_ip6_subnet)  -> 15;
 cp_attr_raw(p_cscf_ip4_address)   -> 20;
 cp_attr_raw(p_cscf_ip6_address)   -> 21;      %% RFC 7651
+cp_attr_raw(p_cscf_ip4_address_3gpp) -> 16389; %% 3GPP private; sibling of 16390
 cp_attr_raw(p_cscf_ip6_address_3gpp) -> 16390; %% 3GPP private; what iOS asks for
 cp_attr_raw(N) when is_integer(N) -> N.
 

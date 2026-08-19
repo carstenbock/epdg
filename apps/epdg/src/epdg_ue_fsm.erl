@@ -2152,9 +2152,18 @@ build_cfg_reply(#{ip4 := Ip4, ip6 := Ip6,
     end,
     Dns = [{internal_ip4_dns, encode_ip4(X)} || X <- Dns4]
        ++ [{internal_ip6_dns, encode_ip6(X)} || X <- Dns6],
-    Pcscf = [{p_cscf_ip4_address, encode_ip4(X)} || X <- Pcscf4]
+    Pcscf = lists:flatmap(fun pcscf4_attrs/1, Pcscf4)
          ++ lists:flatmap(fun pcscf6_attrs/1, Pcscf6),
     epdg_ikev2_codec:encode_cp_payload(2, Addr4 ++ Addr6 ++ Dns ++ Pcscf).
+
+%% One IPv4 P-CSCF, twice: the RFC 7651 attribute (20) and the 3GPP private-use
+%% one (16389, TS 24.302 §8.1.2.2). Known stacks read 20 today, but the IPv6
+%% side (below) already has to carry both numbering schemes, and a UE that only
+%% reads the 3GPP number would otherwise silently lose its IPv4 P-CSCF.
+pcscf4_attrs(Addr) ->
+    Bin = encode_ip4(Addr),
+    [{p_cscf_ip4_address, Bin},
+     {p_cscf_ip4_address_3gpp, Bin}].
 
 %% One IPv6 P-CSCF, twice: the RFC 7651 attribute (21) and the 3GPP private-use
 %% one (16390). iOS requests the latter and ignores the former, other stacks do
