@@ -1,5 +1,6 @@
 -module(epdg_ue_fsm_ipv6_tests).
 -include_lib("eunit/include/eunit.hrl").
+-include("epdg_ipv6.hrl").
 
 %% IPv6 PDN plumbing: the inner XFRM selector, what goes into the CFG_REPLY, and
 %% the handover addresses read out of the UE's CFG_REQUEST.
@@ -21,6 +22,11 @@
 -define(PCSCF4, {10, 42, 0, 1}).
 
 ip6_bin({A,B,C,D,E,F,G,H}) -> <<A:16,B:16,C:16,D:16,E:16,F:16,G:16,H:16>>.
+
+%% Not because the value could ever change — 3GPP fixes it — but to prove
+%% that the shared header resolves from test/ as well as from src/.
+ue6_prefix_len_is_64_test() ->
+    ?assertEqual(64, ?UE6_PREFIX_LEN).
 
 %%====================================================================
 %% Inner XFRM selector

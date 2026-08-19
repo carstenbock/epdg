@@ -26,6 +26,9 @@
          encode_update_bearer_response/1,
          encode_delete_bearer_response/1]).
 
+%% ?UE6_PREFIX_LEN: IPv6 prefix length carried in the PAA IE (TS 29.274 §8.14).
+-include("epdg_ipv6.hrl").
+
 %% GTPv2 message types (TS 29.274 §7)
 -define(ECHO_REQ,            1).
 -define(ECHO_RSP,            2).
@@ -62,9 +65,6 @@
 -define(IE_CHARGING_ID,     94).
 -define(IE_PDN_TYPE,        99).
 
-%% IPv6 prefix length carried in the PAA IE (TS 29.274 §8.14). 3GPP fixes a PDN
-%% prefix at /64 (TS 23.401 §5.3.1.2.2); mirrors ?UE6_PREFIX_LEN in epdg_ue_fsm.
--define(V6_PREFIX_LEN,      64).
 -define(IE_PTI,            100).
 -define(IE_UE_TIME_ZONE,   114).
 -define(IE_APN_RESTRICTION, 127).
@@ -508,7 +508,7 @@ encode_fteid_ie(Inst, Iface, TEID, {A,B,C,D,E,F,G,H}) ->
 encode_paa_ie(1, {A,B,C,D}, _) ->
     encode_ie(?IE_PAA, <<0:5, 1:3, A:8, B:8, C:8, D:8>>);
 encode_paa_ie(2, _, {A,B,C,D,E,F,G,H}) ->
-    encode_ie(?IE_PAA, <<0:5, 2:3, ?V6_PREFIX_LEN:8,
+    encode_ie(?IE_PAA, <<0:5, 2:3, ?UE6_PREFIX_LEN:8,
                          A:16,B:16,C:16,D:16,E:16,F:16,G:16,H:16>>);
 %% Dual-stack handover: either half may be absent (the UE is only moving one
 %% family); the missing one goes as zeros so the PGW allocates it dynamically.
@@ -521,7 +521,7 @@ encode_paa_ie(3, HoV4, HoV6) when HoV4 =/= undefined; HoV6 =/= undefined ->
         undefined -> {0,0,0,0,0,0,0,0};
         _         -> HoV6
     end,
-    encode_ie(?IE_PAA, <<0:5, 3:3, ?V6_PREFIX_LEN:8,
+    encode_ie(?IE_PAA, <<0:5, 3:3, ?UE6_PREFIX_LEN:8,
                          A6:16,B6:16,C6:16,D6:16,E6:16,F6:16,G6:16,H6:16,
                          A:8,B:8,C:8,D:8>>);
 encode_paa_ie(PdnType, _, _) ->

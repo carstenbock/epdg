@@ -47,6 +47,10 @@
 
 -behaviour(gen_server).
 
+%% ?UE6_PREFIX_LEN: width of the per-UE prefix that keys uplink attribution
+%% (see inner_src_key/1 and the compile-time assertion next to it).
+-include("epdg_ipv6.hrl").
+
 -export([start_link/0,
          register_ue/1, unregister_ue/1,
          register_bearer/1, unregister_bearer/1,
@@ -536,9 +540,9 @@ report_inner_key_conflict(K, OldTeid, OldImsi, NewTeid, NewImsi) ->
     logger:error("GTP-U: inner-IP key ~p already mapped to TEID ~B "
                  "(IMSI ~s) while registering TEID ~B (IMSI ~s) — "
                  "several UEs share one uplink key; check the PGW "
-                 "address allocation (one /64 per UE for IPv6)~s",
+                 "address allocation (one /~B per UE for IPv6)~s",
                  [K, OldTeid, fmt_imsi(OldImsi), NewTeid,
-                  fmt_imsi(NewImsi), Caveat]).
+                  fmt_imsi(NewImsi), ?UE6_PREFIX_LEN, Caveat]).
 
 fmt_imsi(Imsi) when is_binary(Imsi) -> binary_to_list(Imsi);
 fmt_imsi(_)                         -> "unknown".
@@ -713,6 +717,13 @@ uplink_teid(Pkt, ByInnerIp) ->
 %% address it forms inside it (SLAAC, RFC 4941 privacy addresses) —
 %% exact-address matching would drop everything except the single PAA
 %% interface identifier.
+%% inner_src_key/1 matches the first 4 hextets = 64 bits of the source
+%% address. That is ?UE6_PREFIX_LEN by construction; this guard makes the
+%% build fail if someone changes one without the other.
+-if(?UE6_PREFIX_LEN =/= 64).
+-error("inner_src_key/1 hard-codes a /64 uplink key; update the clause").
+-endif.
+
 inner_src_key(<<4:4, _IHL:4, _:11/binary, A, B, C, D, _:4/binary, _/binary>>) ->
     {ok, {A, B, C, D}};
 inner_src_key(<<6:4, _:4, _:7/binary, S1:16, S2:16, S3:16, S4:16,

@@ -26,11 +26,9 @@
          requested_handover_addrs/1]).
 -endif.
 
-%% Length of the IPv6 prefix a PDN connection gets. 3GPP fixes this at /64
-%% (TS 23.401 §5.3.1.2.2): the network assigns the prefix, the UE picks its own
-%% interface identifier within it. Used for the CFG_REPLY prefix length, the
-%% XFRM inner selectors and the handover PAA so all three agree.
--define(UE6_PREFIX_LEN, 64).
+%% ?UE6_PREFIX_LEN: CFG_REPLY prefix length, XFRM inner selectors, handover
+%% prefix mask.
+-include("epdg_ipv6.hrl").
 
 -define(IKE_SA_INIT_TIMEOUT, 30000).
 -define(IKE_AUTH_TIMEOUT,    60000).

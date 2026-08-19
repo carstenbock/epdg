@@ -7,6 +7,9 @@
 -export([init/0, get/1, get/2, parse_gtpc_mode/1, parse_ue_ip_pools/1,
          parse_instance_id/2, parse_legacy_dh_groups/1, parse_bool/2]).
 
+%% ?UE6_PREFIX_LEN: floor for UE IPv6 pool widths (check_v6_pool_width/3).
+-include("epdg_ipv6.hrl").
+
 -define(APP, epdg).
 
 init() ->
@@ -314,11 +317,13 @@ parse_cidr(Str) ->
 %% Reject such pools at boot instead. IPv4 pools are unaffected (v4
 %% uplink is keyed on the exact address).
 check_v6_pool_width(Addr, Len, Str) when tuple_size(Addr) =:= 8,
-                                         Len >= 64 ->
+                                         Len >= ?UE6_PREFIX_LEN ->
     error({invalid_cidr, Str,
-           "IPv6 UE pools must be wider than /64: uplink attribution is "
-           "keyed on the per-UE delegated /64 prefix, so a pool of /64 "
-           "or longer can hold at most one distinguishable UE"});
+           lists:flatten(io_lib:format(
+               "IPv6 UE pools must be wider than /~B: uplink attribution is "
+               "keyed on the per-UE delegated /~B prefix, so a pool of /~B "
+               "or longer can hold at most one distinguishable UE",
+               [?UE6_PREFIX_LEN, ?UE6_PREFIX_LEN, ?UE6_PREFIX_LEN]))});
 check_v6_pool_width(Addr, Len, _Str) ->
     {Addr, Len}.
 
