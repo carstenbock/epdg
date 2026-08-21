@@ -5,7 +5,8 @@
 -module(epdg_config).
 
 -export([init/0, get/1, get/2, parse_gtpc_mode/1, parse_ue_ip_pools/1,
-         parse_instance_id/2, parse_legacy_dh_groups/1, parse_bool/2]).
+         parse_instance_id/2, parse_legacy_dh_groups/1, parse_bool/2,
+         parse_trace_local_addrs/1]).
 
 %% ?UE6_PREFIX_LEN: floor for UE IPv6 pool widths (check_v6_pool_width/3).
 -include("epdg_ipv6.hrl").
@@ -36,6 +37,19 @@ init() ->
     %% default. Parsed once at boot into app env so the per-packet
     %% proposal check is a cheap ETS read.
     set_ike_legacy_dh_groups(),
+
+    %% Plaintext IKEv2 trace mirror (epdg_ikev2_trace). Off by default.
+    %% When on, every IKE control message this ePDG sends or receives is
+    %% mirrored decrypted as a pcapng stream on a TCP port, for tshark
+    %% (or anything else that reads pcapng) to dissect.
+    %%
+    %% The stream carries decrypted signalling and subscriber identifiers
+    %% (IMSI, NAI), so it binds to loopback by default. Widening the bind
+    %% address exports IMSIs to the network.
+    set_from_env_bool("EPDG_IKE_TRACE_ENABLE", ike_trace_enable, false),
+    set_from_env_int("EPDG_IKE_TRACE_PORT", ike_trace_port, 19500),
+    set_from_env("EPDG_IKE_TRACE_BIND_ADDR", ike_trace_bind_addr, "127.0.0.1"),
+    set_ike_trace_local_addrs(),
 
     %% EAP-AKA'
     set_from_env("EPDG_EAP_METHOD", eap_method, "aka-prime"),
@@ -409,6 +423,42 @@ parse_legacy_dh_group(E) ->
                    "EPDG_IKE_LEGACY_DH_GROUPS accepts only the values 2 "
                    "(MODP-1024) and 5 (MODP-1536), got: \"" ++ E ++ "\""})
     end.
+
+%% Addresses rendered as the ePDG side of the synthetic datagrams in the
+%% IKEv2 trace. Purely cosmetic — it only affects how the mirrored frames
+%% read in a dissector — but it must be a list, because one entry cannot
+%% be right for both address families: a v6 UE rendered against a v4 local
+%% address (or vice versa) would produce a mixed-family datagram. The trace
+%% mirror picks the entry matching each peer's family.
+%%
+%% Defaults to the IKE bind address, which is a sensible single-stack
+%% answer; a dual-stack deployment should set both explicitly, e.g.
+%% "192.0.2.1,2001:db8::1".
+set_ike_trace_local_addrs() ->
+    Csv = os:getenv("EPDG_IKE_TRACE_LOCAL_ADDR",
+                    epdg_config:get(ike_bind_addr, "0.0.0.0")),
+    application:set_env(?APP, ike_trace_local_addrs,
+                        parse_trace_local_addrs(Csv)).
+
+%% Comma-separated IP literals. An unparseable entry is skipped with a
+%% warning rather than failing the boot: this only changes how a diagnostic
+%% trace is labelled, so it must never be able to keep the ePDG down.
+-spec parse_trace_local_addrs(string() | false) -> [inet:ip_address()].
+parse_trace_local_addrs(false) -> [];
+parse_trace_local_addrs(Csv) when is_list(Csv) ->
+    Entries = [string:trim(E) || E <- string:split(Csv, ",", all)],
+    lists:foldr(
+      fun("", Acc) -> Acc;
+         (E, Acc) ->
+              case inet:parse_address(E) of
+                  {ok, IP} ->
+                      [IP | Acc];
+                  {error, _} ->
+                      logger:warning("EPDG_IKE_TRACE_LOCAL_ADDR: ignoring "
+                                     "unparseable address \"~s\"", [E]),
+                      Acc
+              end
+      end, [], Entries).
 
 set_dra_hosts() ->
     Hosts = case os:getenv("DRA_HOSTS") of

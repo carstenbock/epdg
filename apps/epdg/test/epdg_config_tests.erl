@@ -154,3 +154,38 @@ eap_only_auth_false_values_test() ->
 eap_only_auth_true_values_test() ->
     ?assertEqual(true, epdg_config:parse_bool("1", true)),
     ?assertEqual(true, epdg_config:parse_bool("true", true)).
+
+%% EPDG_IKE_TRACE_LOCAL_ADDR (epdg_ikev2_trace): a comma-separated list,
+%% because one address cannot label both address families in the trace.
+%% Unlike the pool parser this one is deliberately lenient — it only
+%% affects how a diagnostic trace reads, so a typo must not fail the boot.
+
+trace_local_addrs_can_parse_only_one_addr() ->
+    ?assertEqual([{192, 0, 2, 1}],
+                 epdg_config:parse_trace_local_addrs(
+                   "192.0.2.1")).
+
+trace_local_addrs_parses_mixed_families_test() ->
+    ?assertEqual([{192, 0, 2, 1}, {16#2001, 16#db8, 0, 0, 0, 0, 0, 1}],
+                 epdg_config:parse_trace_local_addrs(
+                   "192.0.2.1, 2001:db8::1")).
+
+trace_local_addrs_preserves_order_test() ->
+    %% The mirror takes the first entry of the peer's family, so order is
+    %% the operator's way of choosing which address gets rendered.
+    ?assertEqual([{198, 51, 100, 7}, {192, 0, 2, 1}],
+                 epdg_config:parse_trace_local_addrs("198.51.100.7,192.0.2.1")).
+
+trace_local_addrs_skips_empty_entries_test() ->
+    ?assertEqual([{192, 0, 2, 1}],
+                 epdg_config:parse_trace_local_addrs("192.0.2.1,")),
+    ?assertEqual([], epdg_config:parse_trace_local_addrs("")),
+    ?assertEqual([], epdg_config:parse_trace_local_addrs("  ,  ")).
+
+trace_local_addrs_unset_is_empty_test() ->
+    ?assertEqual([], epdg_config:parse_trace_local_addrs(false)).
+
+trace_local_addrs_drops_garbage_without_raising_test() ->
+    ?assertEqual([{192, 0, 2, 1}],
+                 epdg_config:parse_trace_local_addrs("nonsense,192.0.2.1")),
+    ?assertEqual([], epdg_config:parse_trace_local_addrs("nonsense")).

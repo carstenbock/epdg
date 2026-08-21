@@ -74,7 +74,10 @@ init() ->
         mobike_rr_fail_total,
         ike_redirects_sent_total,
         session_superseded_total,
-        tun_startup_cleaned_total
+        tun_startup_cleaned_total,
+        ike_trace_messages_total,
+        ike_trace_dropped_total,
+        ike_trace_subscribers
     ]),
     ok.
 

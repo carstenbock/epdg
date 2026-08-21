@@ -70,6 +70,7 @@ IP.
 | `epdg_ikev2_listener` | UDP sockets on 500 (IKE) and 4500 (NAT-T); dispatches datagrams to UE FSMs |
 | `epdg_ikev2_codec` | IKEv2 header/payload encode + decode, proposal selection (RFC 7296) |
 | `epdg_ikev2_crypto` | DH/ECDH, PRF, AES-GCM/AES-CBC, EAP-AKA' key derivation (CK'/IK', MSK, SK_*) |
+| `epdg_ikev2_trace` | Optional: mirrors decrypted IKE control messages as a pcapng stream over TCP (see [Plaintext IKEv2 tracing](#plaintext-ikev2-tracing)) |
 | `epdg_ue_fsm` | Per-UE `gen_statem`: `idle → ike_sa_init → ike_auth → established`; DPD, MOBIKE, teardown |
 | `epdg_ue_sup` | `simple_one_for_one` dynamic supervisor spawning one FSM per UE |
 | `epdg_ue_registry` | ETS maps: SPI → FSM pid, IMSI → SPI; drain broadcast |
@@ -87,13 +88,14 @@ IP.
 
 ```
 epdg_ue_registry  →  epdg_dns_cache  →  epdg_xfrm  →  epdg_gtpc_client
-   →  epdg_gtpu_forwarder  →  epdg_diameter_swm  →  epdg_ikev2_listener
-   →  epdg_ue_sup (dynamic)  →  epdg_http
+   →  epdg_gtpu_forwarder  →  epdg_diameter_swm  →  epdg_ikev2_trace
+   →  epdg_ikev2_listener  →  epdg_ue_sup (dynamic)  →  epdg_http
 ```
 
 Order matters: the DNS cache starts before the GTP-C client so the first
-PGW resolution is served from cache, and listeners come up only after the
-data-plane and Diameter workers are ready.
+PGW resolution is served from cache, the trace mirror starts before the
+listener and the UE supervisor because both call into it, and listeners come
+up only after the data-plane and Diameter workers are ready.
 
 ---
 
@@ -197,6 +199,15 @@ Empty/unset values fall back to the defaults below.
 | `EPDG_EAP_ONLY_AUTH` | `true` | Honour RFC 5998 `N(EAP_ONLY_AUTHENTICATION)` and omit CERT + signature AUTH from IKE_AUTH message 4. `false` restores strict RFC 7296 (always send CERT+AUTH) |
 | `EPDG_IPSEC_OFFLOAD` | `auto` | `auto` / `none` / `inline` / `crypto` |
 | `EPDG_IPSEC_IFACE` | `eth0` | NIC for hardware-offload detection |
+
+### Plaintext IKEv2 tracing (`epdg_ikev2_trace`)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `EPDG_IKE_TRACE_ENABLE` | `false` | Mirror every IKE control message **decrypted** as a pcapng stream. Off by default |
+| `EPDG_IKE_TRACE_PORT` | `19500` | TCP port subscribers connect to for the pcapng stream |
+| `EPDG_IKE_TRACE_BIND_ADDR` | `127.0.0.1` | Bind address. **Keep this on loopback** — see the warning below |
+| `EPDG_IKE_TRACE_LOCAL_ADDR` | _(`EPDG_IKE_BIND_ADDR`)_ | Comma-separated addresses rendered as the ePDG side of the synthetic datagrams, e.g. `192.0.2.1,2001:db8::1`. Cosmetic, but a **list**: one address cannot label both families, so the mirror picks the first entry matching each peer's family. With nothing configured for a family that peer is rendered against `0.0.0.0` / `::`. Unparseable entries are dropped with a warning rather than failing the boot |
 
 ### Dead Peer Detection (RFC 7296 §2.4)
 
@@ -318,6 +329,61 @@ shared nodes.
 
 ---
 
+## Plaintext IKEv2 tracing
+
+Everything after IKE_SA_INIT travels inside an SK payload (RFC 7296 §3.14), so a packet capture on the SWu interface yields opaque frames. You can see that an IKE_AUTH happened, but not the IDi, the EAP-AKA' round trip, or the `CFG_REPLY` that hands the UE its P-CSCF addresses.
+
+With `EPDG_IKE_TRACE_ENABLE=1`, `epdg_ikev2_trace` mirrors every IKE control message decrypted as a pcapng stream on a TCP port, in both directions. The mirror is a faithful rendering of the payload chain, not of the octets that crossed the wire. `tshark`'s `isakmp` dissector then does all the protocol work, so nothing here has to hand-roll an IKEv2 serialiser.
+
+### Consuming the stream
+
+Subscribers connect and read. The stream is pcapng, so `tshark -r -` consumes it directly:
+
+```bash
+# Live, human-readable
+nc 127.0.0.1 19500 | tshark -r - -V
+
+# Save for later analysis in Wireshark
+nc 127.0.0.1 19500 > ike.pcapng
+
+# Structured output for an ingest pipeline (PDML on stdout, line buffered)
+nc 127.0.0.1 19500 | tshark -r - -l -T pdml
+
+# Only the CFG payloads, as a table
+nc 127.0.0.1 19500 | tshark -r - -Y isakmp.cfg.type \
+  -T fields -e frame.comment -e isakmp.cfg.attr.type
+```
+
+Several subscribers can attach at once.
+
+### What you get
+
+Each IKE message becomes one Enhanced Packet Block:
+
+* `LINKTYPE_RAW` (101) — block data starts at the IP header, so no   fabricated Ethernet addresses appear in the trace.
+* A synthetic IPv4/IPv6 + UDP datagram using the UE's real address and   port. Lengths and checksums are computed, so Wireshark shows no bogus "bad checksum".
+* On port 4500 the RFC 3948 4-byte zero non-ESP marker, exactly as on the wire — without it Wireshark reads the datagram as UDP-encapsulated ESP and never reaches the ISAKMP dissector.
+* An `opt_comment` option holding a JSON object with the context the FSM already knows. `tshark` surfaces it as the `frame.comment` field, so the consumer gets subscriber identity without re-correlating anything:
+
+  ```json
+  {
+    "imsi":"262011234567890",
+    "apn":"ims",
+    "ue_nai":"0262011234567890@nai.epc...",
+    "swm_session_id":"...",
+    "dir":"out",
+    "exchange_type":"IKE_AUTH",
+    "ike_spi_pair":"1122334455667788:8877665544332211",
+    "message_id":1,
+    "is_response":true,
+    "from_initiator":false
+  }
+  ```
+
+  Keys with no value yet are omitted rather than emitted as `null`. Every document carries `ike_spi_pair`, so an IKE_SA_INIT — which happens before any IMSI is known — can still be joined to the IKE_AUTH that names the subscriber.
+
+---
+
 ## HTTP endpoints
 
 Served by Cowboy on `EPDG_API_PORT` (default 8080).
@@ -360,6 +426,11 @@ Served by Cowboy on `EPDG_API_PORT` (default 8080).
 * `epdg_dpd_probes_sent_total`, `epdg_dpd_timeout_total`
 * `epdg_mobike_update_total`, `epdg_mobike_rr_check_total`, `epdg_mobike_rr_fail_total`
 * `epdg_tun_startup_cleaned_total`
+* `epdg_ike_trace_subscribers` (gauge), `epdg_ike_trace_messages_total`,
+  `epdg_ike_trace_dropped_total` — see
+  [Plaintext IKEv2 tracing](#plaintext-ikev2-tracing). A rising
+  `dropped_total` means a subscriber is not keeping up and trace messages
+  are being discarded; the signalling plane is unaffected
 
 ---
 
