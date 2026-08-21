@@ -21,6 +21,7 @@
          build_first_auth_chain/3, eap_only_selected/2,
          classify_register_ue_result/1,
          build_notify_response/4, process_sa_init_payloads/1,
+         format_proposal_notice/3,
          %% IPv6 PDN: inner selectors, CFG_REPLY contents, handover PAA
          ue6_selector/1, ip6_mask/2, build_cfg_reply/1,
          requested_handover_addrs/1]).
@@ -826,14 +827,22 @@ log_sa_proposals(Proposals) ->
                         transforms_data := TData} = _Prop) ->
         case epdg_ikev2_codec:decode_transforms(TData) of
             {ok, Transforms} ->
-                Summary = [format_transform(T) || T <- Transforms],
-                logger:notice("  proposal #~B proto=~B transforms=~s",
-                              [N, Proto, lists:join(", ", Summary)]);
+                {Fmt, Args} = format_proposal_notice(N, Proto, Transforms),
+                logger:notice(Fmt, Args);
             {error, TErr} ->
                 logger:warning("  proposal #~B transforms decode failed: ~p",
                                [N, TErr])
         end
     end, Proposals).
+
+%% Format string + args for one `proposal #N … transforms=…` notice.
+%% The transforms argument stays an iolist (no lists:flatten) and is
+%% interpolated with ~s so logger_formatter cannot apply ~P/~W depth
+%% limiting to it.
+format_proposal_notice(N, Proto, Transforms) ->
+    Summary = [format_transform(T) || T <- Transforms],
+    {"  proposal #~B proto=~B transforms=~s",
+     [N, Proto, lists:join(", ", Summary)]}.
 
 format_transform(#{type := Type, id := Id, attrs := Attrs}) ->
     AttrStr = case maps:get(key_length, Attrs, undefined) of

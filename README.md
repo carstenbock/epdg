@@ -180,7 +180,7 @@ Empty/unset values fall back to the defaults below.
 | `EPDG_ORIGIN_REALM` | `localdomain` | Diameter Origin-Realm |
 | `MCC` | `001` | PLMN MCC (builds NAIs / IDr FQDN) |
 | `MNC` | `01` | PLMN MNC |
-| `EPDG_LOG_LEVEL` | `notice` | `debug` / `info` / `notice` / `warning` / `error` |
+| `EPDG_LOG_LEVEL` | `notice` | `debug` / `info` / `notice` / `warning` / `error`. `notice` emits the per-attach `proposal #N proto=… transforms=…` dump; the logger formatter is pinned so OTP does not truncate it (a mid-token cut is journald `LineMax`, a terminal wrap, or the paste) |
 
 ### IKEv2 / IPsec
 
