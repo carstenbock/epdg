@@ -11,9 +11,14 @@
 -export([start_link/0,
          create_sa/1, delete_sa/1, flush_sa_endpoint/1,
          create_policy/1, delete_policy/1,
-         get_offload_mode/0, flush_all/0]).
+         get_offload_mode/0, flush_all/0,
+         list_sas/0, list_policies/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
+%% Pure `ip xfrm ... list` output parsers, exported for the EUnit suite
+%% (epdg_xfrm_list_tests) and for callers that capture the output
+%% themselves.
+-export([parse_state_list/1, parse_policy_list/1]).
 
 -define(SERVER, ?MODULE).
 
@@ -60,6 +65,28 @@ get_offload_mode() ->
 flush_all() ->
     gen_server:call(?SERVER, flush_all).
 
+%% Inventory of the kernel's ESP SAs: one map per SA with the OUTER
+%% endpoints, SPI and reqid. Used by epdg_xfrm_reconciler to find
+%% orphaned states (no live UE FSM claims the SPI) and by the session
+%% restore path to decide adopt-vs-reinstall after a pod restart.
+%% Goes through the gen_server so reads serialise with mutations.
+-spec list_sas() -> [#{src := inet:ip_address(), dst := inet:ip_address(),
+                       spi := non_neg_integer(), reqid := non_neg_integer()}].
+list_sas() ->
+    gen_server:call(?SERVER, list_sas).
+
+%% Inventory of the kernel's XFRM policies: selector src/dst (CIDR
+%% strings, exactly as `ip xfrm policy' prints them so delete_policy/1
+%% round-trips), direction, and the first template's outer endpoints +
+%% reqid. Socket policies are skipped.
+-spec list_policies() -> [#{src := string(), dst := string(),
+                            dir := in | out | fwd,
+                            tmpl_src := inet:ip_address() | undefined,
+                            tmpl_dst := inet:ip_address() | undefined,
+                            reqid := non_neg_integer()}].
+list_policies() ->
+    gen_server:call(?SERVER, list_policies).
+
 %%====================================================================
 %% gen_server callbacks
 %%====================================================================
@@ -95,6 +122,12 @@ handle_call(flush_all, _From, State) ->
     os:cmd("ip xfrm state flush 2>/dev/null"),
     os:cmd("ip xfrm policy flush 2>/dev/null"),
     {reply, ok, State};
+handle_call(list_sas, _From, State) ->
+    Out = os:cmd("ip xfrm state list 2>/dev/null"),
+    {reply, parse_state_list(Out), State};
+handle_call(list_policies, _From, State) ->
+    Out = os:cmd("ip xfrm policy list 2>/dev/null"),
+    {reply, parse_policy_list(Out), State};
 handle_call(_Req, _From, State) ->
     {reply, {error, unknown}, State}.
 
@@ -341,3 +374,150 @@ ip_str(B) when is_binary(B) -> binary_to_list(B).
 
 bin2hex(Bin) ->
     lists:flatten([io_lib:format("~2.16.0B", [B]) || <<B>> <= Bin]).
+
+%%====================================================================
+%% `ip xfrm ... list` output parsers
+%%
+%% Both parsers scan line-wise: an SA / policy block starts with an
+%% UNINDENTED "src ... dst ..." line, everything indented (tab or
+%% space) belongs to the current block. Fields are located by keyword
+%% so extra tokens (priority, ptype, flags, if_id, ...) never break
+%% the parse. Blocks missing a mandatory field are dropped rather
+%% than guessed at — the reconciler must never delete on a misparse.
+%%====================================================================
+
+-spec parse_state_list(string()) ->
+          [#{src := inet:ip_address(), dst := inet:ip_address(),
+             spi := non_neg_integer(), reqid := non_neg_integer()}].
+parse_state_list(Output) ->
+    Blocks = split_blocks(Output),
+    lists:filtermap(fun parse_state_block/1, Blocks).
+
+parse_state_block([Head | Body]) ->
+    HeadWords = string:lexemes(Head, " \t"),
+    case {parse_addr_after("src", HeadWords),
+          parse_addr_after("dst", HeadWords)} of
+        {{ok, Src}, {ok, Dst}} ->
+            %% "proto esp spi 0x05974942 reqid 93800770 mode tunnel"
+            BodyWords = lists:append([string:lexemes(L, " \t") || L <- Body]),
+            case {word_after("spi", BodyWords),
+                  lists:member("esp", BodyWords)} of
+                {{ok, "0x" ++ SpiHex}, true} ->
+                    Reqid = case word_after("reqid", BodyWords) of
+                        {ok, R} -> to_int(R, 0);
+                        error   -> 0
+                    end,
+                    {true, #{src => Src, dst => Dst,
+                             spi => list_to_integer(SpiHex, 16),
+                             reqid => Reqid}};
+                _ ->
+                    false
+            end;
+        _ ->
+            false
+    end.
+
+-spec parse_policy_list(string()) ->
+          [#{src := string(), dst := string(), dir := in | out | fwd,
+             tmpl_src := inet:ip_address() | undefined,
+             tmpl_dst := inet:ip_address() | undefined,
+             reqid := non_neg_integer()}].
+parse_policy_list(Output) ->
+    Blocks = split_blocks(Output),
+    lists:filtermap(fun parse_policy_block/1, Blocks).
+
+parse_policy_block([Head | Body]) ->
+    HeadWords = string:lexemes(Head, " \t"),
+    case {word_after("src", HeadWords), word_after("dst", HeadWords)} of
+        {{ok, Src}, {ok, Dst}} ->
+            BodyLines = [string:lexemes(L, " \t") || L <- Body],
+            %% "dir in|out|fwd priority N" — socket policies print
+            %% "socket in|out" instead and are skipped here.
+            Dir = lists:foldl(
+                    fun(Words, undefined) ->
+                            case word_after("dir", Words) of
+                                {ok, "in"}  -> in;
+                                {ok, "out"} -> out;
+                                {ok, "fwd"} -> fwd;
+                                _           -> undefined
+                            end;
+                       (_, Acc) -> Acc
+                    end, undefined, BodyLines),
+            %% First template: "tmpl src A dst B" then
+            %% "proto esp reqid N mode tunnel" on the next line.
+            {TmplSrc, TmplDst} = first_tmpl(BodyLines),
+            Reqid = first_tmpl_reqid(BodyLines),
+            case Dir of
+                undefined -> false;
+                _ ->
+                    {true, #{src => Src, dst => Dst, dir => Dir,
+                             tmpl_src => TmplSrc, tmpl_dst => TmplDst,
+                             reqid => Reqid}}
+            end;
+        _ ->
+            false
+    end.
+
+first_tmpl([]) -> {undefined, undefined};
+first_tmpl([["tmpl" | Rest] | _]) ->
+    S = case parse_addr_after("src", Rest) of
+        {ok, A} -> A;
+        _       -> undefined
+    end,
+    D = case parse_addr_after("dst", Rest) of
+        {ok, B} -> B;
+        _       -> undefined
+    end,
+    {S, D};
+first_tmpl([_ | T]) -> first_tmpl(T).
+
+%% The reqid of the FIRST template, from the first "... reqid N ..."
+%% line that follows a "tmpl" line.
+first_tmpl_reqid(BodyLines) ->
+    first_tmpl_reqid(BodyLines, false).
+
+first_tmpl_reqid([], _SeenTmpl) -> 0;
+first_tmpl_reqid([["tmpl" | _] | T], _) -> first_tmpl_reqid(T, true);
+first_tmpl_reqid([Words | T], true) ->
+    case word_after("reqid", Words) of
+        {ok, R} -> to_int(R, 0);
+        error   -> first_tmpl_reqid(T, true)
+    end;
+first_tmpl_reqid([_ | T], false) -> first_tmpl_reqid(T, false).
+
+%% Group output lines into blocks: a block starts at every unindented
+%% line, indented lines extend the current block.
+split_blocks(Output) ->
+    Lines = [L || L <- string:split(Output, "\n", all), string:trim(L) =/= ""],
+    lists:reverse(lists:foldl(
+      fun([C | _] = Line, Acc) when C =:= $\t; C =:= $\s ->
+              case Acc of
+                  [Cur | Rest] -> [Cur ++ [Line] | Rest];
+                  []           -> []   %% indented line before any block: drop
+              end;
+         (Line, Acc) ->
+              [[Line] | Acc]
+      end, [], Lines)).
+
+word_after(_Key, []) -> error;
+word_after(Key, [Key, Next | _]) -> {ok, Next};
+word_after(Key, [_ | T]) -> word_after(Key, T).
+
+%% The word after Key, parsed as an IP address (SA endpoints and policy
+%% templates print bare addresses; selectors print CIDR and would fail
+%% here on purpose).
+parse_addr_after(Key, Words) ->
+    case word_after(Key, Words) of
+        {ok, S} ->
+            case inet:parse_address(S) of
+                {ok, IP} -> {ok, IP};
+                _        -> error
+            end;
+        error -> error
+    end.
+
+to_int(S, Default) ->
+    case string:to_integer(S) of
+        {N, ""} when is_integer(N) -> N;
+        _ -> Default
+    end.

@@ -52,6 +52,25 @@ init() ->
     set_from_env("EPDG_IPSEC_OFFLOAD", ipsec_offload, "auto"),
     set_from_env("EPDG_IPSEC_IFACE", ipsec_iface, "eth0"),
 
+    %% XFRM kernel-state reconciliation (epdg_xfrm_reconciler): sweep
+    %% every INTERVAL seconds, delete kernel SAs/policies that stayed
+    %% unclaimed by any live UE FSM for GRACE seconds. INTERVAL=0 is the
+    %% single off-switch and disables reconciliation completely,
+    %% INCLUDING the startup sweep.
+    set_from_env_int("EPDG_XFRM_RECONCILE_INTERVAL", xfrm_reconcile_interval, 30),
+    set_from_env_int("EPDG_XFRM_RECONCILE_GRACE", xfrm_reconcile_grace, 30),
+
+    %% Redis-backed session store (opt-in): survives pod crashes by
+    %% restoring established UE sessions at startup. Key prefix defaults
+    %% to "epdg:<pod-name>" so each pod only restores its own sessions
+    %% (per-ordinal VIPs make sessions non-portable across pods anyway).
+    set_from_env_bool("EPDG_SESSION_STORE_ENABLED", session_store_enabled, false),
+    set_from_env("EPDG_REDIS_HOST", redis_host, "127.0.0.1"),
+    set_from_env_int("EPDG_REDIS_PORT", redis_port, 6379),
+    set_from_env_int("EPDG_REDIS_DB", redis_db, 0),
+    set_from_env("EPDG_REDIS_KEY_PREFIX", redis_key_prefix,
+                 fun default_redis_prefix/0),
+
     %% GTP-C S2b toward PGW-C/SMF.
     %%
     %% `PGW_FQDN` is the preferred setting: the GTP-C client re-resolves
@@ -431,6 +450,17 @@ hostname_default() ->
             Realm = os:getenv("EPDG_ORIGIN_REALM", "localdomain"),
             H ++ "." ++ Realm
     end.
+
+%% Per-pod Redis key prefix. POD_NAME (fieldRef metadata.name) is
+%% preferred over HOSTNAME because hostNetwork pods inherit the NODE
+%% hostname — which changes when the pod is rescheduled, orphaning every
+%% stored session.
+default_redis_prefix() ->
+    Pod = case os:getenv("POD_NAME") of
+        false -> os:getenv("HOSTNAME", "epdg");
+        P     -> P
+    end,
+    "epdg:" ++ Pod.
 
 %% Default IDr FQDN per TS 23.003 §19.4.2.4: epdg.epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org.
 default_ike_id_fqdn() ->
