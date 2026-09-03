@@ -1,6 +1,6 @@
 {application, epdg,
  [{description, "Evolved Packet Data Gateway (ePDG) for VoWiFi - Native Erlang IKEv2 with kernel XFRM data plane"},
- {vsn, "0.0.81"},
+ {vsn, "0.0.82"},
   {modules, [epdg_app, epdg_sup, epdg_config,
              epdg_ikev2_listener, epdg_ikev2_crypto, epdg_ikev2_codec,
              epdg_ue_sup, epdg_ue_fsm, epdg_ue_registry,
