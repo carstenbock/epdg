@@ -462,8 +462,9 @@ ike_auth(cast, {ikev2, #{exchange_type := ike_auth} = Header, RawData, FromPort}
 ike_auth(cast, {ikev2, #{exchange_type := informational} = Header, RawData, FromPort}, Data) ->
     handle_informational(Header, RawData, refresh_peer_port(Data, FromPort));
 
-ike_auth(cast, disconnect, _Data) ->
-    {stop, normal};
+ike_auth(cast, disconnect, Data) ->
+    _ = try_send_delete_informational(Data),
+    {stop, {shutdown, aaa_abort}};
 
 %% The GTP-C client saw the PGW restart (Recovery IE change) or lost
 %% its Echo heartbeat — every ongoing session is invalid, so tear down
@@ -553,8 +554,9 @@ established(cast, {ikev2, #{exchange_type := ike_auth, message_id := MsgId} = _H
     {keep_state, Data1#data{dpd_failures = 0},
      [{state_timeout, Interval, dpd}]};
 
-established(cast, disconnect, _Data) ->
-    {stop, normal};
+established(cast, disconnect, Data) ->
+    _ = try_send_delete_informational(Data),
+    {stop, {shutdown, aaa_abort}};
 
 established(cast, pgw_restart, _Data) -> {stop, {shutdown, pgw_restart}};
 established(cast, pgw_down,    _Data) -> {stop, {shutdown, pgw_unreachable}};
