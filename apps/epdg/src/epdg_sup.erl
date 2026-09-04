@@ -44,6 +44,13 @@ init([]) ->
           start => {epdg_diameter_swm, start_link, []},
           restart => permanent, shutdown => 5000, type => worker},
 
+        %% Trace mirror MUST come up before the IKEv2 listener and the UE
+        %% supervisor: both call into it, and epdg_ikev2_trace:enabled/0
+        %% has to be answerable from the very first datagram.
+        #{id => epdg_ikev2_trace,
+          start => {epdg_ikev2_trace, start_link, []},
+          restart => permanent, shutdown => 5000, type => worker},
+
         %% Opt-in Redis session store (start_link returns `ignore' when
         %% EPDG_SESSION_STORE_ENABLED is false).
         #{id => epdg_session_store,

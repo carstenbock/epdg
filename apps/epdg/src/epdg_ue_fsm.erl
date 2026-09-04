@@ -1170,9 +1170,14 @@ handle_ike_auth_request(Header, RawData,
                             logger:warning("IKE_AUTH: decrypt failed: ~p "
                                            "peer=~p:~p", [DErr, PeerIP, PeerPort]),
                             {stop, normal, Data};
-                        {ok, #{payloads := InnerPayloads}} ->
+                        {ok, #{payloads := InnerPayloads} = Decoded} ->
                             logger:info("IKE_AUTH decrypted: ~p inner payloads",
                                         [length(InnerPayloads)]),
+                            %% First message the UE sends encrypted: IDi,
+                            %% SAi2, TSi/TSr and the CFG_REQUEST all live
+                            %% in here. IMSI is not known yet, so this
+                            %% document is keyed on the SPI pair.
+                            mirror_in(Header, Decoded, Data),
                             {IDiType, UeNai, IDiBody} = extract_idi(InnerPayloads),
                             %% RFC 7296 §2.16: SAi2 / TSi / TSr arrive in
                             %% this first IKE_AUTH request together with IDi
@@ -1258,8 +1263,8 @@ handle_ike_auth_request(Header, RawData,
                                     flags             => RespFlags,
                                     message_id        => MsgId},
 
-                            case epdg_ikev2_crypto:encode_encrypted_message(
-                                   KeyParams, Keys, responder, Hdr, InnerChain) of
+                            case encrypt_and_mirror(
+                                   KeyParams, Keys, Hdr, InnerChain, Data) of
                                 {ok, RespBytes} ->
                                     catch epdg_ikev2_listener:send(
                                             PeerIP, PeerPort, RespBytes),
@@ -1345,6 +1350,77 @@ is_all_digits_acc(<<C, Rest/binary>>) when C >= $0, C =< $9 ->
 is_all_digits_acc(_) -> false.
 
 %%====================================================================
+%% Plaintext IKEv2 trace mirror (epdg_ikev2_trace)
+%%
+%% From IKE_AUTH onwards every message is SK-protected, so an interface
+%% capture on SWu shows only opaque frames. These helpers hand the
+%% *decrypted* payload chain to the trace mirror, tagged with the IMSI /
+%% APN / SWm session this FSM already knows, so a consumer does not have
+%% to re-correlate anything. Off unless EPDG_IKE_TRACE_ENABLE is set; see
+%% the README section "Plaintext IKEv2 tracing".
+%%====================================================================
+
+%% Mirror an inbound message. `Decoded' is the map returned by
+%% epdg_ikev2_crypto:decode_encrypted_message/4; it carries the
+%% decrypted plaintext and its first inner payload type.
+mirror_in(Header, Decoded, #data{peer_ip = PeerIP, peer_port = PeerPort} = Data) ->
+    case epdg_ikev2_trace:enabled() of
+        false ->
+            ok;
+        true ->
+            epdg_ikev2_trace:mirror(
+              #{dir         => in,
+                peer_ip     => PeerIP,
+                peer_port   => PeerPort,
+                header      => Header,
+                first_inner => maps:get(first_inner, Decoded, 0),
+                inner       => maps:get(plaintext, Decoded, <<>>),
+                meta        => trace_meta(Data)})
+    end.
+
+%% Mirror an outbound message from the payload chain we are about to
+%% encrypt. `Hdr' is the same header map handed to the encoder, so the
+%% mirrored message carries the real SPIs, exchange type and message id.
+mirror_out(Hdr, InnerChain,
+           #data{peer_ip = PeerIP, peer_port = PeerPort} = Data) ->
+    case epdg_ikev2_trace:enabled() of
+        false ->
+            ok;
+        true ->
+            {FirstInner, Inner} = epdg_ikev2_codec:encode_payloads(InnerChain),
+            epdg_ikev2_trace:mirror(
+              #{dir         => out,
+                peer_ip     => PeerIP,
+                peer_port   => PeerPort,
+                header      => Hdr,
+                first_inner => FirstInner,
+                inner       => Inner,
+                meta        => trace_meta(Data)})
+    end.
+
+trace_meta(#data{imsi = IMSI, apn = APN, ue_nai = NAI,
+                 swm_session_id = SessionId}) ->
+    #{imsi           => IMSI,
+      apn            => APN,
+      ue_nai         => NAI,
+      swm_session_id => SessionId}.
+
+%% Single outbound chokepoint: encrypt a response and mirror its
+%% plaintext. Every SK-protected message this FSM sends goes through
+%% here, so a newly added exchange cannot silently drop out of the trace.
+%% Only successful encodes are mirrored — a failed encrypt never reached
+%% the UE, and showing it as sent would be a lie.
+encrypt_and_mirror(KeyParams, Keys, Hdr, InnerChain, Data) ->
+    case epdg_ikev2_crypto:encode_encrypted_message(
+           KeyParams, Keys, responder, Hdr, InnerChain) of
+        {ok, _Bytes} = Ok ->
+            mirror_out(Hdr, InnerChain, Data),
+            Ok;
+        {error, _} = Err ->
+            Err
+    end.
+
+%%====================================================================
 %% IKE_AUTH EAP continuation
 %%====================================================================
 
@@ -1382,7 +1458,8 @@ handle_ike_auth_eap(Header, RawData,
                                    "peer=~p:~p MsgId=~B",
                                    [DErr, PeerIP, PeerPort, MsgId]),
                     {stop, normal, Data};
-                {ok, #{payloads := InnerPayloads}} ->
+                {ok, #{payloads := InnerPayloads} = Decoded} ->
+                    mirror_in(Header, Decoded, Data),
                     dispatch_ike_auth_cont(MsgId, InFlags, InnerPayloads,
                                            ISPI, RSPI, Data)
             end
@@ -1826,8 +1903,7 @@ finalize_ike_auth_redirect(MsgId, InFlags, ISPI, RSPI, IDrBody, NonceI,
             exchange_type_raw => 35,
             flags             => RespFlags,
             message_id        => MsgId},
-    case epdg_ikev2_crypto:encode_encrypted_message(
-           KeyParams, Keys, responder, Hdr, InnerChain) of
+    case encrypt_and_mirror(KeyParams, Keys, Hdr, InnerChain, Data0) of
         {ok, RespBytes} ->
             catch epdg_ikev2_listener:send(PeerIP, PeerPort, RespBytes),
             epdg_metrics:inc(ike_redirects_sent_total),
@@ -1966,8 +2042,7 @@ finalize_ike_auth_setup(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
             flags             => RespFlags,
             message_id        => MsgId},
 
-    case epdg_ikev2_crypto:encode_encrypted_message(
-           KeyParams, Keys, responder, Hdr, InnerChain) of
+    case encrypt_and_mirror(KeyParams, Keys, Hdr, InnerChain, Data0) of
         {ok, RespBytes} ->
             catch epdg_ikev2_listener:send(PeerIP, PeerPort, RespBytes),
             logger:info("IKE_AUTH final response sent (~B bytes) IMSI=~p "
@@ -2572,8 +2647,7 @@ send_ike_notify_and_stop(MsgId, InFlags, ISPI, RSPI, NotifyType,
             exchange_type_raw => 35,
             flags             => RespFlags,
             message_id        => MsgId},
-    case epdg_ikev2_crypto:encode_encrypted_message(
-           KeyParams, Keys, responder, Hdr, [{notify, NotifyBin}]) of
+    case encrypt_and_mirror(KeyParams, Keys, Hdr, [{notify, NotifyBin}], Data) of
         {ok, RespBytes} ->
             catch epdg_ikev2_listener:send(PeerIP, PeerPort, RespBytes);
         _ -> ok
@@ -2591,8 +2665,7 @@ send_eap_to_ue(EapOut, MsgId, InFlags, ISPI, RSPI,
             flags             => RespFlags,
             message_id        => MsgId},
     InnerChain = [{eap, EapBin}],
-    case epdg_ikev2_crypto:encode_encrypted_message(
-           KeyParams, Keys, responder, Hdr, InnerChain) of
+    case encrypt_and_mirror(KeyParams, Keys, Hdr, InnerChain, Data) of
         {ok, RespBytes} ->
             catch epdg_ikev2_listener:send(PeerIP, PeerPort, RespBytes),
             logger:info("IKE_AUTH(cont) sent EAP relay (~p bytes) "
@@ -2694,7 +2767,7 @@ handle_informational(#{message_id := MsgId} = Header, RawData,
     %% (SK_ei/SK_ai) decrypt it. We inspect once for DELETE (RFC 7296
     %% §3.11), UPDATE_SA_ADDRESSES (RFC 4555 §3.2) and COOKIE2 (RFC 4555
     %% §4.2.5).
-    Payloads = decrypt_informational_payloads(KeyParams, Keys, RawData),
+    Payloads = decrypt_informational_payloads(KeyParams, Keys, RawData, Data0),
     %% RFC 4555 §4.2.5: if the UE put a COOKIE2 in its request (to verify
     %% *our* return routability) we MUST echo it verbatim in the response.
     Echo = cookie2_echo_payloads(Payloads),
@@ -2776,13 +2849,13 @@ start_rr_check(OldIP, NewIP, NewPort,
 
 %% Process the UE's reply to our COOKIE2 probe (RFC 4555 §3.7). The UE is
 %% the IKE initiator, so it encrypts with its initiator-half keys — exactly
-%% what decrypt_informational_payloads/3 already uses.
+%% what decrypt_informational_payloads/4 already uses.
 handle_rr_response(RawData,
                    #data{keys_params = KeyParams, ike_keys = Keys, imsi = IMSI,
                          rr_pending = #{cookie := Cookie, old_ip := OldIP,
                                         new_ip := NewIP, new_port := NewPort}}
                        = Data0) ->
-    Payloads = decrypt_informational_payloads(KeyParams, Keys, RawData),
+    Payloads = decrypt_informational_payloads(KeyParams, Keys, RawData, Data0),
     case cookie2_value(Payloads) of
         {ok, Cookie} ->
             logger:notice("MOBIKE RR check passed IMSI=~p; committing move "
@@ -2835,10 +2908,15 @@ handle_rr_timeout(_RR, #data{imsi = IMSI} = Data) ->
 
 %% Decrypt an INFORMATIONAL request to its inner payload list (or [] on
 %% failure). The UE initiated the exchange, so use the initiator keys.
-decrypt_informational_payloads(KeyParams, Keys, RawData) ->
+%% Mirrors the decrypted message on the way through: DPD, DELETE, MOBIKE
+%% and COOKIE2 all arrive here, and they are the exchanges that are least
+%% diagnosable from an encrypted capture.
+decrypt_informational_payloads(KeyParams, Keys, RawData, Data) ->
     case epdg_ikev2_crypto:decode_encrypted_message(
            KeyParams, Keys, initiator, RawData) of
-        {ok, #{payloads := Payloads}} -> Payloads;
+        {ok, #{payloads := Payloads, header := Header} = Decoded} ->
+            mirror_in(Header, Decoded, Data),
+            Payloads;
         _ -> []
     end.
 
@@ -2894,7 +2972,7 @@ cookie2_echo_payloads(Payloads) ->
 send_cookie2_request(Cookie, MsgId,
                      #data{ike_keys = Keys, keys_params = KeyParams,
                            initiator_spi = ISPI, responder_spi = RSPI,
-                           peer_ip = PeerIP, peer_port = PeerPort})
+                           peer_ip = PeerIP, peer_port = PeerPort} = Data)
   when is_map(Keys), is_map(KeyParams),
        is_integer(ISPI), is_integer(RSPI),
        is_tuple(PeerIP), is_integer(PeerPort) ->
@@ -2905,8 +2983,7 @@ send_cookie2_request(Cookie, MsgId,
             flags             => 16#00,
             message_id        => MsgId},
     try
-        case epdg_ikev2_crypto:encode_encrypted_message(
-               KeyParams, Keys, responder, Hdr, [{notify, Notify}]) of
+        case encrypt_and_mirror(KeyParams, Keys, Hdr, [{notify, Notify}], Data) of
             {ok, Bytes} ->
                 catch epdg_ikev2_listener:send(PeerIP, PeerPort, Bytes),
                 ok;
@@ -2929,14 +3006,14 @@ send_cookie2_request(_Cookie, _MsgId, _Data) ->
 send_informational_response(MsgId, ExtraPayloads,
                             #data{keys_params = KeyParams, ike_keys = Keys,
                                   initiator_spi = ISPI, responder_spi = RSPI,
-                                  peer_ip = PeerIP, peer_port = PeerPort}) ->
+                                  peer_ip = PeerIP,
+                                  peer_port = PeerPort} = Data) ->
     Hdr = #{initiator_spi     => ISPI,
             responder_spi     => RSPI,
             exchange_type_raw => 37,
             flags             => 16#20,  %% Response=1, Initiator=0
             message_id        => MsgId},
-    case epdg_ikev2_crypto:encode_encrypted_message(
-           KeyParams, Keys, responder, Hdr, ExtraPayloads) of
+    case encrypt_and_mirror(KeyParams, Keys, Hdr, ExtraPayloads, Data) of
         {ok, Bytes} -> catch epdg_ikev2_listener:send(PeerIP, PeerPort, Bytes);
         _ -> ok
     end,
@@ -3101,8 +3178,7 @@ send_dpd_probe(#data{ike_keys = Keys, keys_params = KeyParams,
             flags             => 16#00,
             message_id        => MsgId},
     try
-        case epdg_ikev2_crypto:encode_encrypted_message(
-               KeyParams, Keys, responder, Hdr, []) of
+        case encrypt_and_mirror(KeyParams, Keys, Hdr, [], Data) of
             {ok, Bytes} ->
                 catch epdg_ikev2_listener:send(PeerIP, PeerPort, Bytes),
                 epdg_metrics:inc(dpd_probes_sent_total),
@@ -3168,7 +3244,7 @@ try_send_redirect_informational({GwType, GwId},
                                       responder_spi = RSPI,
                                       peer_ip = PeerIP,
                                       peer_port = PeerPort,
-                                      message_id = MsgId})
+                                      message_id = MsgId} = Data)
   when is_map(Keys), is_map(KeyParams),
        is_integer(ISPI), is_integer(RSPI),
        is_tuple(PeerIP), is_integer(PeerPort) ->
@@ -3182,8 +3258,8 @@ try_send_redirect_informational({GwType, GwId},
             flags             => 16#00,
             message_id        => MsgId},
     try
-        case epdg_ikev2_crypto:encode_encrypted_message(
-               KeyParams, Keys, responder, Hdr, [{notify, RedirectNotify}]) of
+        case encrypt_and_mirror(KeyParams, Keys, Hdr,
+                                [{notify, RedirectNotify}], Data) of
             {ok, Bytes} ->
                 catch epdg_ikev2_listener:send(PeerIP, PeerPort, Bytes),
                 epdg_metrics:inc(ike_redirects_sent_total),
@@ -3231,7 +3307,7 @@ try_send_delete_informational(#data{ike_keys = Keys,
                                     responder_spi = RSPI,
                                     peer_ip = PeerIP,
                                     peer_port = PeerPort,
-                                    message_id = MsgId})
+                                    message_id = MsgId} = Data)
   when is_map(Keys), is_map(KeyParams),
        is_integer(ISPI), is_integer(RSPI),
        is_tuple(PeerIP), is_integer(PeerPort) ->
@@ -3249,8 +3325,8 @@ try_send_delete_informational(#data{ike_keys = Keys,
             flags             => 16#00,
             message_id        => MsgId},
     try
-        case epdg_ikev2_crypto:encode_encrypted_message(
-               KeyParams, Keys, responder, Hdr, [{delete, DeletePayload}]) of
+        case encrypt_and_mirror(KeyParams, Keys, Hdr,
+                                [{delete, DeletePayload}], Data) of
             {ok, Bytes} ->
                 catch epdg_ikev2_listener:send(PeerIP, PeerPort, Bytes),
                 logger:info("Drain: IKEv2 DELETE informational sent "

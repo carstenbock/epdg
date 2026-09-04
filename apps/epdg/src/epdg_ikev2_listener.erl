@@ -13,6 +13,9 @@
 
 -define(SERVER, ?MODULE).
 
+%% IKEv2 Encrypted (SK) payload type, RFC 7296 §3.14.
+-define(PL_SK, 46).
+
 -record(state, {
     socket_500  :: gen_udp:socket() | undefined,
     socket_4500 :: gen_udp:socket() | undefined,
@@ -83,15 +86,16 @@ init([]) ->
 
 handle_call({send, IP, Port, FromPort, Data}, _From,
             #state{socket_500 = S500, socket_4500 = S4500} = State) ->
-    Sock = case FromPort of
-        500  -> S500;
-        4500 -> S4500;
-        _    -> case Port of 500 -> S500; _ -> S4500 end
+    {Sock, LocalPort} = case FromPort of
+        500  -> {S500, 500};
+        4500 -> {S4500, 4500};
+        _    -> case Port of 500 -> {S500, 500}; _ -> {S4500, 4500} end
     end,
-    SendData = case Sock of
-        S4500 -> <<0,0,0,0, Data/binary>>;
-        _     -> Data
+    SendData = case LocalPort of
+        4500 -> <<0,0,0,0, Data/binary>>;
+        _    -> Data
     end,
+    mirror_if_cleartext(out, Data, IP, Port, LocalPort),
     {reply, gen_udp:send(Sock, IP, Port, SendData), State};
 
 handle_call(get_local_ip, _From, #state{local_ip = IP} = State) ->
@@ -127,6 +131,7 @@ handle_info({udp, Sock, FromIP, FromPort, Data},
         {4500, <<0,0,0,0, Rest/binary>>} -> Rest;
         _ -> Data
     end,
+    mirror_if_cleartext(in, IKEData, FromIP, FromPort, RecvPort),
     handle_ikev2_packet(IKEData, FromIP, FromPort, RecvPort),
     epdg_metrics:inc(ikev2_packets_received_total),
     {noreply, State};
@@ -188,6 +193,34 @@ dispatch(_ISPI, RSPI, Header, Data, _FromIP, FromPort) ->
             epdg_ue_fsm:handle_ikev2(Pid, Header, Data, FromPort);
         error ->
             logger:warning("IKEv2 for unknown RSPI ~.16B", [RSPI])
+    end.
+
+%% IKE_SA_INIT is the only exchange that crosses the wire in the clear, so
+%% the listener is the right place to mirror it: both directions pass
+%% through here with the plaintext already in hand. Every later exchange is
+%% SK-protected (RFC 7296 §3.14) and is mirrored from the UE FSM once
+%% decrypted — mirroring the ciphertext here would only produce opaque
+%% frames, and would duplicate every message in the trace.
+%%
+%% The check is on the header's Next Payload field rather than the exchange
+%% type so anything unencrypted (e.g. an IKE_SA_INIT carrying a COOKIE
+%% retry) is mirrored too.
+mirror_if_cleartext(Dir, Data, PeerIP, PeerPort, LocalPort) ->
+    case epdg_ikev2_trace:enabled() of
+        false ->
+            ok;
+        true ->
+            case Data of
+                <<_ISPI:8/binary, _RSPI:8/binary, NextPL:8, _Rest/binary>>
+                  when NextPL =/= ?PL_SK ->
+                    epdg_ikev2_trace:mirror(#{dir        => Dir,
+                                              msg        => Data,
+                                              peer_ip    => PeerIP,
+                                              peer_port  => PeerPort,
+                                              local_port => LocalPort});
+                _ ->
+                    ok
+            end
     end.
 
 close_if_open(undefined) -> ok;

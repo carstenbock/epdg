@@ -81,7 +81,10 @@ init() ->
         session_store_writes_total,
         session_store_errors_total,
         sessions_restored_total,
-        session_restore_failures_total
+        session_restore_failures_total,
+        ike_trace_messages_total,
+        ike_trace_dropped_total,
+        ike_trace_subscribers
     ]),
     ok.
 
