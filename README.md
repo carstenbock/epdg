@@ -275,8 +275,16 @@ therefore derived from a per-pod **instance id**:
 
 * TUN device: `epdg<id>` (`epdg0`, `epdg1`, …)
 * policy-routing table: `100 + id` (100..163)
-* `ip rule` priority: `1000 + id` (1000..1063 — always strictly between
-  the PGW-U escape rules at 900 and the main table at 32766)
+* `ip rule` priority: `30 + id` (30..93 — always strictly between the
+  PGW-U escape rules at 20 and the kernel `local` table lookup at 100).
+  The pool rules sort **before** `local` (lower priority number) on
+  purpose: on hostNetwork GKE nodes the GCP guest agent installs every
+  passthrough-LB VIP the node backs as a `local` address, and the P-CSCF
+  VIP handed to VoWiFi UEs is one of them. If the UE-pool uplink rule
+  sorted after `local`, the node would intercept the decrypted SIP
+  REGISTER (delivering it to `lo`) instead of forwarding it via the
+  shared TUN toward the PGW-U. Steering UE-pool uplink before `local`
+  makes it always ride the datapath, regardless of node-local VIP routes.
 
 Without distinct ids, two pods on one node would attach to the same
 `epdg0` device, overwrite each other's rules, and a stopping pod would

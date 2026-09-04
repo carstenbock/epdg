@@ -14,7 +14,10 @@
 start_link() ->
     supervisor:start_link({local, ?SERVER}, ?MODULE, []).
 
--spec start_ue_fsm(map()) -> {ok, pid()} | {error, term()}.
+%% InitContext is either the peer-context map for a fresh attach or
+%% {restore, Snapshot, ExistingSAs} from epdg_session_restore.
+-spec start_ue_fsm(map() | {restore, map(), sets:set()}) ->
+          {ok, pid()} | {error, term()}.
 start_ue_fsm(InitContext) ->
     supervisor:start_child(?SERVER, [InitContext]).
 

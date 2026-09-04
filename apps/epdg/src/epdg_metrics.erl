@@ -75,6 +75,13 @@ init() ->
         ike_redirects_sent_total,
         session_superseded_total,
         tun_startup_cleaned_total,
+        xfrm_reconcile_runs_total,
+        xfrm_reconcile_orphan_sas_deleted_total,
+        xfrm_reconcile_orphan_policies_deleted_total,
+        session_store_writes_total,
+        session_store_errors_total,
+        sessions_restored_total,
+        session_restore_failures_total,
         ike_trace_messages_total,
         ike_trace_dropped_total,
         ike_trace_subscribers

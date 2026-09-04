@@ -88,7 +88,7 @@
 %%
 %%   TUN device:  "epdg" ++ Id                  ("epdg0".."epdg63")
 %%   table:       ?SHARED_TABLE_BASE + Id       (100..163)
-%%   rule prio:   ?SHARED_RULE_PRIO_BASE + Id   (1000..1063)
+%%   rule prio:   ?SHARED_RULE_PRIO_BASE + Id   (30..93)
 %%
 %% The tables live deliberately OUTSIDE the legacy per-UE range
 %% 1000..30999 (pre-shared-TUN releases derived one table per bearer in
@@ -96,21 +96,38 @@
 %% on upgrade and must never touch ours).
 %%
 %% INVARIANT: for EVERY instance id the rule priority must sort strictly
-%% AFTER the PGW-U escape rules (?PGWU_ESCAPE_PRIO = 900) and strictly
-%% BEFORE the main table (32766):
+%% AFTER the PGW-U escape rules (?PGWU_ESCAPE_PRIO = 20) and strictly
+%% BEFORE the kernel `local' table lookup (priority 100 on GKE Dataplane
+%% V2 / Cilium; the kernel default of 0 elsewhere):
 %%
-%%   900 < 1000 + Id =< 1063 < 32766   for Id in 0..63
+%%   20 < 30 + Id =< 93 < 100   for Id in 0..63
 %%
-%% — otherwise pool rules could shadow the escape rules (uplink
-%% black-hole for a co-located PGW-U) or drop behind main. Checked by
-%% instance_rule_prios_stay_between_escape_and_main_test.
+%% Why below `local': on hostNetwork GKE nodes the GCP guest agent
+%% programs every internal/external passthrough LB VIP the node backs as
+%% a `local' address (see `ip route show table local', proto 66). The
+%% P-CSCF address the SMF hands VoWiFi UEs in the S2b PCO is exactly such
+%% a VIP (the IPsec-GW internal NLB). If the UE-pool uplink rule sits
+%% BELOW the `local' table (the old 1000+Id band), the decrypted REGISTER
+%% destined to that VIP matches `local' first and is delivered to `lo' on
+%% the ePDG node instead of being steered into the shared TUN for GTP-U
+%% encapsulation toward the PGW-U — a silent black-hole for every VoWiFi
+%% attach. Sitting above `local' makes UE-pool uplink always ride the
+%% datapath, regardless of node-local VIP routes. Checked by
+%% instance_rule_prios_stay_between_escape_and_local_test.
+%%
+%% The escape rules must stay strictly before the pool rules so a
+%% co-located PGW-U's ogstun uplink is not looped back into the TUN.
 -define(SHARED_TUN_PREFIX, "epdg").
 -define(SHARED_TABLE_BASE, 100).
--define(SHARED_RULE_PRIO_BASE, 1000).
+-define(SHARED_RULE_PRIO_BASE, 30).
+%% Previous-scheme base (rules lived at 1000+Id, below the `local' table).
+%% Only referenced by the one-time upgrade sweep in setup_shared_tun/4 so
+%% rules a pre-move release left on the hostNetwork node do not linger.
+-define(LEGACY_SHARED_RULE_PRIO_BASE, 1000).
 -define(MAX_INSTANCES, 64).
 %% Priority of the PGW-U escape rules (ensure_pgwu_escape_rules/0).
 %% Must sort strictly before the UE-pool rules of every instance.
--define(PGWU_ESCAPE_PRIO, 900).
+-define(PGWU_ESCAPE_PRIO, 20).
 
 -record(ue_ent, {
     local_teid   :: non_neg_integer(),
@@ -906,9 +923,15 @@ setup_shared_tun(Name, Table, Prio, Pools) ->
             %% duplicate rules behind (there is no `ip rule replace').
             %% Safe next to sibling instances: the selectors, table and
             %% priority are all instance-scoped, so only OUR rules match.
+            %% Also sweep the previous-scheme priority (1000+Id, below the
+            %% `local' table): rules a pre-move release left on this
+            %% hostNetwork node would otherwise linger forever. Harmless
+            %% while present (the new rule at Prio wins), removed for hygiene.
+            LegacyPrio = ?LEGACY_SHARED_RULE_PRIO_BASE + (Prio - ?SHARED_RULE_PRIO_BASE),
             Selectors = shared_rule_selectors(Name, Pools),
             lists:foreach(fun({Fam, Sel}) ->
-                run_quiet(rule_cmd(Fam, "del", Sel, Table, Prio))
+                run_quiet(rule_cmd(Fam, "del", Sel, Table, Prio)),
+                run_quiet(rule_cmd(Fam, "del", Sel, Table, LegacyPrio))
             end, Selectors),
             BaseCmds = [
                 io_lib:format("ip link set dev ~s up", [Name]),
@@ -973,8 +996,9 @@ teardown_shared_tun(Name, Table, Prio, Pools) ->
 %%
 %% All of an instance's rules share its derived priority: they sort
 %% strictly after the PGW-U escape rules (?PGWU_ESCAPE_PRIO) and
-%% strictly before the main table (32766) — see the invariant note at
-%% ?SHARED_RULE_PRIO_BASE.
+%% strictly before the kernel `local' table lookup — see the invariant
+%% note at ?SHARED_RULE_PRIO_BASE for why UE-pool uplink must beat
+%% `local' on hostNetwork GKE nodes.
 shared_rule_selectors(Name, Pools) ->
     Iif = "iif " ++ Name,
     WantV6 = lists:any(fun({Base, _}) -> tuple_size(Base) =:= 8 end, Pools),
@@ -1040,8 +1064,12 @@ ensure_forwarding_sysctls(WantV6) ->
 %% ePDG's own node.
 %%
 %% Fix: anything entering through an ogstun device is routed via the
-%% main table, at a priority strictly below the pool rules. The rules
-%% are node-global, idempotent, and intentionally never torn down.
+%% main table, at a priority strictly before the pool rules (lower
+%% number). Since both now sort before the kernel `local' table, ogstun
+%% uplink destined to a node-local passthrough-LB VIP (e.g. the P-CSCF
+%% VIP) reaches the LB via main instead of being black-holed by local
+%% delivery. The rules are node-global, idempotent, and intentionally
+%% never torn down.
 %% XFRM-decrypted SWu uplink is unaffected (iif = the underlay NIC), as
 %% is downlink the forwarder injects into the shared TUN (iif = epdg0).
 ensure_pgwu_escape_rules() ->

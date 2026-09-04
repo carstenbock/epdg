@@ -487,10 +487,91 @@ handle_error(Reason, _Req, _SvcName, _Peer) ->
     logger:warning("SWm handle_error: ~P", [Reason, 10]),
     {error, Reason}.
 
-handle_request(_Pkt, _SvcName, _Peer) ->
-    %% ePDG is not expected to serve SWm requests; AAA → ePDG ASR/RAR
-    %% arrive as this callback — answer with a 3001 for now.
-    {answer_message, 3001}.
+handle_request(#diameter_packet{msg = Msg}, _SvcName, _Peer) ->
+    case Msg of
+        ['ASR' | AVPs] ->
+            handle_inbound_asr(AVPs);
+        ['RAR' | AVPs] ->
+            handle_inbound_rar(AVPs);
+        _ ->
+            {answer_message, 3001}
+    end.
+
+%% AAA-initiated abort (TS 29.273 §7.1.2.4). Look the UE up by IMSI
+%% (bare or NAI) and tear the IKE SA down; always answer ASA 2001 so
+%% the AAA does not retry a session that is already gone.
+handle_inbound_asr(AVPs) ->
+    IMSI = avp_bin('User-Name', AVPs),
+    Sid  = avp_bin('Session-Id', AVPs),
+    Found = lookup_ue_by_imsi(IMSI),
+    case Found of
+        {ok, Pid} ->
+            epdg_ue_fsm:disconnect(Pid);
+        error ->
+            ok
+    end,
+    {reply, asa_ok(Sid, IMSI)}.
+
+handle_inbound_rar(AVPs) ->
+    Sid = avp_bin('Session-Id', AVPs),
+    {reply, raa_ok(Sid)}.
+
+avp_bin(Key, AVPs) ->
+    case proplists:get_value(Key, AVPs) of
+        [V] when is_binary(V) -> V;
+        V when is_binary(V)   -> V;
+        [V] when is_list(V)   -> list_to_binary(V);
+        V when is_list(V)     -> list_to_binary(V);
+        _                     -> <<>>
+    end.
+
+lookup_ue_by_imsi(<<>>) -> error;
+lookup_ue_by_imsi(IMSI) ->
+    Bare = case binary:split(IMSI, <<"@">>) of
+        [User, _] -> User;
+        [User]    -> User
+    end,
+    Canon = case Bare of
+        <<D, Rest/binary>> when (D =:= $0 orelse D =:= $6),
+                                 byte_size(Rest) >= 14 ->
+            Rest;
+        _ ->
+            Bare
+    end,
+    case epdg_ue_registry:lookup_by_imsi(IMSI) of
+        {ok, Pid} -> {ok, Pid};
+        error ->
+            case epdg_ue_registry:lookup_by_imsi(Canon) of
+                {ok, Pid} -> {ok, Pid};
+                error ->
+                    case [Pid || {_SPI, Pid, U} <- epdg_ue_registry:all(),
+                                 is_binary(U),
+                                 (U =:= IMSI orelse U =:= Canon
+                                  orelse U =:= Bare)] of
+                        [Pid | _] -> {ok, Pid};
+                        [] -> error
+                    end
+            end
+    end.
+
+asa_ok(Sid, IMSI) ->
+    OH = to_bin(epdg_config:get(origin_host, "epdg.localdomain")),
+    OR = to_bin(epdg_config:get(origin_realm, "localdomain")),
+    ['ASA',
+     {'Session-Id', Sid},
+     {'Result-Code', 2001},
+     {'Origin-Host', OH},
+     {'Origin-Realm', OR},
+     {'User-Name', IMSI}].
+
+raa_ok(Sid) ->
+    OH = to_bin(epdg_config:get(origin_host, "epdg.localdomain")),
+    OR = to_bin(epdg_config:get(origin_realm, "localdomain")),
+    ['RAA',
+     {'Session-Id', Sid},
+     {'Result-Code', 2001},
+     {'Origin-Host', OH},
+     {'Origin-Realm', OR}].
 
 %%====================================================================
 %% Origin injection (list form)

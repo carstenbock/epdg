@@ -24,7 +24,9 @@
          format_proposal_notice/3,
          %% IPv6 PDN: inner selectors, CFG_REPLY contents, handover PAA
          ue6_selector/1, ip6_mask/2, build_cfg_reply/1,
-         requested_handover_addrs/1]).
+         requested_handover_addrs/1,
+         %% Session persistence: snapshot <-> #data roundtrip
+         session_snapshot/1, data_from_snapshot/1]).
 -endif.
 
 %% ?UE6_PREFIX_LEN: CFG_REPLY prefix length, XFRM inner selectors, handover
@@ -209,6 +211,38 @@ disconnect(Pid) ->
 
 callback_mode() -> [state_functions, state_enter].
 
+%% Restore path (epdg_session_restore): rebuild an ESTABLISHED session
+%% from its persisted snapshot after a pod crash. Registers the routing
+%% entries a normal attach would have created, re-registers the GTP-U
+%% bearer(s), then adopts the surviving kernel XFRM state (same-node
+%% restart) or re-installs it from the persisted key material
+%% (rescheduled). Ends directly in `established' — the state-enter call
+%% registers the RSPI, re-persists the snapshot and arms DPD. No IKE or
+%% S2b signalling happens: from the UE's and the PGW's point of view the
+%% session never went away. Any failure here crashes the start_child,
+%% which the restore orchestrator logs and resolves by deleting the
+%% stored entry (the UE then re-attaches normally via its own DPD).
+init({restore, Snapshot, ExistingSAs}) ->
+    Data = data_from_snapshot(Snapshot),
+    #data{responder_spi = RSPI, initiator_spi = ISPI, imsi = IMSI,
+          peer_ip = PeerIP, pgw_session = PGW} = Data,
+    epdg_metrics:inc(ue_sessions_total),
+    epdg_metrics:gauge_inc(ue_sessions_active),
+    %% Route IKE retransmits / PGW-initiated bearer requests to this FSM
+    %% again (the RSPI registration itself happens in established/enter).
+    catch epdg_ue_registry:register_initiator(PeerIP, ISPI, self()),
+    case PGW of
+        #{local_c_teid := LocalCTeid} ->
+            catch epdg_ue_registry:register_cteid(LocalCTeid, self());
+        _ -> ok
+    end,
+    restore_gtpu(Data),
+    restore_child_sas(Data, ExistingSAs),
+    logger:notice("Session restored from store IMSI=~p RSPI=~.16B peer=~p "
+                  "inner_ip=~p", [IMSI, value_or_zero(RSPI), PeerIP,
+                                  Data#data.ue_inner_ip]),
+    {ok, established, Data};
+
 init(#{peer_ip := PeerIP, peer_port := PeerPort} = _Ctx) ->
     RSPI = epdg_ikev2_crypto:generate_spi(),
     epdg_metrics:inc(ue_sessions_total),
@@ -243,9 +277,13 @@ terminate(_Reason, _State, #data{responder_spi = RSPI, imsi = IMSI,
     %% across DPD teardown / re-attach cycles. Also drop the per-UE XFRM
     %% policies (keyed by the UE inner IP), which were never cleaned before.
     case ChildSA of
-        #{spi_in := _, spi_out := _} ->
+        #{spi_in := SpiIn, spi_out := SpiOut} ->
             delete_child_sas(PeerIP, ChildSA),
-            delete_ue_policies(UeInnerIp, UeInnerIp6);
+            delete_ue_policies(UeInnerIp, UeInnerIp6),
+            %% Release the reconciler's ESP-SPI claim only AFTER the
+            %% kernel state is gone (release-last, mirrors the
+            %% claim-first in install_child_sas).
+            catch epdg_ue_registry:unregister_esp_spis(SpiIn, SpiOut);
         _ -> ok
     end,
     case PGW of
@@ -282,6 +320,11 @@ terminate(_Reason, _State, #data{responder_spi = RSPI, imsi = IMSI,
             catch epdg_ue_registry:unregister_initiator(IP, I);
         _ -> ok
     end,
+    %% Orderly teardown forgets the persisted snapshot: everything above
+    %% just released the kernel/S2b/SWm state, so restoring this session
+    %% later would resurrect a corpse. A crashed pod never reaches
+    %% terminate/3 — its entries stay for epdg_session_restore.
+    catch epdg_session_store:delete_session(RSPI),
     epdg_metrics:gauge_dec(ue_sessions_active),
     logger:info("UE FSM terminated IMSI=~p RSPI=~.16B", [IMSI, value_or_zero(RSPI)]),
     ok.
@@ -419,8 +462,9 @@ ike_auth(cast, {ikev2, #{exchange_type := ike_auth} = Header, RawData, FromPort}
 ike_auth(cast, {ikev2, #{exchange_type := informational} = Header, RawData, FromPort}, Data) ->
     handle_informational(Header, RawData, refresh_peer_port(Data, FromPort));
 
-ike_auth(cast, disconnect, _Data) ->
-    {stop, normal};
+ike_auth(cast, disconnect, Data) ->
+    _ = try_send_delete_informational(Data),
+    {stop, {shutdown, aaa_abort}};
 
 %% The GTP-C client saw the PGW restart (Recovery IE change) or lost
 %% its Echo heartbeat — every ongoing session is invalid, so tear down
@@ -458,6 +502,9 @@ established(enter, _OldState, #data{responder_spi = RSPI, imsi = IMSI} = Data) -
     epdg_ue_registry:register(RSPI, self(), IMSI),
     logger:info("Tunnel established IMSI=~p RSPI=~.16B", [IMSI, RSPI]),
     epdg_metrics:inc(ike_tunnels_established_total),
+    %% Persist the full session snapshot (no-op unless the session store
+    %% is enabled) so a pod crash can restore this session.
+    maybe_store_session(Data),
     Interval = epdg_config:get(dpd_interval, ?DPD_INTERVAL),
     {keep_state, Data, [{state_timeout, Interval, dpd}]};
 
@@ -507,8 +554,9 @@ established(cast, {ikev2, #{exchange_type := ike_auth, message_id := MsgId} = _H
     {keep_state, Data1#data{dpd_failures = 0},
      [{state_timeout, Interval, dpd}]};
 
-established(cast, disconnect, _Data) ->
-    {stop, normal};
+established(cast, disconnect, Data) ->
+    _ = try_send_delete_informational(Data),
+    {stop, {shutdown, aaa_abort}};
 
 established(cast, pgw_restart, _Data) -> {stop, {shutdown, pgw_restart}};
 established(cast, pgw_down,    _Data) -> {stop, {shutdown, pgw_unreachable}};
@@ -598,7 +646,9 @@ handle_bearer_request(create, #{seq_num := Seq, bearer_contexts := BCs},
     epdg_gtpc_client:send_bearer_response(
         #{kind => create, seq_num => Seq, teid => pgw_c_teid(PGW),
           bearers => lists:reverse(RespBearers)}),
-    {keep_state, Data#data{dedicated_bearers = NewBeds}};
+    Data1 = Data#data{dedicated_bearers = NewBeds},
+    maybe_store_session(Data1),
+    {keep_state, Data1};
 
 handle_bearer_request(update, #{seq_num := Seq, bearer_contexts := BCs},
                       #data{pgw_session = PGW,
@@ -610,7 +660,9 @@ handle_bearer_request(update, #{seq_num := Seq, bearer_contexts := BCs},
     epdg_gtpc_client:send_bearer_response(
         #{kind => update, seq_num => Seq, teid => pgw_c_teid(PGW),
           bearers => lists:reverse(RespBearers)}),
-    {keep_state, Data#data{dedicated_bearers = NewBeds}};
+    Data1 = Data#data{dedicated_bearers = NewBeds},
+    maybe_store_session(Data1),
+    {keep_state, Data1};
 
 handle_bearer_request(delete, #{seq_num := Seq, ebis := Ebis},
                       #data{pgw_session = PGW,
@@ -638,7 +690,9 @@ handle_bearer_request(delete, #{seq_num := Seq, ebis := Ebis},
             epdg_gtpc_client:send_bearer_response(
                 #{kind => delete, seq_num => Seq, teid => PgwCTeid,
                   bearers => RespBearers}),
-            {keep_state, Data#data{dedicated_bearers = NewBeds}}
+            Data1 = Data#data{dedicated_bearers = NewBeds},
+            maybe_store_session(Data1),
+            {keep_state, Data1}
     end.
 
 %% Create a single dedicated bearer: assign an EBI, allocate the ePDG S2b-U
@@ -2293,6 +2347,14 @@ install_child_sas({U_A, U_B, U_C, U_D} = UeOuter, PeerPort, PeerSPI, RespSPI,
     %% the reqid that ties this UE's policy templates to its own SA pair.
     Reqid = SpiInInt,
 
+    %% Claim the ESP SA pair for this FSM BEFORE any kernel state exists
+    %% (claim-first): the XFRM reconciler treats unclaimed kernel SAs as
+    %% orphans, and this ordering guarantees it can never observe an
+    %% installed-but-unclaimed SA of a live session. Runs in the FSM
+    %% process for every install path (IKE_AUTH finalize, MOBIKE move,
+    %% session restore).
+    catch epdg_ue_registry:register_esp_spis(SpiInInt, SpiOutInt, self()),
+
     %% Idempotency WITHOUT collateral damage: remove only THIS UE's own
     %% prior SA pair (exact SPI + endpoint) before re-installing — e.g. on
     %% an IKE_AUTH retransmit or an unclean re-dial. A co-NAT'd sibling UE
@@ -2339,6 +2401,17 @@ install_child_sas({U_A, U_B, U_C, U_D} = UeOuter, PeerPort, PeerSPI, RespSPI,
     log_xfrm_result(sa_out, SpiOutInt,
                     catch epdg_xfrm:create_sa(OutboundParams)),
 
+    install_ue_policies(UeOuter, LocalOuter, Reqid, UeInnerIp, UeInnerIp6),
+
+    _ = {U_A, U_B, U_C, U_D},  %% silence unused
+    ok.
+
+%% The three per-UE XFRM policies (in/fwd/out) plus the IPv6 set when the
+%% PDN is dual-stack. `create_policy` uses `ip xfrm policy update`
+%% (create-or-replace), so this is idempotent — also called stand-alone
+%% by the session-restore adopt path to re-assert policies against
+%% adopted (surviving) kernel SAs.
+install_ue_policies(UeOuter, LocalOuter, Reqid, UeInnerIp, UeInnerIp6) ->
     UeCidr  = ip4_cidr(UeInnerIp, 32),
     AnyCidr = "0.0.0.0/0",
 
@@ -2374,8 +2447,6 @@ install_child_sas({U_A, U_B, U_C, U_D} = UeOuter, PeerPort, PeerSPI, RespSPI,
     %% stay the IPv4 outer node IPs — Linux XFRM supports inner-IPv6 over
     %% an outer-IPv4 tunnel, and both families ride the same ESP SA pair.
     install_v6_policies(UeInnerIp6, UeOuter, LocalOuter, Reqid),
-
-    _ = {U_A, U_B, U_C, U_D},  %% silence unused
     ok.
 
 %% Install the in/fwd/out XFRM policies for the UE's IPv6 inner prefix.
@@ -2757,12 +2828,16 @@ handle_mobike_update(MsgId, NewIP, NewPort, Echo,
 %% gateway-initiated INFORMATIONAL request to the UE's new address. The
 %% data-plane move waits in rr_pending until the UE echoes it back.
 start_rr_check(OldIP, NewIP, NewPort,
-               #data{imsi = IMSI, message_id = MsgId} = Data0) ->
+               #data{imsi = IMSI, message_id = MsgId,
+                     responder_spi = RSPI} = Data0) ->
     Cookie = crypto:strong_rand_bytes(16),
     logger:notice("MOBIKE UPDATE_SA_ADDRESSES IMSI=~p ~s -> ~s:~B; starting "
                   "RFC 4555 return-routability check (msg_id=~B)",
                   [IMSI, format_ip(OldIP), format_ip(NewIP), NewPort, MsgId]),
     ok = send_cookie2_request(Cookie, MsgId, Data0),
+    %% Persist the consumed message-id after the send (same rationale as
+    %% in send_dpd_probe/1).
+    catch epdg_session_store:update_message_id(RSPI, MsgId + 1),
     epdg_metrics:inc(mobike_rr_check_total),
     RR = #{old_ip => OldIP, new_ip => NewIP, new_port => NewPort,
            cookie => Cookie, msg_id => MsgId,
@@ -3071,6 +3146,9 @@ do_mobike_dataplane_move(OldIP, NewIP, NewPort,
             install_child_sas(NewIP, NewPort, PeerSPI, RespSPI, Suite,
                               Ei, Ai, Er, Ar, InnerIp, InnerIp6),
             epdg_metrics:inc(mobike_update_total),
+            %% The UE's outer address/port changed — re-persist so a
+            %% restore rebuilds the SAs against the CURRENT endpoint.
+            maybe_store_session(Data),
             Data;
         _ ->
             logger:warning("MOBIKE move but no stored Child SA params; "
@@ -3104,6 +3182,10 @@ send_dpd_probe(#data{ike_keys = Keys, keys_params = KeyParams,
             {ok, Bytes} ->
                 catch epdg_ikev2_listener:send(PeerIP, PeerPort, Bytes),
                 epdg_metrics:inc(dpd_probes_sent_total),
+                %% Persist the consumed message-id AFTER the send (see
+                %% epdg_session_store:update_message_id/2 for why after,
+                %% not write-ahead).
+                catch epdg_session_store:update_message_id(RSPI, MsgId + 1),
                 Data#data{message_id = MsgId + 1};
             {error, EncErr} ->
                 logger:info("DPD: encode failed: ~p", [EncErr]),
@@ -3265,6 +3347,189 @@ try_send_delete_informational(_Data) ->
     %% No keys yet (pre-auth) — nothing we can encrypt. The UE will
     %% time out its half-open IKE SA naturally.
     ok.
+
+%%====================================================================
+%% Session persistence (epdg_session_store) and crash restore
+%%====================================================================
+
+%% Persist the full session snapshot. No-op unless the session store is
+%% enabled; the write itself is a fire-and-forget cast so signalling
+%% never waits on Redis.
+maybe_store_session(#data{responder_spi = RSPI} = Data)
+  when is_integer(RSPI) ->
+    case epdg_session_store:enabled() of
+        true ->
+            catch epdg_session_store:put_session(RSPI, session_snapshot(Data)),
+            ok;
+        false ->
+            ok
+    end;
+maybe_store_session(_Data) ->
+    ok.
+
+%% Everything an established session needs to be rebuilt after a crash:
+%% identity (IMSI/APN/NAI), the UE's outer endpoint, both IKE SPIs, the
+%% IKE keys + crypto params (for DPD/INFORMATIONAL exchanges), the
+%% responder message-id, the full child_sa (incl. the `reinstall' key
+%% material), the S2b session + TEIDs, dedicated bearers, and the SWm
+%% Diameter anchors (so the eventual teardown still sends a correct
+%% STR). Handshake-only state (nonces, DH, EAP MSK, cached IKE_AUTH
+%% response bytes) is deliberately NOT persisted — it is dead weight
+%% and key material at rest.
+%%
+%% Mirrors data_from_snapshot/1; the roundtrip is pinned by
+%% epdg_ue_fsm_snapshot_tests.
+session_snapshot(#data{peer_ip = PeerIP, peer_port = PeerPort,
+                       initiator_spi = ISPI, responder_spi = RSPI,
+                       imsi = IMSI, apn = Apn, ue_nai = UeNai,
+                       keys_params = KeyParams, ike_keys = Keys,
+                       message_id = MsgId, mobike = Mobike,
+                       redirect_supported = RedirSup,
+                       eap_next_id = EapNextId,
+                       child_sa = ChildSA, pgw_session = PGW,
+                       ue_inner_ip = InnerIp, ue_inner_ip6 = InnerIp6,
+                       gtpu_teid_local = TeidLocal,
+                       gtpu_teid_pgw = TeidPgw,
+                       dedicated_bearers = Beds,
+                       swm_session_id = SwmSess,
+                       swm_dest_host = SwmHost}) ->
+    #{peer_ip => PeerIP, peer_port => PeerPort,
+      initiator_spi => ISPI, responder_spi => RSPI,
+      imsi => IMSI, apn => Apn, ue_nai => UeNai,
+      keys_params => KeyParams, ike_keys => Keys,
+      message_id => MsgId, mobike => Mobike,
+      redirect_supported => RedirSup,
+      eap_next_id => EapNextId,
+      child_sa => ChildSA, pgw_session => PGW,
+      ue_inner_ip => InnerIp, ue_inner_ip6 => InnerIp6,
+      gtpu_teid_local => TeidLocal, gtpu_teid_pgw => TeidPgw,
+      dedicated_bearers => Beds,
+      swm_session_id => SwmSess, swm_dest_host => SwmHost,
+      stored_at => os:system_time(second)}.
+
+%% Rebuild #data from a stored snapshot. Volatile and handshake-only
+%% fields are reset: DPD starts clean, no return-routability check is
+%% in flight, and there is no cached IKE_AUTH response to retransmit
+%% (a UE still retransmitting its final IKE_AUTH across our crash gives
+%% up on its own — it already has a working tunnel).
+data_from_snapshot(S) when is_map(S) ->
+    #data{peer_ip           = maps:get(peer_ip, S),
+          peer_port         = maps:get(peer_port, S),
+          initiator_spi     = maps:get(initiator_spi, S),
+          responder_spi     = maps:get(responder_spi, S),
+          imsi              = maps:get(imsi, S, undefined),
+          apn               = maps:get(apn, S, undefined),
+          ue_nai            = maps:get(ue_nai, S, undefined),
+          keys_params       = maps:get(keys_params, S, undefined),
+          ike_keys          = maps:get(ike_keys, S, undefined),
+          message_id        = maps:get(message_id, S, 0),
+          mobike            = maps:get(mobike, S, false) =:= true,
+          redirect_supported = maps:get(redirect_supported, S, false) =:= true,
+          eap_next_id       = maps:get(eap_next_id, S, 1),
+          child_sa          = maps:get(child_sa, S, undefined),
+          pgw_session       = maps:get(pgw_session, S, undefined),
+          ue_inner_ip       = maps:get(ue_inner_ip, S, undefined),
+          ue_inner_ip6      = maps:get(ue_inner_ip6, S, undefined),
+          gtpu_teid_local   = maps:get(gtpu_teid_local, S, undefined),
+          gtpu_teid_pgw     = maps:get(gtpu_teid_pgw, S, undefined),
+          dedicated_bearers = maps:get(dedicated_bearers, S, #{}),
+          swm_session_id    = maps:get(swm_session_id, S, undefined),
+          swm_dest_host     = maps:get(swm_dest_host, S, undefined),
+          dpd_failures      = 0,
+          eap_done          = true,
+          rr_pending        = undefined}.
+
+%% Re-register the restored session's bearer(s) with the GTP-U
+%% forwarder. The persisted local S2b-U TEID is passed as a hint and is
+%% MANDATORY for downlink: the PGW-U keeps sending T-PDUs to the TEID it
+%% learned at attach time, so a freshly allocated one would black-hole
+%% every downlink packet.
+restore_gtpu(#data{pgw_session = PGW, imsi = IMSI,
+                   ue_inner_ip = InnerIp, ue_inner_ip6 = InnerIp6,
+                   gtpu_teid_local = LocalU,
+                   dedicated_bearers = Beds}) ->
+    {PgwUIp, PgwUTeid} = pgw_u_from_resp(PGW),
+    RegResult = (catch epdg_gtpu_forwarder:register_ue(#{
+                     pgw_u_teid   => PgwUTeid,
+                     pgw_u_ip     => PgwUIp,
+                     ue_inner_ip  => InnerIp,
+                     ue_inner_ip6 => InnerIp6,
+                     imsi         => IMSI,
+                     owner_pid    => self(),
+                     local_teid_hint => LocalU})),
+    case classify_register_ue_result(RegResult) of
+        proceed ->
+            ok;
+        degraded ->
+            logger:warning("Restore: GTP-U forwarder unavailable (~p) — "
+                           "restoring without bearer registration "
+                           "(degraded / dev mode) IMSI=~p",
+                           [RegResult, IMSI]);
+        _Reject ->
+            %% A restored session whose uplink cannot be attributed is a
+            %% dead tunnel; failing the restore lets the UE re-attach
+            %% cleanly instead.
+            error({restore_bearer_registration_failed, RegResult})
+    end,
+    maps:foreach(
+      fun(_Ebi, Bearer) ->
+              catch epdg_gtpu_forwarder:register_bearer(
+                      #{default_teid => LocalU,
+                        local_teid   => maps:get(local_u_teid, Bearer),
+                        pgw_u_teid   => maps:get(pgw_u_teid, Bearer),
+                        pgw_u_ip     => maps:get(pgw_u_ip, Bearer),
+                        filters      => maps:get(filters, Bearer, [])})
+      end, Beds),
+    ok.
+
+%% Bring the kernel XFRM state of a restored session back in line.
+%%
+%% Same-node restart (both SAs survived in the host kernel): ADOPT them
+%% untouched — the surviving SAs carry the live ESP sequence counters,
+%% and a re-install would reset the outbound counter to zero, which the
+%% UE's anti-replay window then discards (dead downlink). Only the
+%% ESP-SPI claim and the (idempotent) policies are re-asserted.
+%%
+%% Rescheduled to another node (kernel empty): RE-INSTALL the pair from
+%% the persisted `reinstall' key material. The outbound sequence number
+%% necessarily restarts at zero here; a UE that enforces strict ESP
+%% anti-replay may drop downlink until DPD reaps the session and it
+%% re-attaches — still no worse than losing the session outright.
+restore_child_sas(#data{peer_ip = PeerIP, peer_port = PeerPort,
+                        child_sa = ChildSA, imsi = IMSI,
+                        ue_inner_ip = InnerIp, ue_inner_ip6 = InnerIp6},
+                  ExistingSAs) ->
+    case ChildSA of
+        #{spi_in := SpiIn, spi_out := SpiOut,
+          reinstall := #{peer_spi := PeerSPI, resp_spi := RespSPI,
+                         suite := Suite, sk_ei := Ei, sk_ai := Ai,
+                         sk_er := Er, sk_ar := Ar}} ->
+            LocalOuter = local_outer_ip(),
+            BothPresent =
+                sets:is_element({PeerIP, LocalOuter, SpiIn}, ExistingSAs)
+                andalso
+                sets:is_element({LocalOuter, PeerIP, SpiOut}, ExistingSAs),
+            case BothPresent of
+                true ->
+                    catch epdg_ue_registry:register_esp_spis(
+                            SpiIn, SpiOut, self()),
+                    install_ue_policies(PeerIP, LocalOuter, SpiIn,
+                                        InnerIp, InnerIp6),
+                    logger:notice("Restore: adopted surviving kernel SAs "
+                                  "IMSI=~p spi_in=0x~8.16.0B",
+                                  [IMSI, SpiIn]);
+                false ->
+                    install_child_sas(PeerIP, PeerPort, PeerSPI, RespSPI,
+                                      Suite, Ei, Ai, Er, Ar,
+                                      InnerIp, InnerIp6),
+                    logger:notice("Restore: re-installed kernel SAs "
+                                  "IMSI=~p spi_in=0x~8.16.0B",
+                                  [IMSI, SpiIn])
+            end,
+            ok;
+        _ ->
+            error({restore_missing_child_sa, IMSI})
+    end.
 
 %%====================================================================
 %% Internal: certificate loading

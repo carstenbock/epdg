@@ -287,20 +287,23 @@ v4_same_ip_different_imsi_counts_collision_test() ->
 %%====================================================================
 
 %% The rule priorities of ALL 64 possible instances must stay strictly
-%% between the PGW-U escape rules (900) and the main table (32766):
-%% a priority at or below 900 would shadow the escape rules and
-%% black-hole a co-located PGW-U's uplink; one at or above 32766 would
-%% drop the pool rules behind the main table. The device name and table
-%% id must be the documented derivations, or operators cannot attribute
-%% node state to pods.
-instance_rule_prios_stay_between_escape_and_main_test() ->
+%% between the PGW-U escape rules (20) and the kernel `local' table
+%% lookup (priority 100 on GKE Dataplane V2 / Cilium): a priority at or
+%% below 20 would shadow the escape rules and black-hole a co-located
+%% PGW-U's uplink; one at or above 100 would let the `local' table
+%% intercept UE-pool uplink destined to a node-local passthrough-LB VIP
+%% (e.g. the P-CSCF VIP the SMF hands VoWiFi UEs), delivering the
+%% decrypted REGISTER to `lo' instead of the shared GTP-U datapath. The
+%% device name and table id must be the documented derivations, or
+%% operators cannot attribute node state to pods.
+instance_rule_prios_stay_between_escape_and_local_test() ->
     lists:foreach(
       fun(Id) ->
               {Name, Table, Prio} = epdg_gtpu_forwarder:instance_params(Id),
               ?assertEqual("epdg" ++ integer_to_list(Id), Name),
               ?assertEqual(100 + Id, Table),
-              ?assert(Prio > 900),
-              ?assert(Prio < 32766)
+              ?assert(Prio > 20),
+              ?assert(Prio < 100)
       end, lists:seq(0, 63)).
 
 %% Ids outside the instance space must not derive a datapath at all.

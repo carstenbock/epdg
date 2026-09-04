@@ -11,6 +11,7 @@
          register/3, unregister/1,
          register_initiator/3, lookup_by_initiator/2, unregister_initiator/2,
          register_cteid/2, lookup_by_cteid/1, unregister_cteid/1,
+         register_esp_spis/3, unregister_esp_spis/2, esp_spi_claimed/1,
          lookup_by_spi/1, lookup_by_imsi/1,
          count/0, all/0, broadcast/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -21,6 +22,7 @@
 -define(TAB_IMSI, epdg_imsi_tab).
 -define(TAB_INIT, epdg_initiator_tab).  %% {PeerIP, ISPI} -> Pid (dedup IKE_SA_INIT retransmits)
 -define(TAB_CTEID, epdg_cteid_tab).     %% ePDG local S2b-C TEID -> Pid (route PGW-initiated bearer msgs)
+-define(TAB_ESP, epdg_esp_spi_tab).     %% ESP SPI (in+out) -> Pid (kernel-SA ownership for the XFRM reconciler)
 
 %%====================================================================
 %% API
@@ -88,6 +90,38 @@ unregister_cteid(CTEID) ->
     ets:delete(?TAB_CTEID, CTEID),
     ok.
 
+%% Claim the kernel ESP SA pair (inbound + outbound SPI) for a UE FSM so
+%% the XFRM reconciler can tell live kernel state from orphans. Claimed
+%% BEFORE the SAs are installed and released only after they are deleted
+%% (claim-first / release-last), so the reconciler can never observe an
+%% installed-but-unclaimed SA of a healthy session. The 'DOWN' handler
+%% purges claims of a crashed FSM — its kernel SAs then age past the
+%% reconciler's grace period and are reaped (or re-claimed by the session
+%% restore path first).
+-spec register_esp_spis(non_neg_integer(), non_neg_integer(), pid()) -> ok.
+register_esp_spis(SpiIn, SpiOut, Pid) ->
+    ets:insert(?TAB_ESP, [{SpiIn, Pid}, {SpiOut, Pid}]),
+    ok.
+
+-spec unregister_esp_spis(non_neg_integer(), non_neg_integer()) -> ok.
+unregister_esp_spis(SpiIn, SpiOut) ->
+    ets:delete(?TAB_ESP, SpiIn),
+    ets:delete(?TAB_ESP, SpiOut),
+    ok.
+
+-spec esp_spi_claimed(non_neg_integer()) -> boolean().
+esp_spi_claimed(Spi) ->
+    case ets:lookup(?TAB_ESP, Spi) of
+        [{_, Pid}] ->
+            case is_process_alive(Pid) of
+                true  -> true;
+                false ->
+                    ets:delete(?TAB_ESP, Spi),
+                    false
+            end;
+        [] -> false
+    end.
+
 -spec lookup_by_spi(non_neg_integer()) -> {ok, pid()} | error.
 lookup_by_spi(SPI) ->
     case ets:lookup(?TAB_SPI, SPI) of
@@ -138,6 +172,8 @@ init([]) ->
                         {write_concurrency, true}]),
     ets:new(?TAB_CTEID, [named_table, public, set, {read_concurrency, true},
                          {write_concurrency, true}]),
+    ets:new(?TAB_ESP, [named_table, public, set, {read_concurrency, true},
+                       {write_concurrency, true}]),
     {ok, #{}}.
 
 handle_call({register, SPI, Pid, IMSI}, _From, State) ->
@@ -162,9 +198,10 @@ handle_cast(_Msg, State) ->
     {noreply, State}.
 
 handle_info({'DOWN', _MRef, process, Pid, _Reason}, State) ->
-    %% Purge any C-TEID route for the dead FSM (safety net; the FSM also
-    %% unregisters explicitly in terminate/3).
+    %% Purge any C-TEID route / ESP-SPI claim for the dead FSM (safety
+    %% net; the FSM also unregisters explicitly in terminate/3).
     ets:match_delete(?TAB_CTEID, {'_', Pid}),
+    ets:match_delete(?TAB_ESP, {'_', Pid}),
     case maps:find(Pid, State) of
         {ok, SPI} ->
             do_unregister(SPI, State),
