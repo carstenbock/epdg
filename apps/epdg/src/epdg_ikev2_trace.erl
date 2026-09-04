@@ -44,7 +44,7 @@
 
 -behaviour(gen_server).
 
--export([start_link/0, enabled/0, mirror/1, subscriber_count/0]).
+-export([start_link/0, enabled/0, mirror/1]).
 
 %% Exported for eunit (epdg_ikev2_trace_tests) — pure helpers with no
 %% dependency on the running gen_server.
@@ -123,14 +123,6 @@ start_link() ->
 enabled() ->
     persistent_term:get(?ACTIVE_KEY, false).
 
-%% How many trace subscribers are attached right now. Also exposed as the
-%% `epdg_ike_trace_subscribers' gauge on /metrics.
--spec subscriber_count() -> non_neg_integer().
-subscriber_count() ->
-    try gen_server:call(?SERVER, subscriber_count, 1000)
-    catch _:_ -> 0
-    end.
-
 %% Mirror one IKE message. Event map:
 %%
 %%   dir         := in | out          `in' = UE -> ePDG
@@ -194,8 +186,6 @@ init([]) ->
             end
     end.
 
-handle_call(subscriber_count, _From, #state{subs = Subs} = State) ->
-    {reply, length(Subs), State};
 handle_call(_Req, _From, State) ->
     {reply, {error, unknown_request}, State}.
 
@@ -513,8 +503,26 @@ synth_datagram(SrcIP, SrcPort, DstIP, DstPort, IkeMsg) ->
         true  -> <<0:32, IkeMsg/binary>>;
         false -> IkeMsg
     end,
+    ok = check_renderable(SrcIP, byte_size(Payload)),
     Udp = udp(SrcIP, DstIP, SrcPort, DstPort, Payload),
     ip(SrcIP, DstIP, Udp).
+
+%% The IPv4 total-length, IPv6 payload-length and UDP length fields are all
+%% 16 bits, so a larger datagram cannot be described at all. Erlang would
+%% silently truncate the field modulo 65536 and hand the dissector a frame
+%% whose length disagrees with its contents, which is worse than no frame:
+%% it reads as a genuine capture. Refuse instead — write/3 turns this into
+%% a counted `ike_trace_dropped_total'. Only reachable via RFC 7383
+%% fragmentation, where the mirror sees the reassembled message.
+check_renderable(SrcIP, PayloadLen) ->
+    Overhead = case tuple_size(SrcIP) of
+        4 -> 20 + 8;   %% IPv4 total length spans the IP header too
+        8 -> 8         %% IPv6 payload length starts after the IP header
+    end,
+    case PayloadLen + Overhead > 16#FFFF of
+        true  -> error({ike_message_too_large, PayloadLen});
+        false -> ok
+    end.
 
 udp(SrcIP, DstIP, SrcPort, DstPort, Payload) ->
     Len = 8 + byte_size(Payload),

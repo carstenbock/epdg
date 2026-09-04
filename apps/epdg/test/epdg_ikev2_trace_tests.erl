@@ -231,6 +231,38 @@ synth_ipv6_headers_are_consistent_test() ->
     {500, 500, Payload} = parse_udp(SA, DA, Udp),
     ?assertEqual(Ike, Payload).
 
+%% A message too large for the 16-bit length fields must be refused, not
+%% rendered. Truncating the field modulo 65536 would emit a frame that
+%% looks like a real capture but whose declared length disagrees with its
+%% contents — a silently misleading trace is worse than a missing one, and
+%% write/3 accounts the refusal as a drop.
+synth_refuses_message_too_large_for_length_field_test() ->
+    TooBig = binary:copy(<<0>>, 16#FFFF - 27),
+    ?assertError({ike_message_too_large, _},
+                 epdg_ikev2_trace:synth_datagram({10, 20, 30, 40}, 500,
+                                                 {192, 0, 2, 1}, 500, TooBig)),
+    %% One byte under the IPv4 limit (20 IP + 8 UDP) still renders, so the
+    %% bound is off-by-one-proof rather than merely conservative.
+    Largest = binary:copy(<<0>>, 16#FFFF - 28),
+    Pkt = epdg_ikev2_trace:synth_datagram({10, 20, 30, 40}, 500,
+                                          {192, 0, 2, 1}, 500, Largest),
+    ?assertEqual(16#FFFF, byte_size(Pkt)),
+    {SA, DA, Udp} = parse_ipv4(Pkt),
+    {500, 500, Payload} = parse_udp(SA, DA, Udp),
+    ?assertEqual(Largest, Payload).
+
+%% IPv6 carries the same 16-bit ceiling, but its length field excludes the
+%% 40-byte header, so the usable payload is 20 bytes larger than on IPv4.
+synth_ipv6_length_ceiling_excludes_the_header_test() ->
+    Src = {16#2001, 16#db8, 0, 0, 0, 0, 0, 1},
+    Dst = {16#2001, 16#db8, 0, 0, 0, 0, 0, 2},
+    Largest = binary:copy(<<0>>, 16#FFFF - 8),
+    Pkt = epdg_ikev2_trace:synth_datagram(Src, 500, Dst, 500, Largest),
+    ?assertEqual(40 + 16#FFFF, byte_size(Pkt)),
+    ?assertError({ike_message_too_large, _},
+                 epdg_ikev2_trace:synth_datagram(
+                   Src, 500, Dst, 500, binary:copy(<<0>>, 16#FFFF - 7))).
+
 %%====================================================================
 %% ike_bytes/1
 %%====================================================================

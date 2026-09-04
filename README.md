@@ -206,7 +206,7 @@ Empty/unset values fall back to the defaults below.
 |----------|---------|---------|
 | `EPDG_IKE_TRACE_ENABLE` | `false` | Mirror every IKE control message **decrypted** as a pcapng stream. Off by default |
 | `EPDG_IKE_TRACE_PORT` | `19500` | TCP port subscribers connect to for the pcapng stream |
-| `EPDG_IKE_TRACE_BIND_ADDR` | `127.0.0.1` | Bind address. **Keep this on loopback** — see the warning below |
+| `EPDG_IKE_TRACE_BIND_ADDR` | `127.0.0.1` | Bind address. **Keep this on loopback** — the stream is unauthenticated, see [What it exposes](#what-it-exposes) |
 | `EPDG_IKE_TRACE_LOCAL_ADDR` | _(`EPDG_IKE_BIND_ADDR`)_ | Comma-separated addresses rendered as the ePDG side of the synthetic datagrams, e.g. `192.0.2.1,2001:db8::1`. Cosmetic, but a **list**: one address cannot label both families, so the mirror picks the first entry matching each peer's family. With nothing configured for a family that peer is rendered against `0.0.0.0` / `::`. Unparseable entries are dropped with a warning rather than failing the boot |
 
 ### Dead Peer Detection (RFC 7296 §2.4)
@@ -389,6 +389,27 @@ Each IKE message becomes one Enhanced Packet Block:
   ```
 
   Keys with no value yet are omitted rather than emitted as `null`. Every document carries `ike_spi_pair`, so an IKE_SA_INIT — which happens before any IMSI is known — can still be joined to the IKE_AUTH that names the subscriber.
+
+### What it exposes
+
+**The stream is unauthenticated.** There is no handshake, token or TLS: anything that can open `EPDG_IKE_TRACE_PORT` receives every mirrored message for every subscriber. Treat reachability to that port as equivalent to read access to the signalling plane.
+
+A subscriber sees the decrypted IKE control messages — the IDi (an IMSI-derived NAI), the EAP-AKA' round trip, and the `CFG` payloads carrying the UE's inner addresses and the P-CSCF list — plus the `opt_comment` JSON, which names the IMSI, NAI, APN and SWm session id outright.
+
+It does **not** carry key material or user plane:
+
+* Diffie-Hellman private values and the derived `SK_*` keys never leave `epdg_ikev2_crypto`. The mirror only ever receives a decoded header plus already-decrypted payloads, so there is nothing to export. The KE payload visible in IKE_SA_INIT is the public value.
+* ESP is not mirrored, so no SIP or RTP appears. A captured trace cannot be used to decrypt user traffic or to replay a session.
+
+That bounds the damage but does not remove it: the trace is still subscriber-identifying data, and warrants the same handling as an interface capture on SWu (TS 33.402).
+
+So: the mirror is off unless `EPDG_IKE_TRACE_ENABLE=1`, and `EPDG_IKE_TRACE_BIND_ADDR` defaults to `127.0.0.1`. Keep it on loopback and reach the port *through* the pod rather than widening the bind — a forwarded port or an SSH pipe costs nothing and keeps the listener unreachable from the network:
+
+```bash
+ssh epdg.example.org nc 127.0.0.1 19500 > ike.pcapng
+```
+
+If a deployment genuinely has to bind wider, restrict the port to the specific collector with a NetworkPolicy. Enable tracing for a debugging session and turn it off again afterwards; it is not meant to be left on in production.
 
 ---
 
