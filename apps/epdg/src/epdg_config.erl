@@ -125,6 +125,11 @@ init() ->
     set_dra_hosts(),
     set_from_env_int("DRA_PORT", dra_port, 3868),
     set_from_env("DRA_TRANSPORT", dra_transport, "tcp"),
+    %% Local address for the SCTP connect transport toward the DRA.
+    %% With hostNetwork, a wildcard bind advertises every host address
+    %% in the INIT (RFC 4960 §5.1.2), including floating IPs that also
+    %% exist on other nodes; DRA heartbeats to those get ABORTed there.
+    set_from_env("POD_IP", dra_local_addr, ""),
     set_from_env_int("EPDG_DIAMETER_PORT", diameter_port, 3868),
     %% Destination realm for routed SWm DERs (AAA realm, not DRA realm).
     %% Falls back to our Origin-Realm so single-realm deployments work

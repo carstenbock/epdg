@@ -681,7 +681,7 @@ try_connect_host(Host, #state{dra_port = DRAPort, transport_mod = TransMod,
                 {transport_module, TransMod},
                 {transport_config, [{raddr, DRAIP},
                                     {rport, DRAPort},
-                                    {ip, {0,0,0,0}}]},
+                                    {ip, connect_local_ip(TransMod)}]},
                 {reconnect_timer, 5000},
                 {capabilities,
                     [{'Auth-Application-Id', [?SWM_APP_ID]}]}
@@ -750,6 +750,14 @@ retry_delay(Retries) ->
 transport_module("sctp") -> diameter_sctp;
 transport_module("tcp")  -> diameter_tcp;
 transport_module(_)      -> diameter_tcp.
+
+connect_local_ip(diameter_sctp) ->
+    case inet:parse_ipv4_address(epdg_config:get(dra_local_addr, "")) of
+        {ok, IP} -> IP;
+        {error, _} -> {0,0,0,0}
+    end;
+connect_local_ip(_) ->
+    {0,0,0,0}.
 
 resolve_host(Host) ->
     case inet:getaddr(Host, inet) of
