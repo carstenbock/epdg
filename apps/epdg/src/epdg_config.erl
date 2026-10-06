@@ -6,7 +6,7 @@
 
 -export([init/0, get/1, get/2, parse_gtpc_mode/1, parse_ue_ip_pools/1,
          parse_instance_id/2, parse_legacy_dh_groups/1, parse_bool/2,
-         parse_trace_local_addrs/1]).
+         parse_trace_local_addrs/1, default_ike_id_fqdn/0]).
 
 %% ?UE6_PREFIX_LEN: floor for UE IPv6 pool widths (check_v6_pool_width/3).
 -include("epdg_ipv6.hrl").
@@ -517,7 +517,9 @@ default_redis_prefix() ->
     end,
     "epdg:" ++ Pod.
 
-%% Default IDr FQDN per TS 23.003 §19.4.2.4: epdg.epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org.
+%% Default IDr FQDN: the Operator Identifier based ePDG FQDN the UE resolves
+%% and checks the certificate against (TS 23.003 §19.4.2.9.2):
+%% epdg.epc.mnc<MNC>.mcc<MCC>.pub.3gppnetwork.org.
 default_ike_id_fqdn() ->
     MCC = os:getenv("MCC", "001"),
     MNC = os:getenv("MNC", "01"),
@@ -525,4 +527,4 @@ default_ike_id_fqdn() ->
         2 -> "0" ++ MNC;
         _ -> MNC
     end,
-    "epdg.epc.mnc" ++ MNC3 ++ ".mcc" ++ MCC ++ ".3gppnetwork.org".
+    "epdg.epc.mnc" ++ MNC3 ++ ".mcc" ++ MCC ++ ".pub.3gppnetwork.org".

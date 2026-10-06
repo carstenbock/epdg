@@ -189,3 +189,15 @@ trace_local_addrs_drops_garbage_without_raising_test() ->
     ?assertEqual([{192, 0, 2, 1}],
                  epdg_config:parse_trace_local_addrs("nonsense,192.0.2.1")),
     ?assertEqual([], epdg_config:parse_trace_local_addrs("nonsense")).
+
+%% The UE resolves epdg.epc.mnc<MNC>.mcc<MCC>.pub.3gppnetwork.org and checks
+%% the ePDG certificate against that name (TS 23.003 §19.4.2.9.2), so the
+%% default IDr must carry the ".pub" label or certificate validation fails.
+
+ike_id_fqdn_defaults_to_public_epdg_fqdn_test() ->
+    os:putenv("MCC", "262"),
+    os:putenv("MNC", "24"),
+    ?assertEqual("epdg.epc.mnc024.mcc262.pub.3gppnetwork.org",
+                 epdg_config:default_ike_id_fqdn()),
+    os:unsetenv("MCC"),
+    os:unsetenv("MNC").
