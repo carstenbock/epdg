@@ -151,7 +151,7 @@ code_change(_OldVsn, State, _Extra) ->
 %% Internal
 %%====================================================================
 
-handle_ikev2_packet(Data, FromIP, FromPort, _RecvPort) ->
+handle_ikev2_packet(Data, FromIP, FromPort, RecvPort) ->
     case epdg_ikev2_codec:decode_header(Data) of
         {ok, #{initiator_spi := ISPI, responder_spi := RSPI,
                exchange_type := ExType} = Header0} ->
@@ -160,7 +160,11 @@ handle_ikev2_packet(Data, FromIP, FromPort, _RecvPort) ->
             %% Carry the UDP source address in the decoded header so the UE
             %% FSM can detect a MOBIKE address change (RFC 4555) without a
             %% wider signature change to the {ikev2, ...} cast.
-            Header = Header0#{from_ip => FromIP, from_port => FromPort},
+            %% local_port is the listener port the datagram arrived on: the
+            %% IKE_SA_INIT response has to leave from that same port
+            %% (RFC 7296 §2.11), see epdg_ue_fsm:sa_init_reply_port/1.
+            Header = Header0#{from_ip => FromIP, from_port => FromPort,
+                              local_port => RecvPort},
             dispatch(ISPI, RSPI, Header, Data, FromIP, FromPort);
         {error, Reason} ->
             Prefix = case Data of

@@ -21,6 +21,7 @@
          build_first_auth_chain/3, eap_only_selected/2,
          classify_register_ue_result/1,
          build_notify_response/4, process_sa_init_payloads/1,
+         sa_init_reply_port/1,
          format_proposal_notice/3,
          %% IPv6 PDN: inner selectors, CFG_REPLY contents, handover PAA
          ue6_selector/1, ip6_mask/2, build_cfg_reply/1,
@@ -402,7 +403,7 @@ ike_sa_init(cast, {ikev2, #{exchange_type := ike_auth} = Header, RawData, FromPo
 
 %% IKE_SA_INIT retransmit from the initiator: re-send our cached response bytes
 %% (RFC 7296 §2.1 - responder MUST retransmit the same response, not regenerate).
-ike_sa_init(cast, {ikev2, #{exchange_type := ike_sa_init}, _RawData, FromPort},
+ike_sa_init(cast, {ikev2, #{exchange_type := ike_sa_init} = Header, _RawData, FromPort},
             #data{peer_ip = PeerIP,
                   ike_sa_init_resp = Resp} = Data0)
   when is_binary(Resp), byte_size(Resp) > 0 ->
@@ -410,7 +411,7 @@ ike_sa_init(cast, {ikev2, #{exchange_type := ike_sa_init}, _RawData, FromPort},
     #data{peer_port = PeerPort} = Data,
     logger:info("IKE_SA_INIT retransmit detected, re-sending cached response "
                 "(~p bytes) to ~p:~p", [byte_size(Resp), PeerIP, PeerPort]),
-    catch epdg_ikev2_listener:send(PeerIP, PeerPort, 500, Resp),
+    catch epdg_ikev2_listener:send(PeerIP, PeerPort, sa_init_reply_port(Header), Resp),
     {keep_state, Data};
 
 ike_sa_init(cast, {ikev2, _, _, _}, Data) ->
@@ -783,10 +784,11 @@ pgw_u_fteid_parts(_) -> {0, {0, 0, 0, 0}}.
 
 handle_ike_sa_init_request(#{initiator_spi := ISPI, next_payload := NextPL,
                               payload_data := PayloadBin,
-                              message_id   := MsgId} = _Header,
+                              message_id   := MsgId} = Header,
                             _RawData,
                             #data{responder_spi = RSPI,
                                   peer_ip = PeerIP, peer_port = PeerPort} = Data) ->
+    LocalPort = sa_init_reply_port(Header),
     case epdg_ikev2_codec:decode_payloads(NextPL, PayloadBin) of
         {ok, Payloads} ->
             %% RFC 5685 §4: the UE advertises N(REDIRECT_SUPPORTED) in the
@@ -806,17 +808,17 @@ handle_ike_sa_init_request(#{initiator_spi := ISPI, next_payload := NextPL,
             case process_sa_init_payloads(Payloads) of
                 {ok, Parsed} ->
                     log_key_length_defaulted(Parsed, PeerIP, PeerPort),
-                    send_sa_init_response(ISPI, MsgId, Parsed, Data1);
+                    send_sa_init_response(ISPI, MsgId, Parsed, LocalPort, Data1);
                 {error, Reason} ->
                     logger:warning("IKE_SA_INIT from ~p:~p rejected: ~p "
                                    "(ISPI=~.16B RSPI=~.16B)",
                                    [PeerIP, PeerPort, Reason, ISPI, RSPI]),
-                    send_notify_and_stop(ISPI, MsgId, Reason, Data)
+                    send_notify_and_stop(ISPI, MsgId, Reason, LocalPort, Data)
             end;
         {error, DecodeErr} ->
             logger:warning("IKE_SA_INIT from ~p:~p payload decode error: ~p",
                            [PeerIP, PeerPort, DecodeErr]),
-            send_notify_and_stop(ISPI, MsgId, invalid_syntax, Data)
+            send_notify_and_stop(ISPI, MsgId, invalid_syntax, LocalPort, Data)
     end.
 
 %% The selected ENCR transform carries key_length_defaulted when the
@@ -964,6 +966,7 @@ with_nonce(Suite, PeerPub, Payloads) ->
 %% preferred.
 send_sa_init_response(ISPI, MsgId,
                        #{suite := Suite, peer_dh_pub := PeerPub, nonce_i := NonceI},
+                       LocalPort,
                        #data{responder_spi = RSPI, peer_ip = PeerIP,
                              peer_port = PeerPort, cert_der = CertDer} = Data) ->
     #{dh := #{id := DHGroupId}} = Suite,
@@ -1002,7 +1005,7 @@ send_sa_init_response(ISPI, MsgId,
     %% swapped — correct now.
     OurIpBin = ip_bytes(local_hash_ip()),
     UeIpBin  = ip_bytes(PeerIP),
-    OurPort  = 500,
+    OurPort  = LocalPort,
     UePort   = PeerPort,
     NatSourceHash =
         crypto:hash(sha, <<ISPI:64, RSPI:64, OurIpBin/binary, OurPort:16>>),
@@ -1035,7 +1038,7 @@ send_sa_init_response(ISPI, MsgId,
           message_id        => MsgId,
           payload_bin       => PayloadBin}),
 
-    case epdg_ikev2_listener:send(PeerIP, PeerPort, 500, RespBytes) of
+    case epdg_ikev2_listener:send(PeerIP, PeerPort, LocalPort, RespBytes) of
         ok -> ok;
         {error, SendErr} ->
             logger:warning("Failed to send IKE_SA_INIT response to ~p:~p: ~p",
@@ -1061,12 +1064,25 @@ send_sa_init_response(ISPI, MsgId,
     {next_state, ike_sa_init, NewData}.
 
 %% Send a NOTIFY response and terminate cleanly — avoids log-noisy crash reports.
-send_notify_and_stop(ISPI, MsgId, Reason,
+send_notify_and_stop(ISPI, MsgId, Reason, LocalPort,
                       #data{responder_spi = RSPI, peer_ip = PeerIP,
                             peer_port = PeerPort} = Data) ->
     RespBytes = build_notify_response(ISPI, RSPI, MsgId, Reason),
-    catch epdg_ikev2_listener:send(PeerIP, PeerPort, 500, RespBytes),
+    catch epdg_ikev2_listener:send(PeerIP, PeerPort, LocalPort, RespBytes),
     {stop, normal, Data}.
+
+%% Local port an IKE_SA_INIT response is sent from: the one the request
+%% arrived on. RFC 7296 §2.11 requires the response to come from the address
+%% and port the request was sent to, and §2.23 lets an initiator use UDP/4500
+%% from its very first message. Answering such a request from 500 (as this
+%% code used to, unconditionally) sends a datagram the UE's NAT has no
+%% mapping for, so the UE never sees it and retransmits until it gives up.
+%% The peer's source port says nothing here: a NAT'd UE sends IKE_SA_INIT to
+%% 500 from an arbitrary port. Headers without local_port (tests, callers
+%% that predate it) keep the classic port.
+-spec sa_init_reply_port(map()) -> 500 | 4500.
+sa_init_reply_port(#{local_port := 4500}) -> 4500;
+sa_init_reply_port(_Header)               -> 500.
 
 %% Build the unprotected IKE_SA_INIT error response for a rejection reason.
 %% For INVALID_KE_PAYLOAD the responder has not committed to an IKE SA
