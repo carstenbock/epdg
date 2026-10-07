@@ -32,7 +32,11 @@ xfrm_cmd_test_() ->
       fun sa_add_algorithm_names_survive_the_shell/1,
       fun sa_add_auth_trunc_length_follows_algorithm/1,
       fun sa_add_encap_ports_follow_direction/1,
-      fun policy_add_uses_update_not_add/1]}.
+      fun policy_add_uses_update_not_add/1,
+      fun without_interface_nothing_is_scoped/1,
+      fun sa_and_policies_are_scoped_to_the_interface/1,
+      fun outbound_policy_routes_node_traffic_into_the_interface/1,
+      fun other_mode_delete_addresses_the_other_scope/1]}.
 
 setup() ->
     Base = case os:getenv("TMPDIR") of false -> "/tmp"; T -> T end,
@@ -127,6 +131,95 @@ policy_add_uses_update_not_add(Ctx) ->
     [?_assert(has_seq(Argv, ["policy", "update"])),
      ?_assert(has_seq(Argv, ["dir", "in"])),
      ?_assert(has_seq(Argv, ["reqid", integer_to_list(?REQID)]))].
+
+%% --- XFRM interface scoping -----------------------------------------
+%%
+%% On a node shared with the IMS IPsec gateway the kernel has ONE policy
+%% table for both. Unscoped, our "any -> UE" policy and the gateway's
+%% per-port IMS policies fight over the same packets and a co-located UE
+%% cannot complete a protected IMS registration (TS 33.203): depending on
+%% who ranks first, replies leave without the IMS ESP layer or requests
+%% fail the gateway's template check. An if_id takes our state out of that
+%% contest -- but only if EVERY SA and policy carries it, and only if the
+%% node's own traffic to the UE is routed into the interface.
+
+-define(XFRM_IF, #{id => 16#45500000, name => "epdgx0",
+                   downlink_table => 300, local_table => 400}).
+
+with_xfrm_if(Fun) ->
+    application:set_env(epdg, xfrm_if, ?XFRM_IF),
+    application:set_env(epdg, xfrm_if_params, ?XFRM_IF),
+    try Fun() after
+        application:unset_env(epdg, xfrm_if),
+        application:unset_env(epdg, xfrm_if_params)
+    end.
+
+ue_policy(Dir) ->
+    {Src, Dst, TS, TD} = case Dir of
+        out -> {"0.0.0.0/0", "10.46.0.60/32", ?EPDG_OUTER, ?UE_OUTER};
+        _   -> {"10.46.0.60/32", "0.0.0.0/0", ?UE_OUTER, ?EPDG_OUTER}
+    end,
+    #{src => Src, dst => Dst, direction => Dir,
+      tmpl_src => TS, tmpl_dst => TD, reqid => ?REQID}.
+
+%% The fallback (no xfrm_interface in the kernel, or switched off) must be
+%% exactly the pre-interface behaviour: one command, no if_id, no route.
+without_interface_nothing_is_scoped(Ctx) ->
+    ok = epdg_xfrm:create_sa(base_sa()),
+    ok = epdg_xfrm:create_policy(ue_policy(out)),
+    ok = epdg_xfrm:delete_policy(ue_policy(out)),
+    All = invocations(Ctx),
+    [?_assertEqual(3, length(All)),
+     ?_assertNot(lists:any(fun(A) -> lists:member("if_id", A) end, All)),
+     ?_assertNot(lists:any(fun(A) -> lists:member("route", A) end, All))].
+
+sa_and_policies_are_scoped_to_the_interface(Ctx) ->
+    with_xfrm_if(fun() ->
+        ok = epdg_xfrm:create_sa(base_sa()),
+        ok = epdg_xfrm:create_policy(ue_policy(in)),
+        ok = epdg_xfrm:create_policy(ue_policy(fwd)),
+        ok = epdg_xfrm:delete_policy(ue_policy(in))
+    end),
+    IfId = integer_to_list(16#45500000),
+    All = invocations(Ctx),
+    %% in/fwd: no route, so exactly one command each.
+    [?_assertEqual(4, length(All))
+     | [?_assert(has_seq(A, ["if_id", IfId])) || A <- All]].
+
+%% The reply of a co-located P-CSCF is the node's own traffic. Unless it is
+%% routed into the interface, no policy of ours sees it any more and it
+%% never enters the UE's tunnel.
+outbound_policy_routes_node_traffic_into_the_interface(Ctx) ->
+    with_xfrm_if(fun() ->
+        ok = epdg_xfrm:create_policy(ue_policy(out)),
+        ok = epdg_xfrm:create_policy((ue_policy(out))#{src => "::/0",
+                                                       dst => "cafe:0:46:1::/64"}),
+        ok = epdg_xfrm:delete_policy(ue_policy(out))
+    end),
+    [Pol4, Route4, _Pol6, Route6, RouteDel, PolDel] = invocations(Ctx),
+    [?_assert(has_seq(Pol4, ["policy", "update"])),
+     ?_assertEqual(["route", "replace", "10.46.0.60/32", "dev", "epdgx0",
+                    "table", "400"], Route4),
+     ?_assertEqual(["-6", "route", "replace", "cafe:0:46:1::/64", "dev",
+                    "epdgx0", "table", "400"], Route6),
+     ?_assertEqual(["route", "del", "10.46.0.60/32", "dev", "epdgx0",
+                    "table", "400"], RouteDel),
+     ?_assert(has_seq(PolDel, ["policy", "delete"]))].
+
+%% After a release (or a config switch) changed the mode, the policies of
+%% restored sessions still sit in the old scope, where they keep capturing
+%% traffic. Deleting them needs the OTHER scope's identity: an if_id-less
+%% delete does not find a scoped policy and vice versa.
+other_mode_delete_addresses_the_other_scope(Ctx) ->
+    with_xfrm_if(fun() ->
+        ok = epdg_xfrm:delete_policy((ue_policy(in))#{other_mode => true})
+    end),
+    application:set_env(epdg, xfrm_if_params, ?XFRM_IF),
+    ok = epdg_xfrm:delete_policy((ue_policy(in))#{other_mode => true}),
+    application:unset_env(epdg, xfrm_if_params),
+    [WeAreScoped, WeAreUnscoped] = invocations(Ctx),
+    [?_assertNot(lists:member("if_id", WeAreScoped)),
+     ?_assert(has_seq(WeAreUnscoped, ["if_id", integer_to_list(16#45500000)]))].
 
 %%====================================================================
 %% Helpers

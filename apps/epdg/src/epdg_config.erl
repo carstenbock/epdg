@@ -65,6 +65,14 @@ init() ->
     %% XFRM / IPsec
     set_from_env("EPDG_IPSEC_OFFLOAD", ipsec_offload, "auto"),
     set_from_env("EPDG_IPSEC_IFACE", ipsec_iface, "eth0"),
+    %% Bind the per-UE SAs and policies to an XFRM interface (see
+    %% epdg_gtpu_forwarder:setup_xfrm_if/5). "false" keeps them in the
+    %% node's global policy table, as all releases up to 0.0.91 did.
+    set_from_env("EPDG_XFRM_INTERFACE", xfrm_interface, "true"),
+    %% MTU of that interface: the largest inner packet that goes into one
+    %% ESP packet. Must leave room for the tunnel overhead (up to ~90 bytes
+    %% with NAT-T) below the smallest MTU on the way to the UE.
+    set_from_env_int("EPDG_TUNNEL_MTU", tunnel_mtu, 1300),
 
     %% XFRM kernel-state reconciliation (epdg_xfrm_reconciler): sweep
     %% every INTERVAL seconds, delete kernel SAs/policies that stayed

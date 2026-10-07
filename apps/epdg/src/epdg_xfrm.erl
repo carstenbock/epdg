@@ -12,13 +12,18 @@
          create_sa/1, delete_sa/1, flush_sa_endpoint/1,
          create_policy/1, delete_policy/1,
          get_offload_mode/0, flush_all/0,
-         list_sas/0, list_policies/0]).
+         list_sas/1, list_policies/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 %% Pure `ip xfrm ... list` output parsers, exported for the EUnit suite
 %% (epdg_xfrm_list_tests) and for callers that capture the output
 %% themselves.
 -export([parse_state_list/1, parse_policy_list/1]).
+-ifdef(TEST).
+%% The policy pipeline itself, so the EUnit suite (epdg_xfrm_scope_tests) can
+%% measure what it lets through to the BEAM.
+-export([policy_list_cmd/1]).
+-endif.
 
 -define(SERVER, ?MODULE).
 
@@ -65,27 +70,48 @@ get_offload_mode() ->
 flush_all() ->
     gen_server:call(?SERVER, flush_all).
 
-%% Inventory of the kernel's ESP SAs: one map per SA with the OUTER
-%% endpoints, SPI and reqid. Used by epdg_xfrm_reconciler to find
-%% orphaned states (no live UE FSM claims the SPI) and by the session
-%% restore path to decide adopt-vs-reinstall after a pod restart.
-%% Goes through the gen_server so reads serialise with mutations.
--spec list_sas() -> [#{src := inet:ip_address(), dst := inet:ip_address(),
-                       spi := non_neg_integer(), reqid := non_neg_integer()}].
-list_sas() ->
-    gen_server:call(?SERVER, list_sas).
+%% Inventory of the kernel's ESP SAs that have LocalIP as an OUTER
+%% endpoint: one map per SA with the outer endpoints, SPI and reqid. Used
+%% by epdg_xfrm_reconciler to find orphaned states (no live UE FSM claims
+%% the SPI) and by the session restore path to decide adopt-vs-reinstall
+%% after a pod restart.
+%%
+%% Never dump the whole SAD: on a hostNetwork node the ePDG shares the
+%% kernel with the IMS IPsec gateway, whose SAs outnumber ours by orders of
+%% magnitude. An unscoped `ip xfrm state list' read into the BEAM as an
+%% Erlang string (16 bytes per character) OOM-killed the ePDG in a loop
+%% once the gateway held ~39,000 SAs. `src'/`dst' are sent to the kernel as
+%% XFRMA_ADDRESS_FILTER, so foreign SAs are not even copied to user space.
+%%
+%% Runs in the calling process, not in the gen_server: a dump must never
+%% stall SA/policy installation for attaching UEs. Callers tolerate the
+%% resulting races (reconciler: grace period + claim-first ordering;
+%% restore: runs before the IKE listener is up).
+-spec list_sas(inet:ip_address()) ->
+          [#{src := inet:ip_address(), dst := inet:ip_address(),
+             spi := non_neg_integer(), reqid := non_neg_integer()}].
+list_sas(LocalIP) ->
+    lists:usort(lists:append(
+        [parse_state_list(os:cmd(Cmd)) || Cmd <- state_list_cmds(LocalIP)])).
 
-%% Inventory of the kernel's XFRM policies: selector src/dst (CIDR
-%% strings, exactly as `ip xfrm policy' prints them so delete_policy/1
-%% round-trips), direction, and the first template's outer endpoints +
-%% reqid. Socket policies are skipped.
--spec list_policies() -> [#{src := string(), dst := string(),
-                            dir := in | out | fwd,
-                            tmpl_src := inet:ip_address() | undefined,
-                            tmpl_dst := inet:ip_address() | undefined,
-                            reqid := non_neg_integer()}].
-list_policies() ->
-    gen_server:call(?SERVER, list_policies).
+%% Inventory of the XFRM policies whose first template has LocalIP as an
+%% outer endpoint: selector src/dst (CIDR strings, exactly as `ip xfrm
+%% policy' prints them so delete_policy/1 round-trips), direction, and the
+%% first template's outer endpoints + reqid.
+%%
+%% The kernel has no dump filter for policies and iproute2 cannot select by
+%% template, so the dump is piped through awk and only matching blocks reach
+%% the BEAM: memory is bounded by our own policies, the pipe throttles `ip'.
+%% The CPU cost of the dump itself still grows with the host's SPD. Like
+%% list_sas/1 this runs in the calling process.
+-spec list_policies(inet:ip_address()) ->
+          [#{src := string(), dst := string(),
+             dir := in | out | fwd,
+             tmpl_src := inet:ip_address() | undefined,
+             tmpl_dst := inet:ip_address() | undefined,
+             reqid := non_neg_integer()}].
+list_policies(LocalIP) ->
+    parse_policy_list(os:cmd(policy_list_cmd(LocalIP))).
 
 %%====================================================================
 %% gen_server callbacks
@@ -122,12 +148,6 @@ handle_call(flush_all, _From, State) ->
     os:cmd("ip xfrm state flush 2>/dev/null"),
     os:cmd("ip xfrm policy flush 2>/dev/null"),
     {reply, ok, State};
-handle_call(list_sas, _From, State) ->
-    Out = os:cmd("ip xfrm state list 2>/dev/null"),
-    {reply, parse_state_list(Out), State};
-handle_call(list_policies, _From, State) ->
-    Out = os:cmd("ip xfrm policy list 2>/dev/null"),
-    {reply, parse_policy_list(Out), State};
 handle_call(_Req, _From, State) ->
     {reply, {error, unknown}, State}.
 
@@ -230,9 +250,10 @@ do_create_sa(#{spi := SPI, src_ip := Src, dst_ip := Dst,
     %% not the SA. strongSwan sets the same flag unconditionally.
     Cmd = io_lib:format(
         "ip xfrm state add src ~s dst ~s proto esp spi 0x~.16B~s~s "
-        "enc '~s' 0x~s~s~s mode tunnel flag af-unspec",
+        "enc '~s' 0x~s~s~s mode tunnel flag af-unspec~s",
         [ip_str(Src), ip_str(Dst), SPI, ReqidPart, EsnPart,
-         enc_alg_str(EncAlg), bin2hex(EncKey), AuthPart, EncapPart]),
+         enc_alg_str(EncAlg), bin2hex(EncKey), AuthPart, EncapPart,
+         if_id_part(xfrm_if())]),
 
     OffloadPart = case Offload of
         inline -> io_lib:format(" offload packet dev ~s", [Iface]);
@@ -286,6 +307,17 @@ do_flush_sa_endpoint(_) ->
 %% Policy management
 %%====================================================================
 
+%% Priority: left at the kernel default (0) on purpose. On a node shared with
+%% the IMS IPsec gateway (hostNetwork) the kernel applies one policy per
+%% packet, and these per-UE policies overlap with the gateway's per-port IMS
+%% policies (OpenSIPS proto_ipsec, priority 1024). Ahead of them (0), P-CSCF
+%% replies to a co-located VoWiFi UE enter the SWu tunnel without the IMS ESP
+%% layer. Behind them (2048, tried in 0.0.88/0.0.89) the reply is protected,
+%% but the UE's protected requests are dropped instead: they arrive with the
+%% tunnel SA in their secpath, the gateway's inbound policy wins and its
+%% single transport-mode template rejects that (XfrmInTmplMismatch). A
+%% priority cannot fix both directions; what does is taking these policies
+%% out of the shared table ("XFRM interface scoping" below).
 do_create_policy(#{src := Src, dst := Dst, direction := Dir,
                    tmpl_src := TSrc, tmpl_dst := TDst} = Params) ->
     %% `update` (create-or-replace), not `add` (create-exclusive): a UE
@@ -295,21 +327,125 @@ do_create_policy(#{src := Src, dst := Dst, direction := Dir,
     %% reqid, which black-holed the downlink. The reqid pins the template
     %% to this UE's SA pair (see do_create_sa/2).
     Reqid = maps:get(reqid, Params, 0),
+    If = xfrm_if(),
     Cmd = io_lib:format(
-        "ip xfrm policy update src ~s dst ~s dir ~s "
+        "ip xfrm policy update src ~s dst ~s dir ~s~s "
         "tmpl src ~s dst ~s proto esp reqid ~B mode tunnel",
-        [Src, Dst, dir_str(Dir), ip_str(TSrc), ip_str(TDst), Reqid]),
-    run_cmd(lists:flatten(Cmd));
+        [Src, Dst, dir_str(Dir), if_id_part(If),
+         ip_str(TSrc), ip_str(TDst), Reqid]),
+    case run_cmd(lists:flatten(Cmd)) of
+        ok -> local_route(replace, Dir, Dst, If);
+        E  -> E
+    end;
 do_create_policy(_) ->
     {error, invalid_params}.
 
-do_delete_policy(#{src := Src, dst := Dst, direction := Dir}) ->
+do_delete_policy(#{src := Src, dst := Dst, direction := Dir} = Params) ->
+    OtherMode = maps:get(other_mode, Params, false),
+    If = case OtherMode of
+        false -> xfrm_if();
+        true  -> other_mode_if()
+    end,
     Cmd = io_lib:format(
-        "ip xfrm policy delete src ~s dst ~s dir ~s",
-        [Src, Dst, dir_str(Dir)]),
-    run_cmd(lists:flatten(Cmd));
+        "ip xfrm policy delete src ~s dst ~s dir ~s~s",
+        [Src, Dst, dir_str(Dir), if_id_part(If)]),
+    _ = local_route(del, Dir, Dst, If),
+    case run_cmd(lists:flatten(Cmd)) of
+        ok ->
+            ok;
+        Error when OtherMode ->
+            Error;
+        Error ->
+            %% Not in our scope: it may be one a previous incarnation left
+            %% in the other (found by the reconciler as an orphan, which
+            %% knows selectors, not scopes). Left alone it keeps capturing
+            %% that UE address's traffic.
+            case do_delete_policy(Params#{other_mode => true}) of
+                ok -> ok;
+                _  -> Error
+            end
+    end;
 do_delete_policy(_) ->
     {error, invalid_params}.
+
+%%====================================================================
+%% XFRM interface scoping
+%%====================================================================
+%%
+%% Without an if_id our per-UE policies ("UE inner address <-> any") live
+%% in the node's global policy table. The kernel applies exactly one policy
+%% to a packet, so on a hostNetwork node shared with the IMS IPsec gateway
+%% they compete with the gateway's per-port IMS policies (TS 33.203):
+%% whichever ranks first, one direction of a co-located UE's protected SIP
+%% breaks (replies leave without the IMS ESP layer, or requests fail the
+%% gateway's inbound template check).
+%%
+%% With an if_id, a policy only applies to traffic routed through the XFRM
+%% interface of that id, and inbound to traffic that came out of an SA of
+%% that id. The gateway's policies then see exactly what they would see
+%% without an ePDG on the node, and the two ESP layers nest: the IMS
+%% transform runs on the packet first, the route into the interface adds
+%% the tunnel.
+
+%% The interface of this instance, #{id, name, local_table}, or undefined
+%% when the forwarder could not set one up (or it is switched off).
+xfrm_if() ->
+    case epdg_config:get(xfrm_if, undefined) of
+        #{id := Id} = If when is_integer(Id), Id > 0 -> If;
+        _ -> undefined
+    end.
+
+%% What the other mode would have used: the instance's interface when we
+%% run without one, none when we run with it. Only for removing policies a
+%% previous incarnation installed before the mode changed.
+other_mode_if() ->
+    case xfrm_if() of
+        undefined -> epdg_config:get(xfrm_if_params, undefined);
+        _         -> undefined
+    end.
+
+if_id_part(#{id := Id}) -> io_lib:format(" if_id ~B", [Id]);
+if_id_part(_)           -> "".
+
+%% Traffic the node itself sends to a UE (P-CSCF replies of a co-located
+%% IPsec gateway) has to be routed into the interface, or no policy of ours
+%% applies to it any more. One host route per attached UE in the instance's
+%% local-origin table, which `iif lo' consults; it travels with the
+%% outbound policy because that is the policy it feeds.
+local_route(Op, out, Dst, #{name := Name, local_table := Table}) ->
+    Fam = case lists:member($:, Dst) of true -> "ip -6"; false -> "ip" end,
+    Cmd = io_lib:format("~s route ~s ~s dev ~s table ~B",
+                        [Fam, atom_to_list(Op), Dst, Name, Table]),
+    case Op of
+        replace -> run_cmd(lists:flatten(Cmd));
+        del     -> _ = os:cmd(lists:flatten(Cmd) ++ " 2>/dev/null"), ok
+    end;
+local_route(_Op, _Dir, _Dst, _If) ->
+    ok.
+
+%%====================================================================
+%% Scoped inventory commands
+%%====================================================================
+
+%% One kernel-filtered dump per direction (inbound: dst = us, outbound:
+%% src = us); the address filter is an AND over src and dst, so "either
+%% endpoint" takes two dumps.
+state_list_cmds(LocalIP) ->
+    Local = lists:flatten(ip_str(LocalIP)),
+    [lists:flatten(io_lib:format(
+         "ip xfrm state list ~s ~s proto esp 2>/dev/null", [Key, Local]))
+     || Key <- ["src", "dst"]].
+
+%% Keep a policy block only if a "tmpl src A dst B" line names LocalIP.
+%% A block starts at every unindented line (see split_blocks/1).
+policy_list_cmd(LocalIP) ->
+    Local = lists:flatten(ip_str(LocalIP)),
+    lists:flatten(io_lib:format(
+        "ip xfrm policy list 2>/dev/null | awk -v ip=~s '"
+        "/^[^ \t]/ { if (keep) printf \"%s\", blk; blk = \"\"; keep = 0 } "
+        "{ blk = blk $0 \"\\n\"; "
+        "if ($1 == \"tmpl\" && ($3 == ip || $5 == ip)) keep = 1 } "
+        "END { if (keep) printf \"%s\", blk }'", [Local])).
 
 %%====================================================================
 %% Hardware offload detection

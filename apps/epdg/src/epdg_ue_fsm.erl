@@ -12,6 +12,9 @@
 -export([start_link/1, handle_ikev2/4, get_state/1, get_info/1, disconnect/1]).
 -export([init/1, callback_mode/0, terminate/3, code_change/4]).
 -export([idle/3, ike_sa_init/3, ike_auth/3, established/3]).
+%% The outer address Child SAs are keyed on; epdg_session_restore scopes
+%% its kernel SA inventory to it.
+-export([local_outer_ip/0]).
 
 -ifdef(TEST).
 %% Internal functions exercised by the EUnit suite (see test/). new_data_for_test/1
@@ -21,7 +24,7 @@
          build_first_auth_chain/3, eap_only_selected/2,
          classify_register_ue_result/1,
          build_notify_response/4, process_sa_init_payloads/1,
-         sa_init_reply_port/1,
+         sa_init_reply_port/1, parse_imsi_from_nai/1,
          format_proposal_notice/3,
          %% IPv6 PDN: inner selectors, CFG_REPLY contents, handover PAA
          ue6_selector/1, ip6_mask/2, build_cfg_reply/1,
@@ -1340,20 +1343,19 @@ extract_idi(Payloads) ->
     end.
 
 %% Extract IMSI from a 3GPP permanent identity NAI of the form
-%%   0<IMSI>@nai.epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org
-%% (TS 23.003 §19.3.2). Tolerates pseudonym / re-auth forms by returning
-%% undefined if the user-part doesn't match an IMSI pattern.
+%%   <d><IMSI>@nai.epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org
+%% (TS 23.003 §19.3.2), where the leading digit names the EAP method: "0"
+%% for EAP-AKA, "6" for EAP-AKA'. Only "0" used to be accepted, so an
+%% EAP-AKA' UE authenticated fine and was then handed to the PGW without an
+%% IMSI. Tolerates pseudonym / re-auth forms by returning undefined if the
+%% user-part doesn't match an IMSI pattern.
 parse_imsi_from_nai(<<>>) -> undefined;
 parse_imsi_from_nai(Nai) when is_binary(Nai) ->
     case binary:split(Nai, <<"@">>) of
-        [Username, _Realm] ->
-            case Username of
-                <<"0", Digits/binary>> ->
-                    case is_all_digits(Digits) of
-                        true  -> Digits;
-                        false -> undefined
-                    end;
-                _ -> undefined
+        [<<Method, Digits/binary>>, _Realm] when Method =:= $0; Method =:= $6 ->
+            case is_all_digits(Digits) of
+                true  -> Digits;
+                false -> undefined
             end;
         _ -> undefined
     end.
@@ -1688,6 +1690,19 @@ null_or_int(_)                    -> null.
 %% final IKE_AUTH response.
 %%--------------------------------------------------------------------
 
+%% No IMSI, no PDN connection: the IMSI is a mandatory IE of the S2b
+%% Create Session Request (TS 29.274 §7.2.1), and a request without it once
+%% aborted the PGW-C, taking every subscriber's session with it. An identity
+%% we cannot map to an IMSI (pseudonym, unknown method digit) ends here.
+proceed_with_s2b(MsgId, InFlags, ISPI, RSPI,
+                 _InnerPayloads, UeNai, IMSI, _IDrBody,
+                 _NonceI, _NonceR,
+                 _IkeSaInitRespBytes, _Apn,
+                 _PeerIP, _PeerPort, Data0)
+  when not is_binary(IMSI); IMSI =:= <<>> ->
+    logger:warning("No IMSI in identity ~p: not creating an S2b session", [UeNai]),
+    send_ike_notify_and_stop(MsgId, InFlags, ISPI, RSPI,
+                             24, Data0); %% AUTHENTICATION_FAILED
 proceed_with_s2b(MsgId, InFlags, ISPI, RSPI,
                  InnerPayloads, _UeNai, IMSI, IDrBody,
                  NonceI, NonceR,
@@ -3113,31 +3128,37 @@ delete_child_sas(_OuterIP, _) ->
 
 %% Delete the three per-UE XFRM policies (in/fwd/out) keyed by the UE inner
 %% IP. Mirrors the create_policy calls in install_child_sas/10.
-delete_ue_policies(undefined, UeInnerIp6) ->
-    delete_ue6_policies(UeInnerIp6);
 delete_ue_policies(UeInnerIp, UeInnerIp6) ->
+    delete_ue_policies(UeInnerIp, UeInnerIp6, #{}).
+
+%% Opts is passed on to epdg_xfrm:delete_policy/1; #{other_mode => true}
+%% addresses the policies of the XFRM interface mode we are NOT running in
+%% (see restore_child_sas/2).
+delete_ue_policies(undefined, UeInnerIp6, Opts) ->
+    delete_ue6_policies(UeInnerIp6, Opts);
+delete_ue_policies(UeInnerIp, UeInnerIp6, Opts) ->
     UeCidr  = ip4_cidr(UeInnerIp, 32),
     AnyCidr = "0.0.0.0/0",
-    catch epdg_xfrm:delete_policy(#{src => UeCidr,  dst => AnyCidr,
-                                    direction => in}),
-    catch epdg_xfrm:delete_policy(#{src => UeCidr,  dst => AnyCidr,
-                                    direction => fwd}),
-    catch epdg_xfrm:delete_policy(#{src => AnyCidr, dst => UeCidr,
-                                    direction => out}),
-    delete_ue6_policies(UeInnerIp6),
+    catch epdg_xfrm:delete_policy(Opts#{src => UeCidr,  dst => AnyCidr,
+                                        direction => in}),
+    catch epdg_xfrm:delete_policy(Opts#{src => UeCidr,  dst => AnyCidr,
+                                        direction => fwd}),
+    catch epdg_xfrm:delete_policy(Opts#{src => AnyCidr, dst => UeCidr,
+                                        direction => out}),
+    delete_ue6_policies(UeInnerIp6, Opts),
     ok.
 
-delete_ue6_policies(undefined) -> ok;
-delete_ue6_policies(UeInnerIp6) ->
+delete_ue6_policies(undefined, _Opts) -> ok;
+delete_ue6_policies(UeInnerIp6, Opts) ->
     %% Must derive the selector exactly as install_v6_policies/4 did.
     Ue6Cidr  = ue6_selector(UeInnerIp6),
     Any6Cidr = "::/0",
-    catch epdg_xfrm:delete_policy(#{src => Ue6Cidr,  dst => Any6Cidr,
-                                    direction => in}),
-    catch epdg_xfrm:delete_policy(#{src => Ue6Cidr,  dst => Any6Cidr,
-                                    direction => fwd}),
-    catch epdg_xfrm:delete_policy(#{src => Any6Cidr, dst => Ue6Cidr,
-                                    direction => out}),
+    catch epdg_xfrm:delete_policy(Opts#{src => Ue6Cidr,  dst => Any6Cidr,
+                                        direction => in}),
+    catch epdg_xfrm:delete_policy(Opts#{src => Ue6Cidr,  dst => Any6Cidr,
+                                        direction => fwd}),
+    catch epdg_xfrm:delete_policy(Opts#{src => Any6Cidr, dst => Ue6Cidr,
+                                        direction => out}),
     ok.
 
 %% RFC 4555 §3.5: move the kernel data plane to the UE's new outer address.
@@ -3525,7 +3546,17 @@ restore_child_sas(#data{peer_ip = PeerIP, peer_port = PeerPort,
                 sets:is_element({PeerIP, LocalOuter, SpiIn}, ExistingSAs)
                 andalso
                 sets:is_element({LocalOuter, PeerIP, SpiOut}, ExistingSAs),
-            case BothPresent of
+            %% SAs installed before the XFRM interface mode changed (first
+            %% start of a release that binds them to the interface, or a
+            %% switch back) cannot be adopted: an SA cannot change its
+            %% if_id, and the old policies sit in the other policy scope.
+            ModeChanged = epdg_config:get(xfrm_mode_changed, false) =:= true,
+            case ModeChanged of
+                true  -> delete_ue_policies(InnerIp, InnerIp6,
+                                            #{other_mode => true});
+                false -> ok
+            end,
+            case BothPresent andalso not ModeChanged of
                 true ->
                     catch epdg_ue_registry:register_esp_spis(
                             SpiIn, SpiOut, self()),

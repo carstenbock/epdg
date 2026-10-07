@@ -199,6 +199,8 @@ Empty/unset values fall back to the defaults below.
 | `EPDG_EAP_ONLY_AUTH` | `true` | Honour RFC 5998 `N(EAP_ONLY_AUTHENTICATION)` and omit CERT + signature AUTH from IKE_AUTH message 4. `false` restores strict RFC 7296 (always send CERT+AUTH) |
 | `EPDG_IPSEC_OFFLOAD` | `auto` | `auto` / `none` / `inline` / `crypto` |
 | `EPDG_IPSEC_IFACE` | `eth0` | NIC for hardware-offload detection |
+| `EPDG_XFRM_INTERFACE` | `true` | Bind the per-UE SAs and policies to an XFRM interface (`epdgx<instance>`) instead of the node's global policy table, so they do not overlap with a co-located IMS IPsec gateway's policies. Falls back to unscoped state with a warning when the kernel has no `xfrm_interface`. The Helm chart sets this from `ipsec.xfrmInterface` (default `false`) |
+| `EPDG_TUNNEL_MTU` | `1300` | MTU of that XFRM interface. Inner packets above it are fragmented before encryption, so no ESP-in-UDP packet is itself IP-fragmented (which NATs in front of Wi-Fi UEs tend to drop) |
 
 ### Plaintext IKEv2 tracing (`epdg_ikev2_trace`)
 
@@ -285,6 +287,11 @@ therefore derived from a per-pod **instance id**:
   REGISTER (delivering it to `lo`) instead of forwarding it via the
   shared TUN toward the PGW-U. Steering UE-pool uplink before `local`
   makes it always ride the datapath, regardless of node-local VIP routes.
+  With the XFRM interface (`EPDG_XFRM_INTERFACE`) the pool rules are
+  `from <pool> iif epdgx<id>`, so they only match decrypted SWu uplink and
+  not other traffic with a UE source address that passes through the node
+  (uplink of a co-located PGW-U, traffic from a UE anchored on another
+  node).
 
 Without distinct ids, two pods on one node would attach to the same
 `epdg0` device, overwrite each other's rules, and a stopping pod would

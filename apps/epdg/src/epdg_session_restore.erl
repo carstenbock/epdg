@@ -127,11 +127,13 @@ restore_one(Snapshot, ExistingSAs, #{restored := R, failed := F} = Acc) ->
             Acc#{failed := F + 1}
     end.
 
-%% {Src, Dst, Spi} of every ESP SA currently in the kernel. On a
-%% same-node crash restart (hostNetwork) the previous incarnation's SAs
-%% are all still here; on a reschedule this is typically empty.
+%% {Src, Dst, Spi} of the ESP SAs in the kernel that have this pod's outer
+%% address as an endpoint — the only ones restore_child_sas/2 in
+%% epdg_ue_fsm looks up. On a same-node crash restart (hostNetwork) the
+%% previous incarnation's SAs are all still here; on a reschedule this is
+%% typically empty. Deliberately not the whole SAD: see epdg_xfrm:list_sas/1.
 kernel_sa_set() ->
-    SAs = case catch epdg_xfrm:list_sas() of
+    SAs = case catch epdg_xfrm:list_sas(epdg_ue_fsm:local_outer_ip()) of
         L when is_list(L) -> L;
         _                 -> []
     end,

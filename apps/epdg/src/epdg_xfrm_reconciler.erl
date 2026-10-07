@@ -36,9 +36,9 @@
 -export([start_link/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
-%% Pure sweep planning, exported for the EUnit suite
-%% (epdg_xfrm_reconciler_tests).
--export([plan/4]).
+%% Pure sweep planning and ownership scoping, exported for the EUnit
+%% suite (epdg_xfrm_reconciler_tests).
+-export([plan/4, owned_sas/2, owned_policies/2]).
 
 -define(SERVER, ?MODULE).
 
@@ -128,18 +128,14 @@ do_sweep(#state{local_ip = Local, grace_ms = GraceMs,
 
     %% Kernel ESP SAs scoped to our outer endpoint, keyed for pending
     %% tracking. Claimed = a live FSM registered the SPI.
-    SAs = [SA || #{src := S, dst := D} = SA <- epdg_xfrm:list_sas(),
-                 S =:= Local orelse D =:= Local],
+    SAs = owned_sas(epdg_xfrm:list_sas(Local), Local),
     SaItems = [{{sa, S, D, Spi}, epdg_ue_registry:esp_spi_claimed(Spi)}
                || #{src := S, dst := D, spi := Spi} <- SAs],
 
     %% Per-UE policies scoped to our outer endpoint via the template.
     %% reqid 0 (not installed by the ePDG) is never touched; a policy is
     %% claimed when its reqid — the owning UE's inbound ESP SPI — is.
-    Pols = [P || #{tmpl_src := TS, tmpl_dst := TD, reqid := R} = P
-                     <- epdg_xfrm:list_policies(),
-                 R > 0,
-                 TS =:= Local orelse TD =:= Local],
+    Pols = owned_policies(epdg_xfrm:list_policies(Local), Local),
     PolItems = [{{pol, S, D, Dir}, epdg_ue_registry:esp_spi_claimed(R)}
                 || #{src := S, dst := D, dir := Dir, reqid := R} <- Pols],
 
@@ -163,6 +159,24 @@ delete_item({pol, Src, Dst, Dir} = _Key) ->
     epdg_metrics:inc(xfrm_reconcile_orphan_policies_deleted_total),
     catch epdg_xfrm:delete_policy(#{src => Src, dst => Dst, direction => Dir}),
     ok.
+
+%%====================================================================
+%% Ownership scoping
+%%====================================================================
+
+%% The listing is already scoped to Local (kernel address filter for SAs,
+%% awk for policies). These checks are repeated here on purpose: whatever
+%% the listing returns, state without our outer endpoint belongs to
+%% someone else on this node (IPsec-GW, sibling ePDG pod) and must never
+%% become a deletion candidate.
+owned_sas(SAs, Local) ->
+    [SA || #{src := S, dst := D} = SA <- SAs,
+           S =:= Local orelse D =:= Local].
+
+owned_policies(Pols, Local) ->
+    [P || #{tmpl_src := TS, tmpl_dst := TD, reqid := R} = P <- Pols,
+          R > 0,
+          TS =:= Local orelse TD =:= Local].
 
 %%====================================================================
 %% Pure sweep planning

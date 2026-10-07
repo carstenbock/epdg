@@ -307,6 +307,88 @@ instance_rule_prios_stay_between_escape_and_local_test() ->
       end, lists:seq(0, 63)).
 
 %% Ids outside the instance space must not derive a datapath at all.
+%% The XFRM interface of an instance brings two more routing tables and a
+%% device. A table id of 253..255 is default/main/local: routing a UE host
+%% route or "default dev epdgx" into one of those would take the node off
+%% the network. Device names are capped at 15 characters by the kernel,
+%% and every instance needs its own if_id or co-located pods would share
+%% one policy scope.
+xfrm_if_params_never_collide_test() ->
+    All = [epdg_gtpu_forwarder:xfrm_if_params(Id) || Id <- lists:seq(0, 63)],
+    Tables = lists:append([[D, L] || #{downlink_table := D,
+                                       local_table := L} <- All])
+             ++ [T || Id <- lists:seq(0, 63),
+                      {_, T, _} <- [epdg_gtpu_forwarder:instance_params(Id)]],
+    ?assertEqual(length(Tables), length(lists:usort(Tables))),
+    ?assertEqual([], [T || T <- Tables, T >= 253, T =< 255]),
+    ?assertEqual(64, length(lists:usort([I || #{id := I} <- All]))),
+    ?assert(lists:all(fun(#{id := I}) -> I > 0 end, All)),
+    ?assert(lists:all(fun(#{name := N}) -> length(N) =< 15 end, All)).
+
+%% With the XFRM interface, decrypted SWu uplink is the only traffic that
+%% enters on `epdgx<id>', and the pool rule must say so. A bare
+%% `from <pool>' also matches every other packet with a UE source address
+%% on a node the ePDG shares with a PGW-U: uplink that PGW-U decapsulated
+%% (iif ogstun*) and media of a UE anchored on the other node on its way
+%% to a local UE (iif the VLAN NIC). Both were sent into the shared TUN
+%% and dropped there.
+pool_rules_are_scoped_to_the_xfrm_interface_test() ->
+    #{name := XName} = epdg_gtpu_forwarder:xfrm_if_params(1),
+    ?assertEqual([{"ip",    "from 10.46.0.0/16 iif epdgx1"},
+                  {"ip -6", "from cafe:0:46::/48 iif epdgx1"}],
+                 epdg_gtpu_forwarder:pool_rule_selectors(?POOLS, XName)).
+
+%% Without the interface the packets arrive on the underlay NIC, whose
+%% name the ePDG does not own; scoping to anything would lose all uplink.
+pool_rules_stay_unscoped_without_xfrm_interface_test() ->
+    ?assertEqual([{"ip",    "from 10.46.0.0/16"},
+                  {"ip -6", "from cafe:0:46::/48"}],
+                 epdg_gtpu_forwarder:pool_rule_selectors(?POOLS, undefined)).
+
+%% Rules outlive the pod on a hostNetwork node, so the unscoped rule of a
+%% release before 0.0.94 is still there after the upgrade and, sitting at
+%% the same priority, would keep catching the foreign traffic. It has to be
+%% deleted in both families, and only after the scoped rule is in, or
+%% uplink is without a rule in between.
+scoping_removes_the_unscoped_pool_rules_test() ->
+    ?assertEqual(
+       ["ip rule add from 10.46.0.0/16 iif epdgx0 lookup 100 priority 30",
+        "ip rule del from 10.46.0.0/16 lookup 100 priority 30",
+        "ip -6 rule add from cafe:0:46::/48 iif epdgx0 lookup 100 priority 30",
+        "ip -6 rule del from cafe:0:46::/48 lookup 100 priority 30"],
+       epdg_gtpu_forwarder:scope_pool_rules_cmds(?POOLS, "epdgx0", 100, 30)).
+
+%% Teardown has to delete the rule that was installed. `ip rule del' with
+%% the bare selector does not match the scoped rule, which would then stay
+%% on the node pointing at a flushed table.
+teardown_deletes_the_scoped_pool_rules_test() ->
+    Base = case os:getenv("TMPDIR") of false -> "/tmp"; T -> T end,
+    Dir  = filename:join(Base, "epdg_fwd_rules_"
+                         ++ integer_to_list(erlang:unique_integer([positive]))),
+    ok  = filelib:ensure_dir(filename:join(Dir, "keep")),
+    Log = filename:join(Dir, "cmd.log"),
+    ok = file:write_file(filename:join(Dir, "ip"),
+                         ["#!/bin/sh
+echo \"$*\" >> ", Log, "\n"]),
+    ok = file:change_mode(filename:join(Dir, "ip"), 8#755),
+    OldPath = os:getenv("PATH"),
+    true = os:putenv("PATH", Dir ++ ":" ++ OldPath),
+    try
+        {Tun, _Table, Prio} = epdg_gtpu_forwarder:instance_params(1),
+        epdg_gtpu_forwarder:teardown_xfrm_routing(1, Tun, Prio, ?POOLS),
+        {ok, Bin} = file:read_file(Log),
+        Lines = string:lexemes(binary_to_list(Bin), "\n"),
+        ?assert(lists:member(
+                  "rule del from 10.46.0.0/16 iif epdgx1 lookup 101 priority 31",
+                  Lines)),
+        ?assert(lists:member(
+                  "-6 rule del from cafe:0:46::/48 iif epdgx1 lookup 101 "
+                  "priority 31", Lines))
+    after
+        true = os:putenv("PATH", OldPath),
+        _ = file:del_dir_r(Dir)
+    end.
+
 instance_params_rejects_out_of_range_test() ->
     ?assertError(function_clause, epdg_gtpu_forwarder:instance_params(64)),
     ?assertError(function_clause, epdg_gtpu_forwarder:instance_params(-1)).

@@ -66,7 +66,9 @@
          new_state_for_test/1, register_ue_for_test/2,
          register_bearer_for_test/2, unregister_ue_for_test/2,
          uplink_for_test/2, classify_for_test/2,
-         instance_params/1, extract_ue_tun_name/1, legacy_ue_route_table/1,
+         instance_params/1, xfrm_if_params/1, pool_rule_selectors/2,
+         scope_pool_rules_cmds/4,
+         extract_ue_tun_name/1, legacy_ue_route_table/1,
          decode_gtpu/1, encode_gtpu_echo_response/1]).
 -endif.
 
@@ -124,10 +126,25 @@
 %% Only referenced by the one-time upgrade sweep in setup_shared_tun/4 so
 %% rules a pre-move release left on the hostNetwork node do not linger.
 -define(LEGACY_SHARED_RULE_PRIO_BASE, 1000).
+-ifdef(TEST).
+%% Kernel programming of the XFRM interface, for integration checks against
+%% a real kernel (needs NET_ADMIN; not part of the EUnit run).
+-export([setup_xfrm_if/5, teardown_xfrm_routing/4]).
+-endif.
 -define(MAX_INSTANCES, 64).
+%% XFRM interface of the instance (setup_xfrm_if/5): device "epdgx" ++ Id,
+%% if_id ?XFRM_IF_ID_BASE + Id, and two more routing tables. The table
+%% bases keep clear of 253..255 (default/main/local) for every instance id.
+-define(XFRM_IF_PREFIX, "epdgx").
+-define(XFRM_IF_ID_BASE, 16#45500000).
+-define(DOWNLINK_TABLE_BASE, 300).
+-define(LOCAL_TABLE_BASE, 400).
 %% Priority of the PGW-U escape rules (ensure_pgwu_escape_rules/0).
 %% Must sort strictly before the UE-pool rules of every instance.
 -define(PGWU_ESCAPE_PRIO, 20).
+%% How often the escape rules are re-checked for ogstun devices that did
+%% not exist yet when the forwarder started.
+-define(PGWU_ESCAPE_INTERVAL_MS, 30000).
 
 -record(ue_ent, {
     local_teid   :: non_neg_integer(),
@@ -290,13 +307,17 @@ init_datapath(Pools) ->
                   "rule priority ~B",
                   [InstanceId, TunName, TableId, RulePrio]),
     cleanup_stale_tun_devices(),
-    %% Node-global and idempotent; runs once per forwarder start (NOT per
-    %% attach — re-running it on every TUN setup used to dump the whole
-    %% rule list on each registration). ogstun devices created later
-    %% (PGW-U pod restart) keep their escape because the rules match the
-    %% device name, which open5gs reuses.
+    %% Node-global and idempotent; runs at forwarder start and then every
+    %% ?PGWU_ESCAPE_INTERVAL_MS (NOT per attach — re-running it on every
+    %% TUN setup used to dump the whole rule list on each registration).
+    %% The repeat is for ogstun devices that appear after us: after a node
+    %% reboot the ePDG can be up before the PGW-U has created them, and a
+    %% single run at start then leaves the node without any escape rule.
     ensure_pgwu_escape_rules(),
+    erlang:send_after(?PGWU_ESCAPE_INTERVAL_MS, self(),
+                      ensure_pgwu_escape_rules),
     TunPort = setup_shared_tun(TunName, TableId, RulePrio, Pools),
+    setup_xfrm_if(InstanceId, TunName, TableId, RulePrio, Pools),
     BindIpStr = epdg_config:get(gtpu_bind_addr, "0.0.0.0"),
     BindIp    = parse_ip_or_any(BindIpStr),
     Port      = epdg_config:get(gtpu_port, ?GTPU_PORT),
@@ -418,6 +439,13 @@ handle_info({Port, {exit_status, Status}}, #state{tun_port = Port} = State)
                  "restarting forwarder", [Status]),
     {stop, {shared_tun_exit, {exit_status, Status}},
      State#state{tun_port = undefined}};
+%% Not in this process: it is the uplink packet path, and the check
+%% shells out.
+handle_info(ensure_pgwu_escape_rules, State) ->
+    spawn(fun ensure_pgwu_escape_rules/0),
+    erlang:send_after(?PGWU_ESCAPE_INTERVAL_MS, self(),
+                      ensure_pgwu_escape_rules),
+    {noreply, State};
 handle_info({'DOWN', _MRef, process, Pid, _Reason},
             #state{by_owner = Owners} = State) ->
     case maps:find(Pid, Owners) of
@@ -435,6 +463,8 @@ terminate(_Reason, #state{socket = S, tun_port = TP, pools = Pools,
     end,
     %% Tears down ONLY this instance's device, table and rules — other
     %% ePDG pods on the same hostNetwork node keep their datapath.
+    teardown_xfrm_routing(epdg_config:get(instance_id, 0), TunName,
+                          RulePrio, Pools),
     teardown_shared_tun(TunName, TableId, RulePrio, Pools),
     case S of undefined -> ok; _ -> gen_udp:close(S) end,
     ok.
@@ -977,6 +1007,138 @@ setup_shared_tun(Name, Table, Prio, Pools) ->
 %% table + priority are instance-scoped), its table and its device.
 %% MUST NOT flush anything derived from another instance id — a
 %% stopping pod A would otherwise rip out running pod B's datapath.
+%% Identifiers of the instance's XFRM interface. local_table holds one host
+%% route per attached UE (written by epdg_xfrm with the outbound policy).
+xfrm_if_params(Id) when is_integer(Id), Id >= 0, Id < ?MAX_INSTANCES ->
+    #{name           => ?XFRM_IF_PREFIX ++ integer_to_list(Id),
+      id             => ?XFRM_IF_ID_BASE + Id,
+      downlink_table => ?DOWNLINK_TABLE_BASE + Id,
+      local_table    => ?LOCAL_TABLE_BASE + Id}.
+
+%% Put the per-UE SAs and policies behind an XFRM interface (why: see
+%% "XFRM interface scoping" in epdg_xfrm). Routing that goes with it:
+%%
+%%   iif <TUN>  -> downlink table -> default dev <xfrm if>
+%%       Downlink the forwarder writes into the TUN. It used to be routed
+%%       back out of the TUN and picked up by the global policy on the way.
+%%   iif lo     -> local table    -> <UE>/32 dev <xfrm if>, per attached UE
+%%       Traffic of the node itself to a UE.
+%%
+%% Uplink: decapsulated packets now arrive on the interface instead of the
+%% outer NIC, so the pool rules are narrowed to it
+%% (`from <pool> iif <xfrm if>', pool_rule_selectors/2) and the unscoped
+%% ones setup_shared_tun/4 installed are removed. Unscoped, a pool rule
+%% also catches packets with a UE source address that are not SWu uplink
+%% at all and sends them into the TUN, where they are dropped: uplink a
+%% co-located PGW-U decapsulated (iif ogstun*, if its escape rule is
+%% missing) and traffic of a UE anchored on another node that is routed
+%% through this one to a local UE (iif the underlay NIC, which no escape
+%% rule covers).
+%%
+%% Without the interface (kernel lacks xfrm_interface, no NET_ADMIN, or
+%% EPDG_XFRM_INTERFACE=false) everything stays as before 0.0.92: no if_id,
+%% policies in the global table.
+%%
+%% xfrm_mode_changed tells the session restore that kernel SAs left by the
+%% previous incarnation were installed the other way and must be replaced,
+%% not adopted: an SA cannot change its if_id.
+setup_xfrm_if(InstanceId, TunName, Table, Prio, Pools) ->
+    #{name := XName, id := IfId, downlink_table := DlTable} = Params =
+        xfrm_if_params(InstanceId),
+    application:set_env(epdg, xfrm_if_params, Params),
+    Wanted  = epdg_config:get(xfrm_interface, "true") =/= "false",
+    SysPath = "/sys/class/net/" ++ XName,
+    Existed = filelib:is_dir(SysPath),
+    TunUp   = filelib:is_dir("/sys/class/net/" ++ TunName),
+    case Wanted andalso TunUp andalso not Existed of
+        true ->
+            run_quiet(io_lib:format("ip link add ~s type xfrm if_id ~B",
+                                    [XName, IfId]));
+        false ->
+            ok
+    end,
+    case Wanted andalso TunUp andalso filelib:is_dir(SysPath) of
+        true ->
+            Fams = rule_families(Pools),
+            Iif  = "iif " ++ TunName,
+            teardown_xfrm_routing(InstanceId, TunName, Prio, Pools),
+            %% Inner packets larger than this are fragmented BEFORE they are
+            %% encrypted, so every ESP-in-UDP packet is a complete datagram.
+            %% At the device default of 1500 a full-size inner packet grew
+            %% past the underlay MTU and the encrypted packet itself was
+            %% fragmented; such fragments rarely survive the NAT in front
+            %% of a Wi-Fi UE, which lost every large downlink message (the
+            %% terminating INVITE, for one).
+            Mtu = epdg_config:get(tunnel_mtu, 1300),
+            Cmds =
+                [io_lib:format("ip link set dev ~s mtu ~B", [XName, Mtu]),
+                 io_lib:format("ip link set dev ~s up", [XName]),
+                 io_lib:format(
+                     "val=$(cat /proc/sys/net/ipv4/conf/~s/rp_filter "
+                     "2>/dev/null); [ \"$val\" != 1 ] || "
+                     "sysctl -wq net.ipv4.conf.~s.rp_filter=2", [XName, XName])]
+                ++ [io_lib:format("~s route replace default dev ~s table ~B",
+                                  [Fam, XName, DlTable]) || Fam <- Fams]
+                ++ lists:append(
+                     [[rule_cmd(Fam, "del", Iif, Table, Prio),
+                       rule_cmd(Fam, "add", Iif, DlTable, Prio),
+                       rule_cmd(Fam, "add", "iif lo",
+                                maps:get(local_table, Params), Prio)]
+                      || Fam <- Fams])
+                ++ scope_pool_rules_cmds(Pools, XName, Table, Prio),
+            run_cmds_or_warn(XName, Cmds),
+            application:set_env(epdg, xfrm_if, Params),
+            application:set_env(epdg, xfrm_mode_changed, not Existed),
+            logger:notice("XFRM interface ~s (if_id 0x~.16B, MTU ~B): per-UE "
+                          "SAs and policies are scoped to it",
+                          [XName, IfId, Mtu]);
+        false ->
+            case Wanted of
+                true ->
+                    logger:warning(
+                      "XFRM interface ~s could not be created (kernel "
+                      "without xfrm_interface, or no NET_ADMIN): per-UE "
+                      "policies stay in the node's global policy table. On "
+                      "a node shared with the IMS IPsec gateway, co-located "
+                      "UEs then cannot complete a protected IMS "
+                      "registration", [XName]);
+                false ->
+                    logger:notice("XFRM interface disabled "
+                                  "(EPDG_XFRM_INTERFACE=false)")
+            end,
+            %% setup_shared_tun/4 has put the iif rule back on the TUN's own
+            %% table and installed the unscoped pool rules; drop what an
+            %% earlier incarnation routed to or scoped to the interface.
+            teardown_xfrm_routing(InstanceId, TunName, Prio, Pools),
+            case Existed of
+                true  -> run_quiet(io_lib:format("ip link del ~s", [XName]));
+                false -> ok
+            end,
+            application:set_env(epdg, xfrm_if, undefined),
+            application:set_env(epdg, xfrm_mode_changed, Existed)
+    end.
+
+%% Remove the instance's XFRM routing (rules and tables), not the device:
+%% SAs that survive a restart stay usable only with the interface they were
+%% created for, and an idle interface costs nothing.
+teardown_xfrm_routing(InstanceId, TunName, Prio, Pools) ->
+    #{name := XName, downlink_table := DlTable, local_table := LocalTable} =
+        xfrm_if_params(InstanceId),
+    {_, Table, _} = instance_params(InstanceId),
+    lists:foreach(fun({Fam, Sel}) ->
+        run_quiet(rule_cmd(Fam, "del", Sel, Table, Prio))
+    end, pool_rule_selectors(Pools, XName)),
+    lists:foreach(fun(Fam) ->
+        run_quiet(rule_cmd(Fam, "del", "iif " ++ TunName, DlTable, Prio)),
+        run_quiet(rule_cmd(Fam, "del", "iif lo", LocalTable, Prio)),
+        run_quiet(io_lib:format("~s route flush table ~B", [Fam, DlTable])),
+        run_quiet(io_lib:format("~s route flush table ~B", [Fam, LocalTable]))
+    end, rule_families(Pools)).
+
+rule_families(Pools) ->
+    WantV6 = lists:any(fun({Base, _}) -> tuple_size(Base) =:= 8 end, Pools),
+    ["ip"] ++ ["ip -6" || WantV6].
+
 teardown_shared_tun(Name, Table, Prio, Pools) ->
     lists:foreach(fun({Fam, Sel}) ->
         run_quiet(rule_cmd(Fam, "del", Sel, Table, Prio))
@@ -992,7 +1154,8 @@ teardown_shared_tun(Name, Table, Prio, Pools) ->
 %%     resolve via the shared table, NOT via MAIN);
 %%   - one `from <pool>' rule per configured UE pool (uplink:
 %%     XFRM-decrypted SWu packets carry src = UE inner IP and must be
-%%     steered into the TUN for GTP-U encapsulation).
+%%     steered into the TUN for GTP-U encapsulation). With the XFRM
+%%     interface, setup_xfrm_if/5 replaces these by rules scoped to it.
 %%
 %% All of an instance's rules share its derived priority: they sort
 %% strictly after the PGW-U escape rules (?PGWU_ESCAPE_PRIO) and
@@ -1003,9 +1166,32 @@ shared_rule_selectors(Name, Pools) ->
     Iif = "iif " ++ Name,
     WantV6 = lists:any(fun({Base, _}) -> tuple_size(Base) =:= 8 end, Pools),
     IifRules = [{"ip", Iif}] ++ [{"ip -6", Iif} || WantV6],
-    PoolRules = [{family_cmd(Base), "from " ++ cidr_str(Pool)}
-                 || {Base, _} = Pool <- Pools],
-    IifRules ++ PoolRules.
+    IifRules ++ pool_rule_selectors(Pools, undefined).
+
+%% The uplink rule selectors, one per pool. UplinkIif is the device
+%% decrypted SWu uplink arrives on when that is known to be a device of
+%% ours (the XFRM interface), `undefined' otherwise (no XFRM interface:
+%% the packets arrive on the underlay NIC, which also carries other
+%% traffic, so the rule cannot be narrowed).
+pool_rule_selectors(Pools, UplinkIif) ->
+    Scope = case UplinkIif of
+                undefined -> "";
+                _         -> " iif " ++ UplinkIif
+            end,
+    [{family_cmd(Base), "from " ++ cidr_str(Pool) ++ Scope}
+     || {Base, _} = Pool <- Pools].
+
+%% Replace the unscoped pool rules (from setup_shared_tun/4, or left on
+%% the hostNetwork node by a release before 0.0.94) by the scoped ones.
+%% Scoped rule in before the unscoped one goes, so uplink is never without
+%% a pool rule.
+scope_pool_rules_cmds(Pools, UplinkIif, Table, Prio) ->
+    lists:append(
+      [[lists:flatten(rule_cmd(Fam, "add", Scoped, Table, Prio)),
+        lists:flatten(rule_cmd(Fam, "del", Unscoped, Table, Prio))]
+       || {{Fam, Scoped}, {Fam, Unscoped}}
+              <- lists:zip(pool_rule_selectors(Pools, UplinkIif),
+                           pool_rule_selectors(Pools, undefined))]).
 
 rule_cmd(Fam, Op, Selector, Table, Prio) ->
     io_lib:format("~s rule ~s ~s lookup ~B priority ~B",
@@ -1070,8 +1256,15 @@ ensure_forwarding_sysctls(WantV6) ->
 %% VIP) reaches the LB via main instead of being black-holed by local
 %% delivery. The rules are node-global, idempotent, and intentionally
 %% never torn down.
-%% XFRM-decrypted SWu uplink is unaffected (iif = the underlay NIC), as
-%% is downlink the forwarder injects into the shared TUN (iif = epdg0).
+%% XFRM-decrypted SWu uplink is unaffected (iif = the underlay NIC or the
+%% XFRM interface), as is downlink the forwarder injects into the shared
+%% TUN (iif = epdg0).
+%%
+%% With the XFRM interface the pool rules only match its own traffic
+%% (pool_rule_selectors/2) and these rules are not needed; they are kept
+%% for the mode without it. That mode has no answer for traffic of a UE
+%% anchored on another node arriving on the underlay NIC: it has the same
+%% input interface as SWu uplink there.
 ensure_pgwu_escape_rules() ->
     Prio = ?PGWU_ESCAPE_PRIO,
     Sh = io_lib:format(
