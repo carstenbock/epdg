@@ -116,7 +116,9 @@ up only after the data-plane and Diameter workers are ready.
 | AAA → ePDG | DEA (268) | EAP-Request/AKA'-Challenge (1001) or EAP-Success + `EAP-Master-Session-Key` (2001) |
 | ePDG → AAA | STR (275) | Release the non-3GPP session on tunnel teardown |
 | AAA → ePDG | STA (275) | Confirmed |
-| AAA → ePDG | ASR (274) / RAR (258) | HSS-initiated detach / profile refresh — **not yet honoured** (answered `DIAMETER_UNABLE_TO_DELIVER` 3001) |
+| AAA → ePDG | ASR (274) | HSS-initiated detach — the UE is looked up by IMSI and its tunnel torn down |
+| ePDG → AAA | ASA (274) | Always `DIAMETER_SUCCESS` (2001), also when the session is already gone |
+| AAA → ePDG | RAR (258) | Profile refresh — acknowledged with RAA 2001, but **not yet acted on** |
 
 The DER also carries the UE's real outer (NAT'd) `UE-Local-IP-Address`
 (TS 29.273 §9.2.3.1.1) so the AAA and HSS-GUI can surface it per IMSI.
@@ -542,8 +544,10 @@ GTP-U socket.
 
 ## Limitations / roadmap
 
-* **AAA-initiated detach** (SWm ASR / RAR) is not yet honoured; such
-  requests are answered with `DIAMETER_UNABLE_TO_DELIVER` (3001).
+* **AAA-initiated re-authorization** (SWm RAR) is acknowledged with
+  RAA `DIAMETER_SUCCESS` (2001) but not yet acted on: the session keeps
+  running with the profile from the initial attach. AAA-initiated detach
+  (SWm ASR) is honoured.
 * **No automated CT suite** yet; testing is currently manual / integration
   (IKEv2 against real UEs, GTP-C against Open5GS). Adding `rebar3 ct`
   coverage for the IKEv2 and Diameter codecs is a roadmap item.
