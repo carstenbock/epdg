@@ -43,14 +43,21 @@ teardown_reasons_send_delete_test_() ->
     [{atom_to_list(element(2, R)),
       ?_assertEqual(Expected, epdg_ue_fsm:s2b_delete_action(R, pgw_session()))}
      || R <- [{shutdown, ue_delete}, {shutdown, dpd_timeout},
-              {shutdown, aaa_abort}, {shutdown, drained},
-              {shutdown, pgw_bearer_delete}]].
+              {shutdown, aaa_abort}, {shutdown, drained}]].
 
 %% ... except when a newer session of the same IMSI superseded it: the PGW
 %% replaced that PDN connection when it accepted the new Create Session
 %% Request, and a Delete with the old TEID could hit a reused one.
 supersede_skips_delete_test() ->
     ?assertEqual(skip, epdg_ue_fsm:s2b_delete_action({shutdown, superseded},
+                                                     pgw_session())).
+
+%% ... and when the PGW deleted the default bearer itself (PGW-initiated
+%% release, e.g. a PGW-C shutdown drain, KI-119): the PDN connection is
+%% already gone at the PGW, so a Delete Session would only hit an unknown or
+%% reused TEID.
+pgw_bearer_delete_skips_delete_test() ->
+    ?assertEqual(skip, epdg_ue_fsm:s2b_delete_action({shutdown, pgw_bearer_delete},
                                                      pgw_session())).
 
 no_session_skips_delete_test() ->

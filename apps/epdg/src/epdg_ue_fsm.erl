@@ -394,6 +394,10 @@ linked_ebi(_) -> 5.
 -spec s2b_delete_action(term(), map() | undefined) -> {send, map()} | skip.
 s2b_delete_action({shutdown, superseded}, _PGW) ->
     skip;
+%% The PGW deleted the default bearer itself (PGW-initiated release); the PDN
+%% connection no longer exists there, and its TEID may already be reused.
+s2b_delete_action({shutdown, pgw_bearer_delete}, _PGW) ->
+    skip;
 s2b_delete_action(_Reason, PGW) ->
     case pgw_delete_params(PGW) of
         {ok, Params} -> {send, Params};
@@ -627,8 +631,15 @@ established(cast, supersede, Data) ->
     _ = try_send_delete_informational(Data),
     {stop, {shutdown, superseded}};
 
-established(cast, pgw_restart, _Data) -> {stop, {shutdown, pgw_restart}};
-established(cast, pgw_down,    _Data) -> {stop, {shutdown, pgw_unreachable}};
+%% The PDN connection is gone at the PGW: delete the IKE SA as well, so the
+%% UE sets up a new one at once instead of keeping a dead tunnel until its
+%% DPD gives up (KI-119).
+established(cast, pgw_restart, Data) ->
+    _ = try_send_delete_informational(Data),
+    {stop, {shutdown, pgw_restart}};
+established(cast, pgw_down, Data) ->
+    _ = try_send_delete_informational(Data),
+    {stop, {shutdown, pgw_unreachable}};
 
 established(cast, {drain, Reason}, Data) ->
     handle_drain(established, Reason, Data);
@@ -745,12 +756,19 @@ handle_bearer_request(delete, #{seq_num := Seq, ebis := Ebis},
     case lists:member(DefaultEbi, Ebis) of
         true ->
             %% Deleting the linked (default) bearer releases the whole PDN
-            %% connection (TS 29.274 §7.2.9.1). Acknowledge, then tear down.
+            %% connection (TS 29.274 §7.2.9.1). Acknowledge, delete the IKE
+            %% SA towards the UE (TS 23.402, PDN GW initiated resource release
+            %% with GTP on S2b: the ePDG releases the
+            %% IPsec tunnel; with cause "reactivation requested", e.g. a
+            %% PGW-C shutdown drain, the UE then sets up a new one, KI-119),
+            %% then tear down. No S2b Delete Session: the PGW has already
+            %% released the connection (s2b_delete_action/2).
             logger:info("S2b Delete Bearer (linked EBI ~p): IMSI=~p releasing "
                         "PDN connection", [DefaultEbi, IMSI]),
             epdg_gtpc_client:send_bearer_response(
                 #{kind => delete, seq_num => Seq, teid => PgwCTeid,
                   bearers => RespBearers}),
+            _ = try_send_delete_informational(Data),
             {stop, {shutdown, pgw_bearer_delete}, Data};
         false ->
             NewBeds = lists:foldl(fun release_one_bearer/2, Beds, Ebis),
