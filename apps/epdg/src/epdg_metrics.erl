@@ -76,6 +76,7 @@ init() ->
         mobike_rr_check_total,
         mobike_rr_fail_total,
         ike_redirects_sent_total,
+        ike_invalid_spi_sent_total,
         session_superseded_total,
         tun_startup_cleaned_total,
         xfrm_reconcile_runs_total,

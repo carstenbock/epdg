@@ -44,6 +44,8 @@
 
 -ifdef(TEST).
 -export([session_state_marker/0]).
+%% Exported for eunit (epdg_swm_rar_tests).
+-export([swm_session_held/2]).
 -endif.
 
 -define(SERVER, ?MODULE).
@@ -535,9 +537,37 @@ handle_inbound_asr(AVPs) ->
     end,
     {reply, asa_ok(Sid, IMSI)}.
 
+%% AAA-initiated re-authorization (TS 29.273 §7.1.2.2). The AAA also uses
+%% it to audit old sessions (KI-46): a Session-Id this ePDG does not hold
+%% is answered with DIAMETER_UNKNOWN_SESSION_ID (5002, RFC 6733 §7.1.5),
+%% so the AAA can drop a session whose STR never reached it. Up to 0.0.107
+%% every RAR was answered with 2001.
 handle_inbound_rar(AVPs) ->
-    Sid = avp_bin('Session-Id', AVPs),
-    {reply, raa_ok(Sid)}.
+    Sid  = avp_bin('Session-Id', AVPs),
+    IMSI = avp_bin('User-Name', AVPs),
+    %% Without a User-Name the session cannot be looked up: answer as before.
+    RC = case IMSI =/= <<>> andalso
+              swm_session_held(Sid, lookup_ue_by_imsi(IMSI)) =:= false of
+        true  -> 5002;
+        false -> 2001
+    end,
+    {reply, raa(Sid, RC)}.
+
+%% Whether the UE FSM found for the RAR's User-Name holds the Session-Id.
+%% `unsure' (FSM busy or gone mid-call) counts as held: a wrong 5002 would
+%% make the AAA end a live session, a wrong 2001 only delays the clean-up
+%% to the next audit.
+-spec swm_session_held(binary(), {ok, pid()} | error) -> boolean() | unsure.
+swm_session_held(_Sid, error) ->
+    false;
+swm_session_held(Sid, {ok, Pid}) ->
+    try epdg_ue_fsm:get_info(Pid) of
+        {ok, #{swm_session_id := Sid}} -> true;
+        {ok, #{swm_session_id := _}}   -> false;
+        _                              -> unsure
+    catch
+        _:_ -> unsure
+    end.
 
 avp_bin(Key, AVPs) ->
     case proplists:get_value(Key, AVPs) of
@@ -587,12 +617,12 @@ asa_ok(Sid, IMSI) ->
      {'Origin-Realm', OR},
      {'User-Name', IMSI}].
 
-raa_ok(Sid) ->
+raa(Sid, ResultCode) ->
     OH = to_bin(epdg_config:get(origin_host, "epdg.localdomain")),
     OR = to_bin(epdg_config:get(origin_realm, "localdomain")),
     ['RAA',
      {'Session-Id', Sid},
-     {'Result-Code', 2001},
+     {'Result-Code', ResultCode},
      {'Origin-Host', OH},
      {'Origin-Realm', OR}].
 

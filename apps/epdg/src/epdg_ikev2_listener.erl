@@ -8,6 +8,8 @@
 -behaviour(gen_server).
 
 -export([start_link/0, send/3, send/4, get_local_ip/0]).
+%% Exported for eunit (epdg_ikev2_listener_tests).
+-export([invalid_ike_spi_response/1, invalid_spi_allowed/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
@@ -16,10 +18,22 @@
 %% IKEv2 Encrypted (SK) payload type, RFC 7296 §3.14.
 -define(PL_SK, 46).
 
+%% RFC 7296 §3.10.1 INVALID_IKE_SPI.
+-define(N_INVALID_IKE_SPI, 4).
+%% IKE_SA_INIT exchange type (RFC 7296 §3.1).
+-define(EX_IKE_SA_INIT, 34).
+%% Unprotected INVALID_IKE_SPI answers per second (RFC 7296 §2.21.4). After
+%% a restart every UE of the old tunnels hits this path; the answers are
+%% unauthenticated hints, so a cap keeps the ePDG from becoming a
+%% reflector for spoofed sources while still telling most phones quickly.
+-define(INVALID_SPI_PER_SEC, 100).
+
 -record(state, {
     socket_500  :: gen_udp:socket() | undefined,
     socket_4500 :: gen_udp:socket() | undefined,
-    local_ip    :: inet:ip_address()
+    local_ip    :: inet:ip_address(),
+    %% {second, answers sent in it} for the INVALID_IKE_SPI rate cap.
+    invalid_spi_window = {0, 0} :: {integer(), non_neg_integer()}
 }).
 
 %%====================================================================
@@ -91,12 +105,7 @@ handle_call({send, IP, Port, FromPort, Data}, _From,
         4500 -> {S4500, 4500};
         _    -> case Port of 500 -> {S500, 500}; _ -> {S4500, 4500} end
     end,
-    SendData = case LocalPort of
-        4500 -> <<0,0,0,0, Data/binary>>;
-        _    -> Data
-    end,
-    mirror_if_cleartext(out, Data, IP, Port, LocalPort),
-    {reply, gen_udp:send(Sock, IP, Port, SendData), State};
+    {reply, send_on(Sock, LocalPort, IP, Port, Data), State};
 
 handle_call(get_local_ip, _From, #state{local_ip = IP} = State) ->
     {reply, IP, State};
@@ -132,9 +141,14 @@ handle_info({udp, Sock, FromIP, FromPort, Data},
         _ -> Data
     end,
     mirror_if_cleartext(in, IKEData, FromIP, FromPort, RecvPort),
-    handle_ikev2_packet(IKEData, FromIP, FromPort, RecvPort),
+    State1 = case handle_ikev2_packet(IKEData, FromIP, FromPort, RecvPort) of
+        {unknown_spi, Header} ->
+            unknown_spi(Header, Sock, RecvPort, FromIP, FromPort, State);
+        ok ->
+            State
+    end,
     epdg_metrics:inc(ikev2_packets_received_total),
-    {noreply, State};
+    {noreply, State1};
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -190,14 +204,92 @@ dispatch(ISPI, 0, Header, Data, FromIP, FromPort) ->
                 {error, Reason} ->
                     logger:error("Failed to start UE FSM: ~p", [Reason])
             end
-    end;
+    end,
+    ok;
 dispatch(_ISPI, RSPI, Header, Data, _FromIP, FromPort) ->
     case epdg_ue_registry:lookup_by_spi(RSPI) of
         {ok, Pid} ->
-            epdg_ue_fsm:handle_ikev2(Pid, Header, Data, FromPort);
+            epdg_ue_fsm:handle_ikev2(Pid, Header, Data, FromPort),
+            ok;
         error ->
-            logger:warning("IKEv2 for unknown RSPI ~.16B", [RSPI])
+            {unknown_spi, Header}
     end.
+
+%% A message for an IKE SA this ePDG does not know, typically from a UE
+%% whose tunnel was lost in an ePDG restart. RFC 7296 §2.21.4: a response
+%% MUST NOT be answered; a request MAY be answered with an unprotected
+%% INVALID_IKE_SPI, so the UE learns at once that its IKE SA is gone and
+%% sets up a new tunnel, instead of waiting for its own DPD to give up
+%% (KI-137). The answer leaves from the port the request arrived on, to
+%% the address and port it came from (§2.11).
+unknown_spi(#{responder_spi := RSPI, is_response := IsResp,
+              exchange_type_raw := ExType} = Header,
+            Sock, RecvPort, FromIP, FromPort,
+            #state{invalid_spi_window = Win} = State) ->
+    NowSec = erlang:monotonic_time(second),
+    {Outcome, Win1} =
+        case IsResp orelse ExType =:= ?EX_IKE_SA_INIT of
+            true ->
+                {"not answered (response)", Win};
+            false ->
+                case invalid_spi_allowed(NowSec, Win) of
+                    {true, W} ->
+                        Resp = invalid_ike_spi_response(Header),
+                        _ = send_on(Sock, RecvPort, FromIP, FromPort, Resp),
+                        epdg_metrics:inc(ike_invalid_spi_sent_total),
+                        {"answered INVALID_IKE_SPI", W};
+                    {false, W} ->
+                        {"not answered (rate cap)", W}
+                end
+        end,
+    logger:warning("IKEv2 for unknown RSPI ~.16B from ~p:~p, ~s",
+                   [RSPI, FromIP, FromPort, Outcome]),
+    State#state{invalid_spi_window = Win1}.
+
+%% Rate cap for the unprotected answers: at most ?INVALID_SPI_PER_SEC in
+%% one second of monotonic time.
+-spec invalid_spi_allowed(integer(), {integer(), non_neg_integer()}) ->
+          {boolean(), {integer(), non_neg_integer()}}.
+invalid_spi_allowed(NowSec, {NowSec, N}) when N >= ?INVALID_SPI_PER_SEC ->
+    {false, {NowSec, N}};
+invalid_spi_allowed(NowSec, {NowSec, N}) ->
+    {true, {NowSec, N + 1}};
+invalid_spi_allowed(NowSec, _Older) ->
+    {true, {NowSec, 1}}.
+
+%% RFC 7296 §2.21.4 / §1.5: not cryptographically protected, the IKE SPIs,
+%% exchange type and Message ID of the request copied, the Response flag
+%% set, the Initiator flag set only if the request came from the original
+%% responder, and one Notify payload INVALID_IKE_SPI without SPI or data.
+-spec invalid_ike_spi_response(map()) -> binary().
+invalid_ike_spi_response(#{initiator_spi := ISPI, responder_spi := RSPI,
+                           exchange_type_raw := ExType, message_id := MsgId,
+                           is_initiator := ReqFromInitiator}) ->
+    Notify = epdg_ikev2_codec:encode_notify_payload(0, ?N_INVALID_IKE_SPI,
+                                                     <<>>, <<>>),
+    {FirstPL, PayloadBin} = epdg_ikev2_codec:encode_payloads([{notify, Notify}]),
+    Flags = case ReqFromInitiator of
+        true  -> 16#20;
+        false -> 16#20 bor 16#08
+    end,
+    epdg_ikev2_codec:encode_header(#{initiator_spi     => ISPI,
+                                     responder_spi     => RSPI,
+                                     next_payload      => FirstPL,
+                                     exchange_type_raw => ExType,
+                                     flags             => Flags,
+                                     message_id        => MsgId,
+                                     payload_bin       => PayloadBin}).
+
+%% Send one IKE message; on 4500 with the non-ESP marker (RFC 3948).
+send_on(undefined, _LocalPort, _IP, _Port, _Data) ->
+    {error, closed};
+send_on(Sock, LocalPort, IP, Port, Data) ->
+    SendData = case LocalPort of
+        4500 -> <<0,0,0,0, Data/binary>>;
+        _    -> Data
+    end,
+    mirror_if_cleartext(out, Data, IP, Port, LocalPort),
+    gen_udp:send(Sock, IP, Port, SendData).
 
 %% IKE_SA_INIT is the only exchange that crosses the wire in the clear, so
 %% the listener is the right place to mirror it: both directions pass

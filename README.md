@@ -462,6 +462,9 @@ Served by Cowboy on `EPDG_API_PORT` (default 8080).
   `epdg_diameter_swm_peers` (gauge)
 * `epdg_xfrm_sa_active` (gauge), `epdg_xfrm_sa_created_total` / `_deleted_total` / `_errors_total`
 * `epdg_dpd_probes_sent_total`, `epdg_dpd_timeout_total`
+* `epdg_ike_invalid_spi_sent_total` — unprotected INVALID_IKE_SPI answers to
+  requests for an IKE SA this ePDG does not know (RFC 7296 §2.21.4), typically
+  the UEs of the tunnels lost in a restart; at most 100 per second
 * `epdg_mobike_update_total`, `epdg_mobike_rr_check_total`, `epdg_mobike_rr_fail_total`
 * `epdg_tun_startup_cleaned_total`
 * `epdg_ike_trace_subscribers` (gauge), `epdg_ike_trace_messages_total`,

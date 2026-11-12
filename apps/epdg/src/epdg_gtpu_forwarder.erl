@@ -979,11 +979,7 @@ setup_shared_tun(Name, Table, Prio, Pools) ->
             ],
             V6Cmds = case WantV6 of
                 true ->
-                    %% Make sure IPv6 is enabled on the TUN even if the
-                    %% host disables it by default.
-                    [io_lib:format("sysctl -wq net.ipv6.conf.~s.disable_ipv6=0",
-                                   [Name]),
-                     io_lib:format("ip -6 route replace default dev ~s table ~B",
+                    [io_lib:format("ip -6 route replace default dev ~s table ~B",
                                    [Name, Table])];
                 false ->
                     []
@@ -1000,6 +996,7 @@ setup_shared_tun(Name, Table, Prio, Pools) ->
             ],
             RuleCmds = [rule_cmd(Fam, "add", Sel, Table, Prio)
                         || {Fam, Sel} <- Selectors],
+            _ = WantV6 andalso ensure_ipv6_enabled(Name),
             run_cmds_or_warn(Name, BaseCmds ++ RouteCmds ++ V6Cmds ++ RuleCmds),
             %% The node's own replies to a UE (the co-located IMS IPsec
             %% gateway's SIP) come back into this TUN through the PGW-U
@@ -1307,6 +1304,30 @@ verify_sysctl_exact(Key, Expected) ->
             logger:error("sysctl ~s=~s (need ~s); add to pod "
                          "securityContext.sysctls or run in "
                          "privileged mode", [Key, Actual, Expected])
+    end.
+
+%% IPv6 must be enabled on the TUN for IPv6 UE pools. The kernel default
+%% is disable_ipv6=0, so only a host that disables IPv6 by default needs a
+%% write, and /proc/sys is read-only in the pod: write only when the
+%% value is 1, and say clearly when that write fails (KI-138).
+ensure_ipv6_enabled(Dev) ->
+    Key = "net.ipv6.conf." ++ Dev ++ ".disable_ipv6",
+    case read_sysctl(Key) of
+        "1" ->
+            Out = string:trim(os:cmd("sysctl -wq " ++ Key ++ "=0 2>&1")),
+            case read_sysctl(Key) of
+                "0" ->
+                    logger:notice("TUN ~s: IPv6 was disabled, enabled it", [Dev]);
+                _ ->
+                    logger:error("TUN ~s: IPv6 is disabled (~s=1) and could "
+                                 "not be enabled (~s); IPv6 UE traffic will "
+                                 "not pass. Set net.ipv6.conf.default."
+                                 "disable_ipv6=0 on the node.", [Dev, Key, Out])
+            end;
+        {error, Reason} ->
+            logger:warning("sysctl ~s: ~s", [Key, Reason]);
+        _ ->
+            ok
     end.
 
 %% rp_filter: 0 (none) and 2 (loose) are both safe for the ePDG's
