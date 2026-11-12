@@ -38,6 +38,7 @@ init() ->
         diameter_swm_latency_ms_sum,
         diameter_swm_latency_ms_count,
         diameter_swm_peers,
+        diameter_swm_transports_reaped_total,
         xfrm_sa_created_total,
         xfrm_sa_deleted_total,
         xfrm_sa_errors_total,

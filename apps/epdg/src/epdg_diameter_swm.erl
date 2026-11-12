@@ -45,7 +45,7 @@
 -ifdef(TEST).
 -export([session_state_marker/0]).
 %% Exported for eunit (epdg_swm_rar_tests).
--export([swm_session_held/2]).
+-export([swm_session_held/2, blocked_transport/1]).
 -endif.
 
 -define(SERVER, ?MODULE).
@@ -58,6 +58,9 @@
 -define(DNS_RETRY_INITIAL, 5000).
 -define(DNS_RETRY_MAX,    60000).
 -define(HEALTH_CHECK_INTERVAL, 30000).
+%% A transport process this far behind while it sits in a socket send is
+%% stuck (KI-175), see reap_blocked_transports/0.
+-define(BLOCKED_TRANSPORT_QUEUE, 5000).
 
 -record(state, {
     service_started :: boolean(),
@@ -648,11 +651,53 @@ is_origin(_)                   -> false.
 %%====================================================================
 
 check_transport_health(#state{transports = Ts}) ->
+    reap_blocked_transports(),
     TInfos = diameter:service_info(?SVC_NAME, transport),
     lists:foreach(fun(Info) when is_list(Info) ->
         check_single_transport(Info, Ts);
     (_) -> ok
     end, TInfos).
+
+%% KI-175: when a DRA association stops taking data, gen_sctp:send blocks
+%% without a timeout. The watchdog gives up on the peer and diameter sets up
+%% a new transport, but the old transport process never sees its DOWN
+%% message: it stayed for good, blocked in the send, with every later request
+%% queued behind it (15,000-32,000 messages, several MB each, after run r16).
+%% Killing it closes its socket (the kernel aborts the association); its
+%% queued requests were lost already. Only Diameter transport processes that
+%% sit in a socket send with a queue of ?BLOCKED_TRANSPORT_QUEUE are taken.
+reap_blocked_transports() ->
+    lists:foreach(
+      fun(P) ->
+              case blocked_transport(P) of
+                  {true, N} ->
+                      logger:warning("SWm transport ~p blocked in send with ~B "
+                                     "queued messages: killing it", [P, N]),
+                      epdg_metrics:inc(diameter_swm_transports_reaped_total),
+                      exit(P, kill);
+                  false ->
+                      ok
+              end
+      end, erlang:processes()).
+
+-spec blocked_transport(pid()) -> {true, non_neg_integer()} | false.
+blocked_transport(P) ->
+    case erlang:process_info(P, [current_function, message_queue_len]) of
+        [{current_function, {prim_inet, send, _}}, {message_queue_len, N}]
+          when N >= ?BLOCKED_TRANSPORT_QUEUE ->
+            case erlang:process_info(P, dictionary) of
+                {dictionary, D} ->
+                    case proplists:get_value('$initial_call', D) of
+                        {diameter_sctp, init, 1} -> {true, N};
+                        {diameter_tcp, init, 1}  -> {true, N};
+                        _                        -> false
+                    end;
+                _ ->
+                    false
+            end;
+        _ ->
+            false
+    end.
 
 check_single_transport(Info, Transports) ->
     Type = proplists:get_value(type, Info),
