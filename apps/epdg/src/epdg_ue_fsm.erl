@@ -767,7 +767,7 @@ handle_bearer_request(delete, #{seq_num := Seq, ebis := Ebis},
                         "PDN connection", [DefaultEbi, IMSI]),
             epdg_gtpc_client:send_bearer_response(
                 #{kind => delete, seq_num => Seq, teid => PgwCTeid,
-                  bearers => RespBearers}),
+                  linked_ebi => DefaultEbi}),
             _ = try_send_delete_informational(Data),
             {stop, {shutdown, pgw_bearer_delete}, Data};
         false ->

@@ -249,6 +249,17 @@ delete_bearer_response_encode_test() ->
     ?assertEqual(100, maps:get(type, D)),
     ?assertEqual(9, maps:get(seq_num, D)).
 
+%% A response to the deletion of the default bearer (PDN connection) must
+%% carry the Linked EPS Bearer ID and no Bearer Context (TS 29.274 Table
+%% 7.2.10.1-1): Open5GS releases the session only on the LBI and otherwise
+%% treats the answer as a dedicated-bearer deletion (KI-119 drain test,
+%% 2026-11-11: the session stayed until the PGW-C's drain timeout).
+delete_bearer_response_for_pdn_carries_lbi_test() ->
+    Bin = epdg_gtpc_codec:encode_delete_bearer_response(
+            #{seq_num => 9, teid => 16#AAAAAAAA, linked_ebi => 5}),
+    {ok, #{type := 100, ies := IEs}} = epdg_gtpc_codec:decode_header(Bin),
+    ?assertEqual([{cause, <<16, 0>>}, {ebi, <<5>>}], IEs).
+
 delete_bearer_request_decode_test() ->
     %% Delete Bearer Request (type 99) listing one dedicated EBI (6).
     EBI  = ie(73, <<6:8>>),

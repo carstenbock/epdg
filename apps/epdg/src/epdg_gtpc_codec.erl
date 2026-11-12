@@ -215,6 +215,16 @@ encode_update_bearer_response(#{seq_num := Seq, teid := TEID} = P) ->
     encode_bearer_ack(?UPDATE_BEARER_RSP, Seq, TEID, P).
 
 -spec encode_delete_bearer_response(map()) -> binary().
+encode_delete_bearer_response(#{seq_num := Seq, teid := TEID,
+                                linked_ebi := Lbi} = P) ->
+    %% Response to the deletion of the default bearer, i.e. of the PDN
+    %% connection: Cause + Linked EPS Bearer ID, no Bearer Context
+    %% (TS 29.274 Table 7.2.10.1-1). Without the LBI the PGW-C (Open5GS)
+    %% takes it for a dedicated-bearer deletion and keeps the session.
+    Cause = maps:get(cause, P, 16),
+    Body = iolist_to_binary([encode_cause_ie(Cause),
+                             encode_ie(?IE_EBI, <<0:4, Lbi:4>>)]),
+    encode_gtpv2_header(?DELETE_BEARER_RSP, TEID, Seq, Body);
 encode_delete_bearer_response(#{seq_num := Seq, teid := TEID} = P) ->
     encode_bearer_ack(?DELETE_BEARER_RSP, Seq, TEID, P).
 
