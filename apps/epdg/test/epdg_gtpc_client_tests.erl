@@ -60,6 +60,7 @@ retransmission_test_() ->
       fun csr_fails_after_n3_and_the_caller_hears_it_first/0,
       fun delete_session_is_retransmitted_too/0,
       fun pending_calls_fail_when_the_pgw_restarts/0,
+      fun restart_seen_in_a_csr_spares_the_session_it_creates/0,
       fun echo_is_retransmitted_before_a_miss_is_counted/0]}.
 
 %% The PGW misses the first Create Session Request; the retransmission is
@@ -125,6 +126,42 @@ pending_calls_fail_when_the_pgw_restarts() ->
         ?assertEqual({error, pgw_restarted}, Res),
         ?assertEqual(1, metric(gtpc_peer_restarts_total))
     after teardown(S) end.
+
+%% KI-148: the first message from a restarted PGW-C can be the Create
+%% Session Response of a new attach, carrying the new Recovery value. Every
+%% session from before the restart is gone and must be told, but the one this
+%% response creates is alive: tearing it down cost the UE its fresh tunnel.
+restart_seen_in_a_csr_spares_the_session_it_creates() ->
+    S = setup(#{}),
+    {Pgw, _} = S,
+    Reg = start(epdg_ue_registry),
+    Self = self(),
+    Fsm = fun(Spi, Work) ->
+        spawn(fun() ->
+            ok = epdg_ue_registry:register(Spi, self(), undefined),
+            Res = Work(),
+            Got = receive {'$gen_cast', pgw_restart} -> pgw_restart
+                  after 200 -> none end,
+            Self ! {Spi, Res, Got}
+        end)
+    end,
+    try
+        %% Learn the PGW's Recovery value (7) from a first exchange.
+        {ok, _} = epdg_gtpc_client:delete_session_request(#{pgw_c_teid => 1, ebi => 5}),
+        ok = fake_pgw:set_recovery(Pgw, 9),
+        Fsm(1, fun() -> ok end),                     % a session from before
+        timer:sleep(20),
+        Fsm(2, fun() -> epdg_gtpc_client:create_session_request(csr_params()) end),
+        Old = receive {1, _, G1} -> G1 after 1000 -> no_answer end,
+        {New, NewGot} = receive {2, R2, G2} -> {R2, G2} after 1000 -> {no_answer, x} end,
+        ?assertEqual(pgw_restart, Old),
+        ?assertMatch({ok, _}, New),
+        ?assertEqual(none, NewGot),
+        ?assertEqual(1, metric(gtpc_peer_restarts_total))
+    after
+        catch gen_server:stop(Reg),
+        teardown(S)
+    end.
 
 %% Echo: a miss is counted only after the retransmissions went unanswered.
 echo_is_retransmitted_before_a_miss_is_counted() ->

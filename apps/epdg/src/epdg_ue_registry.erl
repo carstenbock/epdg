@@ -13,7 +13,7 @@
          register_cteid/2, lookup_by_cteid/1, unregister_cteid/1,
          register_esp_spis/3, unregister_esp_spis/2, esp_spi_claimed/1,
          lookup_by_spi/1, lookup_by_imsi/1,
-         count/0, all/0, broadcast/1]).
+         count/0, all/0, broadcast/1, broadcast/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
@@ -151,8 +151,15 @@ all() ->
 %% orderly tunnel teardown across every session.
 -spec broadcast(term()) -> ok.
 broadcast(Msg) ->
+    broadcast(Msg, none).
+
+%% As broadcast/1, but not to Except (a pid, or none).
+-spec broadcast(term(), pid() | none) -> ok.
+broadcast(Msg, Except) ->
     lists:foreach(
-      fun({_SPI, Pid, _IMSI}) when is_pid(Pid) ->
+      fun({_SPI, Pid, _IMSI}) when Pid =:= Except ->
+              ok;
+         ({_SPI, Pid, _IMSI}) when is_pid(Pid) ->
               case is_process_alive(Pid) of
                   true  -> gen_statem:cast(Pid, Msg);
                   false -> ok

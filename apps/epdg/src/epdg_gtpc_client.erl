@@ -695,7 +695,7 @@ resolve_and_send(Bin, #state{socket = S, pgw_port = P} = State) ->
 
 deliver_response(Seq, Msg, #state{pending = Pending, epoch = Epoch} = State0, Kind) ->
     case maps:find(Seq, Pending) of
-        {ok, #pending_call{from = From, timer_ref = Ref,
+        {ok, #pending_call{from = {Caller, _} = From, timer_ref = Ref,
                             epoch = E}} when E =:= Epoch ->
             erlang:cancel_timer(Ref),
             epdg_metrics:inc(gtpc_responses_total),
@@ -705,9 +705,16 @@ deliver_response(Seq, Msg, #state{pending = Pending, epoch = Epoch} = State0, Ki
                 _ ->
                     {ok, Msg}
             end,
-            gen_server:reply(From, Decoded),
             State1 = State0#state{pending = maps:remove(Seq, Pending)},
-            apply_recovery(Msg, mark_peer_up(State1));
+            %% A new Recovery value in this response means the PGW restarted
+            %% before it answered: every session from before is gone, but the
+            %% one this response creates is not. Its FSM is excluded from the
+            %% pgw_restart broadcast; up to 0.0.108 it got it too and tore the
+            %% new session down when a restarted PGW-C's first message was a
+            %% Create Session Response rather than an Echo Response (KI-148).
+            State2 = apply_recovery(Msg, mark_peer_up(State1), Caller),
+            gen_server:reply(From, Decoded),
+            State2;
         {ok, #pending_call{from = From, timer_ref = Ref}} ->
             %% Stale epoch: the PGW restarted since the request was sent,
             %% so this answer describes a session that is gone.
@@ -722,26 +729,30 @@ deliver_response(Seq, Msg, #state{pending = Pending, epoch = Epoch} = State0, Ki
 %% PGW has restarted (TS 29.274 §7.1.3) so every outstanding session
 %% is dead: broadcast pgw_restart and bump the epoch so late answers
 %% to old requests are discarded.
-apply_recovery(#{ies := IEs}, State) ->
+apply_recovery(Msg, State) ->
+    apply_recovery(Msg, State, none).
+
+%% Except: the UE FSM whose request this message answers, or none.
+apply_recovery(#{ies := IEs}, State, Except) ->
     case lists:keyfind(recovery, 1, IEs) of
         {recovery, Bin} ->
             case epdg_gtpc_codec:decode_recovery(Bin) of
                 undefined -> State;
-                R -> update_recovery(R, State)
+                R -> update_recovery(R, State, Except)
             end;
         _ -> State
     end.
 
-update_recovery(R, #state{peer_recovery = undefined} = State) ->
+update_recovery(R, #state{peer_recovery = undefined} = State, _Except) ->
     logger:info("GTP-C: peer initial Recovery=~B", [R]),
     State#state{peer_recovery = R};
-update_recovery(R, #state{peer_recovery = R} = State) ->
+update_recovery(R, #state{peer_recovery = R} = State, _Except) ->
     State;
-update_recovery(RNew, #state{peer_recovery = ROld, epoch = Epoch} = State) ->
+update_recovery(RNew, #state{peer_recovery = ROld, epoch = Epoch} = State, Except) ->
     logger:warning("GTP-C: peer Recovery changed ~B → ~B (PGW restart)",
                    [ROld, RNew]),
     epdg_metrics:inc(gtpc_peer_restarts_total),
-    catch epdg_ue_registry:broadcast(pgw_restart),
+    catch epdg_ue_registry:broadcast(pgw_restart, Except),
     (fail_pending(pgw_restarted, State))#state{peer_recovery = RNew,
                                                epoch = Epoch + 1}.
 
