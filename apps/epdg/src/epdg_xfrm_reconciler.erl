@@ -38,7 +38,7 @@
          terminate/2, code_change/3]).
 %% Pure sweep planning and ownership scoping, exported for the EUnit
 %% suite (epdg_xfrm_reconciler_tests).
--export([plan/4, owned_sas/2, owned_policies/2]).
+-export([plan/4, owned_sas/2, owned_policies/2, sa_gauge/2]).
 
 -define(SERVER, ?MODULE).
 
@@ -141,7 +141,15 @@ do_sweep(#state{local_ip = Local, grace_ms = GraceMs,
 
     {Delete, Pending1} = plan(SaItems ++ PolItems, Pending0, Now, GraceMs),
     lists:foreach(fun(Key) -> delete_item(Key) end, Delete),
+    %% The SA gauge counts this pod's creates and deletes, so the SAs of a
+    %% previous incarnation, removed here as orphans, pulled it below zero
+    %% (KI-59). Set it from the kernel: our SAs minus the orphans just gone.
+    epdg_metrics:gauge_set(xfrm_sa_active, sa_gauge(SAs, Delete)),
     State#state{pending = Pending1}.
+
+%% SAs left in the kernel after this sweep's deletions.
+sa_gauge(SAs, Delete) ->
+    length(SAs) - length([K || {sa, _, _, _} = K <- Delete]).
 
 %% Delete one aged-out orphan. Failures are logged by epdg_xfrm; the
 %% item simply shows up again next sweep.

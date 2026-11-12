@@ -73,3 +73,12 @@ mixed_sweep_test() ->
         epdg_xfrm_reconciler:plan(Items, Pending, ?GRACE, ?GRACE),
     ?assertEqual([sa(2)], Delete),
     ?assertEqual(#{sa(3) => ?GRACE}, NewPending).
+
+%% KI-59: after a restart the reconciler removes the previous pod's SAs;
+%% the gauge must then show the SAs that are left, the live sessions' ones.
+sa_gauge_counts_what_is_left_in_the_kernel_test() ->
+    Live = #{src => {1,1,1,1}, dst => {2,2,2,2}, spi => 1},
+    Old  = #{src => {1,1,1,1}, dst => {2,2,2,2}, spi => 2},
+    Delete = [{sa, {1,1,1,1}, {2,2,2,2}, 2}, {pol, "a", "b", in}],
+    ?assertEqual(1, epdg_xfrm_reconciler:sa_gauge([Live, Old], Delete)),
+    ?assertEqual(0, epdg_xfrm_reconciler:sa_gauge([], [])).

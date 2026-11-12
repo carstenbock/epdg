@@ -40,6 +40,12 @@ init([]) ->
           start => {epdg_gtpu_forwarder, start_link, []},
           restart => permanent, shutdown => 5000, type => worker},
 
+        %% After the forwarder (it sets up the XFRM interface the check
+        %% hooks on) and before any UE FSM, restored ones included.
+        #{id => epdg_srccheck,
+          start => {epdg_srccheck, start_link, []},
+          restart => permanent, shutdown => 5000, type => worker},
+
         #{id => epdg_diameter_swm,
           start => {epdg_diameter_swm, start_link, []},
           restart => permanent, shutdown => 5000, type => worker},

@@ -2102,10 +2102,10 @@ finalize_ike_auth_setup(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
     %% happens to carry only if the stash is empty (defensive).
     {UeTsi, UeTsr} = extract_ts_stashed_or(Data0, InnerPayloads),
 
-    install_child_sas(PeerIP, PeerPort, PeerSPI, ResponderSPI,
-                       ChildSuite,
-                       SkEiChild, SkAiChild, SkErChild, SkArChild,
-                       UeInnerIp, UeInnerIp6),
+    SrcMark = install_child_sas(PeerIP, PeerPort, PeerSPI, ResponderSPI,
+                                ChildSuite,
+                                SkEiChild, SkAiChild, SkErChild, SkArChild,
+                                UeInnerIp, UeInnerIp6),
 
     %% Bearer registration with the GTP-U forwarder already happened in
     %% register_bearer_then_finalize/19, before any kernel state was
@@ -2176,6 +2176,10 @@ finalize_ike_auth_setup(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
                 child_sa = #{spi_in  => ResponderSPIInt,
                              spi_out => binary_to_int(PeerSPI),
                              suite   => ChildRespSuite,
+                             %% Source-check mark of the inbound SA (KI-58);
+                             %% a restore asks for it again, since an
+                             %% adopted kernel SA keeps writing it.
+                             src_mark => SrcMark,
                              %% Everything needed to re-install this Child SA
                              %% against a new outer address on a MOBIKE move
                              %% (RFC 4555 §3.2) or to delete it precisely on
@@ -2487,6 +2491,12 @@ install_child_sas({U_A, U_B, U_C, U_D} = UeOuter, PeerPort, PeerSPI, RespSPI,
     catch epdg_xfrm:delete_sa(#{spi => SpiOutInt,
                                 src_ip => LocalOuter, dst_ip => UeOuter}),
 
+    %% Source check (KI-58): the inbound SA marks what it decrypts, and the
+    %% UE's addresses are registered under that mark before the SA exists,
+    %% so no packet of this UE passes unchecked. undefined when the check
+    %% is off.
+    SrcMark = epdg_srccheck:claim(self(), UeInnerIp, UeInnerIp6, undefined),
+
     %% Inbound SA: UE → ePDG (SPI = responder SPI we picked)
     InboundParams0 = #{spi => SpiInInt,
                         src_ip => UeOuter,
@@ -2498,7 +2508,7 @@ install_child_sas({U_A, U_B, U_C, U_D} = UeOuter, PeerPort, PeerSPI, RespSPI,
                         enc_key => SkEiChild,
                         auth_alg => IntegAlgIn,
                         auth_key => SkAiChild},
-    InboundParams = maybe_nat_t(InboundParams0, UeOuter, PeerPort),
+    InboundParams = maybe_nat_t(with_src_mark(InboundParams0, SrcMark), UeOuter, PeerPort),
     %% Surface the real return of the xfrm call instead of swallowing it.
     %% A silent failure here (EPERM, shell syntax error, etc.) leaves the
     %% kernel without an IPsec SA while IKE_AUTH still completes, and the
@@ -2524,7 +2534,12 @@ install_child_sas({U_A, U_B, U_C, U_D} = UeOuter, PeerPort, PeerSPI, RespSPI,
     install_ue_policies(UeOuter, LocalOuter, Reqid, UeInnerIp, UeInnerIp6),
 
     _ = {U_A, U_B, U_C, U_D},  %% silence unused
-    ok.
+    SrcMark.
+
+with_src_mark(Params, Mark) when is_integer(Mark) ->
+    Params#{set_mark => Mark, set_mark_mask => 16#FFFFE000};
+with_src_mark(Params, undefined) ->
+    Params.
 
 %% The three per-UE XFRM policies (in/fwd/out) plus the IPv6 set when the
 %% PDN is dual-stack. `create_policy` uses `ip xfrm policy update`
@@ -3631,6 +3646,10 @@ restore_child_sas(#data{peer_ip = PeerIP, peer_port = PeerPort,
                          suite := Suite, sk_ei := Ei, sk_ai := Ai,
                          sk_er := Er, sk_ar := Ar}} ->
             LocalOuter = local_outer_ip(),
+            %% Ask for the mark the session had: an adopted inbound SA
+            %% keeps writing it (KI-58).
+            _ = epdg_srccheck:claim(self(), InnerIp, InnerIp6,
+                                    maps:get(src_mark, ChildSA, undefined)),
             BothPresent =
                 sets:is_element({PeerIP, LocalOuter, SpiIn}, ExistingSAs)
                 andalso

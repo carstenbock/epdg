@@ -95,6 +95,10 @@ init() ->
     %% inbound policy in the node's global table would claim the IMS IPsec
     %% gateway's packets too.
     set_from_env("EPDG_XFRM_POLICY_MODE", xfrm_policy_mode, "static"),
+    %% Static mode only: bind each UE's uplink to its inner address with a
+    %% per-UE SA mark and an nftables set (epdg_srccheck, KI-58). "false"
+    %% leaves the inner source unchecked, as 0.0.102 to 0.0.106 did.
+    set_from_env("EPDG_XFRM_SOURCE_CHECK", xfrm_source_check, "true"),
     %% MTU of that interface: the largest inner packet that goes into one
     %% ESP packet. Must leave room for the tunnel overhead (up to ~90 bytes
     %% with NAT-T) below the smallest MTU on the way to the UE.

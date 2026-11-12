@@ -42,6 +42,10 @@
          prepare_request/3, prepare_retransmit/3,
          handle_answer/4, handle_error/4, handle_request/3]).
 
+-ifdef(TEST).
+-export([session_state_marker/0]).
+-endif.
+
 -define(SERVER, ?MODULE).
 -define(SVC_NAME, epdg_diameter_svc).
 -define(APP_ALIAS, swm).
@@ -132,7 +136,7 @@ init([]) ->
     %% service references it as `dictionary'.
     _ = code:ensure_loaded(diameter_gen_swm),
 
-    OriginStateId = erlang:system_time(second),
+    OriginStateId = origin_state_id(),
     SvcOpts = [
         {'Origin-Host',  to_bin(OriginHost)},
         {'Origin-Realm', to_bin(OriginRealm)},
@@ -307,7 +311,8 @@ send_der(#{session_id := SessionId, eap_payload := EAPPayload} = Opts) ->
     %% RFC 6733 §6.8 / 3GPP TS 29.273: pin follow-up DERs of a session to
     %% the AAA that anchored the first DEA. The DRA honours Destination-Host
     %% over load-balancing realm-based routing.
-    Msg  = maybe_add(Msg2, 'Destination-Host', DestHost),
+    Msg3 = maybe_add(Msg2, 'Destination-Host', DestHost),
+    Msg  = maybe_add(Msg3, 'Origin-State-Id', session_state_marker()),
     do_call(Msg, fun parse_dea/1);
 
 send_der(_Opts) ->
@@ -349,7 +354,8 @@ send_str(#{session_id := SessionId} = Opts) ->
             {'Auth-Application-Id', ?SWM_APP_ID},
             {'Termination-Cause', Cause}],
     Msg0 = maybe_add(Base, 'User-Name', UserName),
-    Msg  = maybe_add(Msg0, 'Destination-Host', DestHost),
+    Msg1 = maybe_add(Msg0, 'Destination-Host', DestHost),
+    Msg  = maybe_add(Msg1, 'Origin-State-Id', session_state_marker()),
     do_call(Msg, fun parse_sta/1);
 
 send_str(_Opts) ->
@@ -847,6 +853,28 @@ to_bin(L) when is_list(L)   -> list_to_binary(L).
 
 to_list(L) when is_list(L)   -> L;
 to_list(B) when is_binary(B) -> binary_to_list(B).
+
+%% RFC 6733 §8.16: one value per start of the node, kept in a persistent
+%% term so a restart of this server alone (UE sessions intact) keeps it.
+origin_state_id() ->
+    case persistent_term:get({?MODULE, origin_state_id}, undefined) of
+        undefined ->
+            V = erlang:system_time(second),
+            persistent_term:put({?MODULE, origin_state_id}, V),
+            V;
+        V ->
+            V
+    end.
+
+%% Origin-State-Id in DER and STR lets the AAA server, which sees this node
+%% only through the DRA and never its CER, remove the sessions of an earlier
+%% start once a higher value arrives (KI-46). With the session store, the
+%% sessions survive a restart, so no value is sent and nothing is removed.
+session_state_marker() ->
+    case epdg_session_store:enabled() of
+        true -> undefined;
+        false -> origin_state_id()
+    end.
 
 maybe_add(Msg, _K, undefined) -> Msg;
 maybe_add(Msg, K, V) -> Msg ++ [{K, V}].

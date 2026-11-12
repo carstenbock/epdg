@@ -20,12 +20,13 @@
          create_sa/4, delete_sa/1, flush_sa_endpoint/1,
          create_policy/2, delete_policy/2,
          route/4, flush_all/0,
-         list_sas/1, list_policies/1, dev_accept_local/2]).
+         list_sas/1, list_policies/1, dev_accept_local/2,
+         nft_setelem/4]).
 
 -ifdef(TEST).
 -export([encode_sa_info/1, encode_policy_info/1, encode_tmpl/1,
          encode_selector/1, parse_cidr/1, format_cidr/2, nla/2,
-         decode_sa_info/1, decode_policy/1]).
+         decode_sa_info/1, decode_policy/1, nft_setelem_msg/5]).
 -endif.
 
 %% Families and protocols
@@ -70,7 +71,26 @@
 -define(XFRMA_REPLAY_ESN_VAL, 23).
 -define(XFRMA_ADDRESS_FILTER, 26).
 -define(XFRMA_OFFLOAD_DEV,   28).
+-define(XFRMA_SET_MARK,      29).
+-define(XFRMA_SET_MARK_MASK, 30).
 -define(XFRMA_IF_ID,         31).
+
+%% nf_tables over NETLINK_NETFILTER (KI-58 source check)
+-define(NETLINK_NETFILTER,      12).
+-define(NFNL_SUBSYS_NFTABLES,   10).
+-define(NFNL_MSG_BATCH_BEGIN,   16).
+-define(NFNL_MSG_BATCH_END,     17).
+-define(NFT_MSG_NEWSETELEM,     12).
+-define(NFT_MSG_DELSETELEM,     14).
+-define(NFPROTO_INET,            1).
+-define(NFTA_SET_ELEM_LIST_TABLE,    1).
+-define(NFTA_SET_ELEM_LIST_SET,      2).
+-define(NFTA_SET_ELEM_LIST_ELEMENTS, 3).
+-define(NFTA_LIST_ELEM,              1).
+-define(NFTA_SET_ELEM_KEY,           1).
+-define(NFTA_SET_ELEM_KEY_END,      10).
+-define(NFTA_DATA_VALUE,             1).
+-define(NLA_F_NESTED,          16#8000).
 
 -define(XFRM_MODE_TRANSPORT, 0).
 -define(XFRM_MODE_TUNNEL,    1).
@@ -88,7 +108,6 @@
 -define(IFLA_AF_SPEC, 26).
 -define(IFLA_INET_CONF, 1).
 -define(IPV4_DEVCONF_ACCEPT_LOCAL, 23).
--define(NLA_F_NESTED, 16#8000).
 -define(RTA_DST,   1).
 -define(RTA_OIF,   4).
 -define(RTA_TABLE, 15).
@@ -135,6 +154,7 @@ create_sa(#{spi := SPI, src_ip := Src, dst_ip := Dst,
              encap_attr(Params, Src),
              esn_attr(Params),
              if_id_attr(If),
+             set_mark_attr(Params),
              offload_attr(Offload, Iface, maps:get(sa_dir, Params, in))],
     request(?NETLINK_XFRM, ?XFRM_MSG_NEWSA,
             ?NLM_F_REQUEST bor ?NLM_F_ACK bor ?NLM_F_CREATE bor ?NLM_F_EXCL,
@@ -151,15 +171,15 @@ delete_sa(#{spi := SPI}) ->
     %% acceptable here, as `ip xfrm state deleteall spi' did.
     case dump(?NETLINK_XFRM, ?XFRM_MSG_GETSA, <<>>, []) of
         {ok, Msgs} ->
-            lists:foreach(
-              fun({?XFRM_MSG_NEWSA, Bin}) ->
-                      case decode_sa_info(Bin) of
-                          #{spi := SPI, src := S, dst := D, family := F} -> delsa(S, D, SPI, F);
-                          _ -> ok
-                      end;
-                 (_) -> ok
-              end, Msgs),
-            ok;
+            Results = [delsa(S, D, SPI, F)
+                       || {?XFRM_MSG_NEWSA, Bin} <- Msgs,
+                          #{spi := SPI0, src := S, dst := D, family := F} <- [decode_sa_info(Bin)],
+                          SPI0 =:= SPI],
+            %% ok only when an SA was removed, as for a delete by address.
+            case lists:member(ok, Results) of
+                true -> ok;
+                false -> {error, esrch}
+            end;
         E -> E
     end;
 delete_sa(_) ->
@@ -490,6 +510,70 @@ request(Proto, Type, Flags, Payload, Attrs) ->
         {error, R} -> {error, R}
     end.
 
+%% Add or delete nf_tables set elements in one batch. Elements are
+%% {Key, KeyEnd} with KeyEnd = undefined for a set without intervals; keys
+%% are the concatenated field values, each padded to 4 bytes. A batch is
+%% all or nothing in the kernel. Adding an element that exists and deleting
+%% one that does not are both ok, so callers can repeat an operation.
+-spec nft_setelem(add | del, string(), string(), [{binary(), binary() | undefined}]) ->
+          ok | {error, term()}.
+nft_setelem(_Op, _Table, _Set, []) ->
+    ok;
+nft_setelem(Op, Table, Set, Elems) ->
+    case nl_open(?NETLINK_NETFILTER) of
+        {ok, S} ->
+            try
+                Seq = erlang:unique_integer([positive]) band 16#3FFFFFFF,
+                Msg = nft_setelem_msg(Op, Table, Set, Elems, Seq),
+                ok = socket:sendto(S, Msg, #{family => ?AF_NETLINK,
+                                             addr => <<0:16, 0:32, 0:32>>}),
+                case socket:recvfrom(S, 0, ?RECV_TIMEOUT_MS) of
+                    {ok, {_, Bin}} ->
+                        case {Op, ack_of(Bin, Seq + 1)} of
+                            {_, 0} -> ok;
+                            {add, {eexist, _}} -> ok;
+                            {add, eexist} -> ok;
+                            {del, {enoent, _}} -> ok;
+                            {del, enoent} -> ok;
+                            {_, {Errno, Text}} when is_integer(Errno) ->
+                                {error, {errno(Errno), Text}};
+                            {_, Errno} when is_integer(Errno) -> {error, errno(Errno)};
+                            {_, Other} -> {error, Other}
+                        end;
+                    {error, R} -> {error, R}
+                end
+            catch C:R2 -> {error, {C, R2}}
+            after socket:close(S)
+            end;
+        {error, R} -> {error, R}
+    end.
+
+%% BATCH_BEGIN (Seq), the element message (Seq + 1, acknowledged), BATCH_END.
+nft_setelem_msg(Op, Table, Set, Elems, Seq) ->
+    Type = (?NFNL_SUBSYS_NFTABLES bsl 8) bor
+           case Op of add -> ?NFT_MSG_NEWSETELEM; del -> ?NFT_MSG_DELSETELEM end,
+    Flags = ?NLM_F_REQUEST bor ?NLM_F_ACK bor
+            case Op of add -> ?NLM_F_CREATE; del -> 0 end,
+    %% struct nfgenmsg: family, version, res_id (big endian)
+    BatchHdr = <<0:8, 0:8, ?NFNL_SUBSYS_NFTABLES:16/big>>,
+    ElemHdr  = <<?NFPROTO_INET:8, 0:8, 0:16/big>>,
+    List = [nla_nested(?NFTA_LIST_ELEM,
+                       [nla_nested(?NFTA_SET_ELEM_KEY, [nla(?NFTA_DATA_VALUE, K)]),
+                        case E of
+                            undefined -> <<>>;
+                            _ -> nla_nested(?NFTA_SET_ELEM_KEY_END, [nla(?NFTA_DATA_VALUE, E)])
+                        end])
+            || {K, E} <- Elems],
+    Attrs = [nla(?NFTA_SET_ELEM_LIST_TABLE, <<(list_to_binary(Table))/binary, 0>>),
+             nla(?NFTA_SET_ELEM_LIST_SET, <<(list_to_binary(Set))/binary, 0>>),
+             nla_nested(?NFTA_SET_ELEM_LIST_ELEMENTS, List)],
+    iolist_to_binary([nlmsg(?NFNL_MSG_BATCH_BEGIN, ?NLM_F_REQUEST, Seq, BatchHdr, []),
+                      nlmsg(Type, Flags, Seq + 1, ElemHdr, Attrs),
+                      nlmsg(?NFNL_MSG_BATCH_END, ?NLM_F_REQUEST, Seq + 2, BatchHdr, [])]).
+
+nla_nested(Type, Children) ->
+    nla(Type bor ?NLA_F_NESTED, iolist_to_binary(Children)).
+
 %% A dump: [{Type, Payload}] of every message until NLMSG_DONE.
 dump(Proto, Type, Payload, Attrs) ->
     case nl_open(Proto) of
@@ -538,6 +622,13 @@ nlmsg(Type, Flags, Seq, Payload, Attrs) ->
     Body = iolist_to_binary([pad4(Payload), Attrs]),
     Len = 16 + byte_size(Body),
     <<Len:32/native, Type:16/native, Flags:16/native, Seq:32/native, 0:32/native, Body/binary>>.
+
+%% Mark the packets this SA decrypts (KI-58): bits outside the mask keep
+%% the outer packet's mark. Inbound SAs only; the caller decides.
+set_mark_attr(#{set_mark := M, set_mark_mask := Mask}) when is_integer(M) ->
+    [nla(?XFRMA_SET_MARK, <<M:32/native>>), nla(?XFRMA_SET_MARK_MASK, <<Mask:32/native>>)];
+set_mark_attr(_) ->
+    [].
 
 nla(Type, Value) when is_binary(Value) ->
     pad4(<<(4 + byte_size(Value)):16/native, Type:16/native, Value/binary>>).

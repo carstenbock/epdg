@@ -356,13 +356,20 @@ do_create_sa(#{spi := SPI, src_ip := Src, dst_ip := Dst,
          enc_alg_str(EncAlg), bin2hex(EncKey), AuthPart, EncapPart,
          if_id_part(xfrm_if())]),
 
+    %% Per-UE mark for the source check (KI-58), inbound SAs only.
+    MarkPart = case Params of
+        #{set_mark := M, set_mark_mask := Mask} when is_integer(M) ->
+            io_lib:format(" output-mark 0x~.16B mask 0x~.16B", [M, Mask]);
+        _ -> ""
+    end,
+
     OffloadPart = case Offload of
         inline -> io_lib:format(" offload packet dev ~s", [Iface]);
         crypto -> io_lib:format(" offload crypto dev ~s", [Iface]);
         none   -> ""
     end,
 
-    case run_cmd(lists:flatten([Cmd, OffloadPart])) of
+    case run_cmd(lists:flatten([Cmd, MarkPart, OffloadPart])) of
         ok ->
             epdg_metrics:inc(xfrm_sa_created_total),
             epdg_metrics:gauge_inc(xfrm_sa_active),
@@ -373,10 +380,12 @@ do_create_sa(#{spi := SPI, src_ip := Src, dst_ip := Dst,
 do_create_sa(_, _) ->
     {error, invalid_params}.
 
+%% The SA counters move only when the kernel removed an SA. Every attach first
+%% deletes the UE's previous SAs by SPI (re-dial handling), and most of those
+%% deletes find nothing; counting them drove `xfrm_sa_active' negative (KI-59).
 do_delete_sa(netlink, Params) ->
     R = epdg_xfrm_nl:delete_sa(Params),
-    epdg_metrics:inc(xfrm_sa_deleted_total),
-    epdg_metrics:gauge_dec(xfrm_sa_active),
+    count_sa_delete(R),
     case R of {error, invalid_params} = E -> E; _ -> ok end;
 do_delete_sa(ip, Params) ->
     do_delete_sa(Params).
@@ -385,18 +394,22 @@ do_delete_sa(#{spi := SPI, src_ip := Src, dst_ip := Dst}) ->
     Cmd = io_lib:format(
         "ip xfrm state delete src ~s dst ~s proto esp spi 0x~.16B",
         [ip_str(Src), ip_str(Dst), SPI]),
-    _ = run_cmd(lists:flatten(Cmd)),
-    epdg_metrics:inc(xfrm_sa_deleted_total),
-    epdg_metrics:gauge_dec(xfrm_sa_active),
+    count_sa_delete(run_cmd(lists:flatten(Cmd))),
     ok;
 do_delete_sa(#{spi := SPI}) ->
+    %% `deleteall' prints nothing whether or not an SA matched, so this rare
+    %% path (outer addresses lost) leaves the counters alone.
     Cmd = io_lib:format("ip xfrm state deleteall spi 0x~.16B 2>/dev/null", [SPI]),
     _ = run_cmd(lists:flatten(Cmd)),
-    epdg_metrics:inc(xfrm_sa_deleted_total),
-    epdg_metrics:gauge_dec(xfrm_sa_active),
     ok;
 do_delete_sa(_) ->
     {error, invalid_params}.
+
+count_sa_delete(ok) ->
+    epdg_metrics:inc(xfrm_sa_deleted_total),
+    epdg_metrics:gauge_dec(xfrm_sa_active);
+count_sa_delete(_) ->
+    ok.
 
 %% Purge every ESP SA for a (src,dst) endpoint pair. `ip xfrm state
 %% deleteall` filters by the supplied selectors (here src/dst/proto),
@@ -584,14 +597,15 @@ if_id_part(_)           -> "".
 %% reconciler, which only considers policies whose template names this
 %% pod's outer address, never treats them as orphans.
 %%
-%% SPEC-DEVIATION: RFC 7296 clause 2.9, TS 33.402 clause 8.2 -- in static
-%% mode the kernel no longer enforces the negotiated traffic selector (TSi =
-%% the UE's PAA) on the inner source address: the wildcard inbound and
-%% forward policies accept any inner address out of any SA of the
-%% interface, so a UE could send packets with another UE's inner address
-%% into that UE's bearer. per-ue mode enforces it, at the price of the
-%% flushes above. Enforcement without flushes (an SA mark per UE, checked
-%% against the UE's address in nftables) is the follow-up recorded as KI-58.
+%% The wildcard inbound and forward policies accept any inner source address
+%% out of any SA of the interface. The negotiated traffic selector (TSi = the
+%% UE's PAA, RFC 7296 clause 2.9, TS 33.402 clause 8.2) is enforced instead by
+%% epdg_srccheck: an SA mark per UE, checked against the UE's address in
+%% nftables, which costs no route-cache flush (KI-58, ADR-0042).
+%% SPEC-DEVIATION: RFC 7296 clause 2.9, TS 33.402 clause 8.2 -- only with
+%% EPDG_XFRM_SOURCE_CHECK=false, or when the nftables table cannot be
+%% created (logged): then a UE can send packets with another UE's inner
+%% address into that UE's bearer.
 
 %% Static policies need the interface scope: in the node's global table a
 %% wildcard inbound policy would claim the IMS IPsec gateway's packets too.

@@ -63,6 +63,8 @@ kernel_test_() ->
             {setup, fun() -> epdg_xfrm_nl:flush_all() end, fun(_) -> epdg_xfrm_nl:flush_all() end,
              [fun sa_fields_agree_with_ip/0,
               fun gcm_sa_is_an_aead_state/0,
+              fun deleting_a_missing_sa_is_reported/0,
+              fun inbound_sa_carries_the_source_check_mark/0,
               fun flush_endpoint_removes_both_sas/0,
               fun policy_fields_agree_with_ip/0,
               fun wildcard_policies_stay_outside_the_reconcilers_view/0,
@@ -109,6 +111,25 @@ gcm_sa_is_an_aead_state() ->
     ?assertNotEqual(nomatch, string:find(Out, "aead rfc4106(gcm(aes))")),
     ?assertNotEqual(nomatch, string:find(Out, " 128")),
     ok = epdg_xfrm_nl:delete_sa(#{spi => 16#2222}).
+
+%% The SA gauge counts a delete only when this returns ok (KI-59), so a
+%% delete that finds nothing must say so, by address and by SPI alone.
+deleting_a_missing_sa_is_reported() ->
+    ?assertMatch({error, _}, epdg_xfrm_nl:delete_sa(
+                               #{spi => 16#3333, src_ip => ?UE_OUTER, dst_ip => ?EPDG_OUTER})),
+    ?assertEqual({error, esrch}, epdg_xfrm_nl:delete_sa(#{spi => 16#3333})).
+
+%% KI-58: the inbound SA writes the UE's mark into what it decrypts,
+%% leaving bits 0 to 12 to the node.
+inbound_sa_carries_the_source_check_mark() ->
+    ok = epdg_xfrm_nl:create_sa(
+           #{spi => 16#4444, src_ip => ?UE_OUTER, dst_ip => ?EPDG_OUTER,
+             enc_alg => aes_cbc_128, enc_key => ?KEY16, auth_alg => hmac_sha256,
+             auth_key => binary:copy(<<1>>, 32), sa_dir => in, reqid => 6,
+             set_mark => 16#4000, set_mark_mask => 16#FFFFE000},
+           none, "lo", undefined),
+    ?assertNotEqual(nomatch, string:find(ip("xfrm state"), "output-mark 0x4000/0xffffe000")),
+    ok = epdg_xfrm_nl:delete_sa(#{spi => 16#4444}).
 
 flush_endpoint_removes_both_sas() ->
     [ok = epdg_xfrm_nl:create_sa(
