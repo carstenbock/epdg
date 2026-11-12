@@ -186,8 +186,17 @@
 %% API
 %%====================================================================
 
+%% A UE FSM is idle almost all its life (a DPD exchange or a rekey every few
+%% minutes), but kept the heap it grew during the attach (IKE crypto, EAP,
+%% S2b decoding) plus old-heap garbage: 40 KB right after an attach, and
+%% 75-125 KB per tunnel at 50,000 tunnels (KI-173). Hibernating after
+%% ue_hibernate_after_ms of inactivity garbage-collects it down to the live
+%% state (about 8 KB) and drops the references to received datagrams; the
+%% next message wakes it at the cost of one heap allocation.
 start_link(InitContext) ->
-    gen_statem:start_link(?MODULE, InitContext, []).
+    gen_statem:start_link(?MODULE, InitContext,
+                          [{hibernate_after,
+                            epdg_config:get(ue_hibernate_after_ms, 10000)}]).
 
 -spec handle_ikev2(pid(), map(), binary(), inet:port_number() | undefined) -> ok.
 handle_ikev2(Pid, Header, RawData, FromPort) ->
