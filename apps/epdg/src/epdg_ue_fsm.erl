@@ -1308,9 +1308,9 @@ handle_ike_auth_request(Header, RawData,
                                         [IDiType, UeNai, IMSI, Mobike]),
 
                             %% Build IDr = FQDN of ePDG (RFC 7296 §3.5 ID_FQDN=2).
+                            %% ADR-0045: per the UE's home PLMN.
                             IDrFqdn = list_to_binary(
-                                epdg_config:get(ike_id_fqdn,
-                                                "epdg.localdomain")),
+                                epdg_config:ike_id_fqdn_for_imsi(IMSI)),
                             IDrPayload = epdg_ikev2_codec:encode_id_payload(2, IDrFqdn),
 
                             %% First EAP message: Request/Identity. Replaced

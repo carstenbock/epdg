@@ -7,7 +7,8 @@
 -export([udp_socket_opts/0]).
 -export([init/0, get/1, get/2, parse_gtpc_mode/1, parse_ue_ip_pools/1,
          parse_instance_id/2, parse_legacy_dh_groups/1, parse_bool/2,
-         parse_trace_local_addrs/1, default_ike_id_fqdn/0]).
+         parse_trace_local_addrs/1, default_ike_id_fqdn/0,
+         ike_id_fqdn_for_imsi/1, ike_id_fqdn_for_imsi/4]).
 
 %% ?UE6_PREFIX_LEN: floor for UE IPv6 pool widths (check_v6_pool_width/3).
 -include("epdg_ipv6.hrl").
@@ -569,3 +570,38 @@ default_ike_id_fqdn() ->
         _ -> MNC
     end,
     "epdg.epc.mnc" ++ MNC3 ++ ".mcc" ++ MCC ++ ".pub.3gppnetwork.org".
+
+%% IDr for a UE (ADR-0045). A UE of an additional home PLMN resolved that
+%% PLMN's ePDG FQDN (TS 23.003 §19.4.2.9.2) and checks the IDr and the
+%% certificate against it; every other UE keeps the configured IDr. The home
+%% PLMN is the longest MCC+MNC prefix of the IMSI, the platform PLMN
+%% included, because the IMSI does not show the MNC length.
+-spec ike_id_fqdn_for_imsi(binary() | undefined) -> string().
+ike_id_fqdn_for_imsi(IMSI) ->
+    ike_id_fqdn_for_imsi(IMSI, get(ike_id_fqdn, "epdg.localdomain"),
+                         {os:getenv("MCC", "001"), os:getenv("MNC", "01")},
+                         os:getenv("ADDITIONAL_PLMNS", "")).
+
+-spec ike_id_fqdn_for_imsi(binary() | undefined, string(),
+                           {string(), string()}, string()) -> string().
+ike_id_fqdn_for_imsi(IMSI, Default, {PMcc, PMnc}, Additional) when is_binary(IMSI) ->
+    Digits = binary_to_list(IMSI),
+    Additionals = [{Mcc, Mnc} || Item <- string:lexemes(Additional, ","),
+                                 [Mcc, Mnc] <- [string:lexemes(string:trim(Item), "-")],
+                                 length(Mcc) =:= 3, length(Mnc) >= 2, length(Mnc) =< 3,
+                                 is_digits(Mcc ++ Mnc)],
+    Candidates = [{length(PMcc ++ PMnc), Default} || lists:prefix(PMcc ++ PMnc, Digits)]
+        ++ [{length(Mcc ++ Mnc), plmn_epdg_fqdn(Mcc, Mnc)}
+            || {Mcc, Mnc} <- Additionals, lists:prefix(Mcc ++ Mnc, Digits)],
+    case lists:reverse(lists:keysort(1, Candidates)) of
+        [{_, Fqdn} | _] -> Fqdn;
+        [] -> Default
+    end;
+ike_id_fqdn_for_imsi(_IMSI, Default, _Platform, _Additional) ->
+    Default.
+
+plmn_epdg_fqdn(Mcc, Mnc) ->
+    Mnc3 = string:right(Mnc, 3, $0),
+    "epdg.epc.mnc" ++ Mnc3 ++ ".mcc" ++ Mcc ++ ".pub.3gppnetwork.org".
+
+is_digits(S) -> S =/= [] andalso lists:all(fun(C) -> C >= $0 andalso C =< $9 end, S).

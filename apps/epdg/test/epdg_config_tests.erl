@@ -214,3 +214,44 @@ udp_sockets_ask_for_a_large_receive_buffer_test() ->
     gen_udp:close(Default),
     gen_udp:close(Sized),
     ?assert(S >= 4 * D).
+
+%% ADR-0045: a UE of an additional home PLMN resolved that PLMN's ePDG FQDN
+%% (TS 23.003 19.4.2.9.2) and checks the IDr against it. A UE of the platform
+%% PLMN keeps the configured IDr, so nothing changes without additional PLMNs.
+
+-define(PLATFORM, {"262", "24"}).
+-define(DEFAULT_IDR, "epdg.epc.mnc024.mcc262.pub.3gppnetwork.org").
+
+idr_of_an_additional_plmn_is_its_own_epdg_fqdn_test() ->
+    ?assertEqual("epdg.epc.mnc025.mcc262.pub.3gppnetwork.org",
+                 epdg_config:ike_id_fqdn_for_imsi(<<"262250000000001">>, ?DEFAULT_IDR,
+                                                  ?PLATFORM, "262-25")).
+
+idr_of_the_platform_plmn_stays_configured_test() ->
+    ?assertEqual("epdg.custom.example",
+                 epdg_config:ike_id_fqdn_for_imsi(<<"262240000000001">>, "epdg.custom.example",
+                                                  ?PLATFORM, "262-25")).
+
+idr_without_additional_plmns_is_unchanged_test() ->
+    ?assertEqual(?DEFAULT_IDR,
+                 epdg_config:ike_id_fqdn_for_imsi(<<"262250000000001">>, ?DEFAULT_IDR,
+                                                  ?PLATFORM, "")),
+    ?assertEqual(?DEFAULT_IDR,
+                 epdg_config:ike_id_fqdn_for_imsi(undefined, ?DEFAULT_IDR, ?PLATFORM, "262-25")).
+
+%% 310/41 and 310/410 are different networks; the IMSI does not show which.
+idr_takes_the_longest_plmn_prefix_test() ->
+    ?assertEqual("epdg.epc.mnc410.mcc310.pub.3gppnetwork.org",
+                 epdg_config:ike_id_fqdn_for_imsi(<<"310410123456789">>, "platform",
+                                                  {"310", "41"}, "310-410")),
+    ?assertEqual("platform",
+                 epdg_config:ike_id_fqdn_for_imsi(<<"310419123456789">>, "platform",
+                                                  {"310", "41"}, "310-410")),
+    ?assertEqual("platform",
+                 epdg_config:ike_id_fqdn_for_imsi(<<"310410123456789">>, "platform",
+                                                  {"310", "410"}, "310-41")).
+
+idr_ignores_malformed_entries_test() ->
+    ?assertEqual(?DEFAULT_IDR,
+                 epdg_config:ike_id_fqdn_for_imsi(<<"262250000000001">>, ?DEFAULT_IDR,
+                                                  ?PLATFORM, "26-25,x,262-,262-2a")).
