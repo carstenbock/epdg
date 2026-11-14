@@ -28,9 +28,18 @@ eap_only_chain_omits_cert_and_auth_test() ->
 %% IDr | CERT | AUTH | EAP.
 cert_chain_includes_cert_and_auth_test() ->
     Chain = epdg_ue_fsm:build_first_auth_chain(
-              <<"idr">>, <<"eap">>, {<<"cert">>, <<"auth">>}),
+              <<"idr">>, <<"eap">>, {[<<"cert">>], <<"auth">>}),
     ?assertEqual([{idr, <<"idr">>}, {cert, <<"cert">>},
                   {auth, <<"auth">>}, {eap, <<"eap">>}], Chain).
+
+%% A UE that trusts only the root CA needs the intermediates to build the
+%% chain; each goes in its own CERT payload after the ePDG's own certificate,
+%% which must come first because its key verifies AUTH (RFC 7296 §3.6).
+cert_chain_sends_intermediates_after_the_own_certificate_test() ->
+    Chain = epdg_ue_fsm:build_first_auth_chain(
+              <<"idr">>, <<"eap">>, {[<<"own">>, <<"int1">>, <<"int2">>], <<"auth">>}),
+    ?assertEqual([{idr, <<"idr">>}, {cert, <<"own">>}, {cert, <<"int1">>},
+                  {cert, <<"int2">>}, {auth, <<"auth">>}, {eap, <<"eap">>}], Chain).
 
 %%====================================================================
 %% Detecting the UE's EAP_ONLY_AUTHENTICATION notify

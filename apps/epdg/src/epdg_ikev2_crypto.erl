@@ -15,8 +15,8 @@
          encrypt_sk/4, decrypt_sk/4,
          encode_encrypted_message/5, decode_encrypted_message/4,
          derive_aka_prime_keys/4,
-         load_certificate/1, load_private_key/1,
-         sign_auth_data/5, auth_method/1,
+         load_certificate_chain/1, load_private_key/1,
+         sign_auth_data/5, sign_octets/3,
          build_psk_auth/5,
          build_initiator_psk_auth/6,
          build_responder_psk_auth/6,
@@ -30,6 +30,22 @@
 -endif.
 
 -define(NONCE_LEN, 32).
+
+%% AUTH methods (RFC 7296 §3.8, RFC 4754, RFC 7427) and hash ids (RFC 7427 §4)
+-define(AUTH_RSA_SIG,           1).
+-define(AUTH_ECDSA_256,         9).
+-define(AUTH_ECDSA_384,        10).
+-define(AUTH_DIGITAL_SIGNATURE, 14).
+-define(HASH_SHA2_256, 2).
+-define(HASH_SHA2_384, 3).
+%% DER AlgorithmIdentifiers (RFC 7427 Appendix A): sha256WithRSAEncryption
+%% with NULL parameters, ecdsa-with-SHA256, ecdsa-with-SHA384.
+-define(ALGID_SHA256_RSA,
+        <<16#30,16#0d,16#06,16#09,16#2a,16#86,16#48,16#86,16#f7,16#0d,16#01,16#01,16#0b,16#05,16#00>>).
+-define(ALGID_ECDSA_SHA256,
+        <<16#30,16#0a,16#06,16#08,16#2a,16#86,16#48,16#ce,16#3d,16#04,16#03,16#02>>).
+-define(ALGID_ECDSA_SHA384,
+        <<16#30,16#0a,16#06,16#08,16#2a,16#86,16#48,16#ce,16#3d,16#04,16#03,16#03>>).
 
 %%====================================================================
 %% Nonce / SPI
@@ -580,13 +596,18 @@ derive_aka_prime_keys(CK, IK, ServingNetworkName, SQNxorAK) ->
 %% X.509 certificate loading (PEM → DER)
 %%====================================================================
 
--spec load_certificate(string()) -> {ok, binary()} | {error, term()}.
-load_certificate(PemFile) ->
+%% Every certificate of the PEM file, in file order: the ePDG's own
+%% certificate first, then the intermediate CA certificates. Each one goes
+%% out as its own CERT payload, so a UE that only trusts the root can build
+%% the chain (RFC 7296 §3.6: the first certificate carries the key that
+%% verifies AUTH).
+-spec load_certificate_chain(string()) -> {ok, [binary(), ...]} | {error, term()}.
+load_certificate_chain(PemFile) ->
     case file:read_file(PemFile) of
         {ok, PemBin} ->
             case public_key:pem_decode(PemBin) of
-                [{'Certificate', DerCert, not_encrypted} | _] ->
-                    {ok, DerCert};
+                [{'Certificate', _, not_encrypted} | _] = Entries ->
+                    {ok, [Der || {'Certificate', Der, not_encrypted} <- Entries]};
                 [] ->
                     {error, no_certificate_in_pem};
                 _ ->
@@ -623,36 +644,51 @@ load_private_key(PemFile) ->
 %% where IDr' is the ID payload body (type + reserved + identity data).
 %%====================================================================
 
--spec sign_auth_data(atom(), binary(), binary(), binary(), term()) ->
+%% Opts: sk_pr, id_payload, and sig_hashes, the hash algorithm ids of the
+%% UE's N(SIGNATURE_HASH_ALGORITHMS) from IKE_SA_INIT (RFC 7427 §4).
+-spec sign_auth_data(atom(), binary(), binary(), map(), term()) ->
     {non_neg_integer(), binary()}.
 sign_auth_data(PRF, IkeSaInitResponseBytes, NonceI,
-               #{sk_pr := SK_pr, id_payload := IDrPayload}, PrivateKey) ->
+               #{sk_pr := SK_pr, id_payload := IDrPayload} = Opts, PrivateKey) ->
     MacOverId = prf(PRF, SK_pr, IDrPayload),
     SignedOctets = <<IkeSaInitResponseBytes/binary, NonceI/binary, MacOverId/binary>>,
-    Signature = do_sign(PrivateKey, SignedOctets),
-    {auth_method(PrivateKey), Signature}.
+    sign_octets(PrivateKey, SignedOctets, maps:get(sig_hashes, Opts, [])).
 
-do_sign(#'RSAPrivateKey'{} = Key, Data) ->
-    public_key:sign(Data, sha256, Key, [{rsa_padding, rsa_pkcs1_pss_padding},
-                                         {rsa_pss_saltlen, 32}]);
-do_sign(#'ECPrivateKey'{parameters = {namedCurve, Curve}} = Key, Data)
-  when Curve =:= ?'secp256r1' ->
-    public_key:sign(Data, sha256, Key);
-do_sign(#'ECPrivateKey'{parameters = {namedCurve, Curve}} = Key, Data)
-  when Curve =:= ?'secp384r1' ->
-    public_key:sign(Data, sha384, Key);
-do_sign(#'ECPrivateKey'{} = Key, Data) ->
-    public_key:sign(Data, sha256, Key).
+%% {AuthMethod, AuthenticationData} for the AUTH payload.
+%%
+%% With the key's hash in the UE's SIGNATURE_HASH_ALGORITHMS: Digital
+%% Signature (14, RFC 7427 §3), data = ASN.1 length | AlgorithmIdentifier |
+%% signature, RSA as RSASSA-PKCS1-v1_5, ECDSA as DER Ecdsa-Sig-Value.
+%% Otherwise the fixed methods: RSA Digital Signature (1, RFC 7296 §3.8),
+%% which UEs verify as RSASSA-PKCS1-v1_5 over SHA-1, and ECDSA 9/10
+%% (RFC 4754 §7), signature as the fixed-length r | s.
+-spec sign_octets(term(), binary(), [non_neg_integer()]) ->
+    {non_neg_integer(), binary()}.
+sign_octets(Key, Octets, PeerHashes) ->
+    {Hash, HashId, AlgId, Legacy} = signature_profile(Key),
+    case lists:member(HashId, PeerHashes) orelse Legacy =:= none of
+        true ->
+            Sig = public_key:sign(Octets, Hash, Key),
+            {?AUTH_DIGITAL_SIGNATURE, <<(byte_size(AlgId)):8, AlgId/binary, Sig/binary>>};
+        false when Legacy =:= rsa ->
+            {?AUTH_RSA_SIG, public_key:sign(Octets, sha, Key)};
+        false ->
+            {Method, Len} = Legacy,
+            Der = public_key:sign(Octets, Hash, Key),
+            #'ECDSA-Sig-Value'{r = R, s = S} = public_key:der_decode('ECDSA-Sig-Value', Der),
+            {Method, <<R:Len/unit:8, S:Len/unit:8>>}
+    end.
 
-%% IKEv2 auth method byte per RFC 7296 §3.8
--spec auth_method(term()) -> non_neg_integer().
-auth_method(#'RSAPrivateKey'{}) -> 1;     %% RSA Digital Signature
-auth_method(#'ECPrivateKey'{parameters = {namedCurve, Curve}})
-  when Curve =:= ?'secp256r1' -> 9;       %% ECDSA with SHA-256 on P-256
-auth_method(#'ECPrivateKey'{parameters = {namedCurve, Curve}})
-  when Curve =:= ?'secp384r1' -> 10;      %% ECDSA with SHA-384 on P-384
-auth_method(#'ECPrivateKey'{}) -> 9;       %% default ECDSA
-auth_method(_) -> 1.
+%% {Hash, RFC 7427 hash id, DER AlgorithmIdentifier, legacy method}.
+signature_profile(#'RSAPrivateKey'{}) ->
+    {sha256, ?HASH_SHA2_256, ?ALGID_SHA256_RSA, rsa};
+signature_profile(#'ECPrivateKey'{parameters = {namedCurve, ?'secp256r1'}}) ->
+    {sha256, ?HASH_SHA2_256, ?ALGID_ECDSA_SHA256, {?AUTH_ECDSA_256, 32}};
+signature_profile(#'ECPrivateKey'{parameters = {namedCurve, ?'secp384r1'}}) ->
+    {sha384, ?HASH_SHA2_384, ?ALGID_ECDSA_SHA384, {?AUTH_ECDSA_384, 48}};
+signature_profile(#'ECPrivateKey'{}) ->
+    %% Other curves exist only as Digital Signature (method 14).
+    {sha256, ?HASH_SHA2_256, ?ALGID_ECDSA_SHA256, none}.
 
 %%====================================================================
 %% Shared-secret MIC AUTH (RFC 7296 §2.15) / EAP-MSK AUTH (RFC 5998 §2.1)

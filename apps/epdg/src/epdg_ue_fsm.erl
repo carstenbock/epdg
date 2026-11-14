@@ -21,7 +21,8 @@
 %% is a minimal #data constructor so tests can drive drain_action/1 without a
 %% live SA (the #data record is otherwise private to this module).
 -export([drain_action/1, find_notify/2, new_data_for_test/1,
-         build_first_auth_chain/3, eap_only_selected/2,
+         build_first_auth_chain/3, eap_only_selected/2, plmn_certificate/3,
+         signature_hash_algorithms/1,
          classify_register_ue_result/1,
          build_notify_response/4, process_sa_init_payloads/1,
          sa_init_reply_port/1, parse_imsi_from_nai/1,
@@ -56,6 +57,8 @@
 -define(N_REDIRECT_FROM,      16408).
 %% RFC 5998 section 4
 -define(N_EAP_ONLY_AUTHENTICATION, 16417).
+%% RFC 7427 §4: hash algorithms the UE can verify signatures with.
+-define(N_SIGNATURE_HASH_ALGORITHMS, 16431).
 
 %% MOBIKE return-routability (COOKIE2) check defaults (RFC 4555 §3.7).
 %% Retransmit the COOKIE2 probe a few times (UDP) before giving up.
@@ -108,10 +111,13 @@
     %% (RFC 5685 §4). Gates every REDIRECT path: we never redirect a UE
     %% that did not signal support.
     redirect_supported :: boolean(),
+    %% RFC 7427 hash ids from the UE's IKE_SA_INIT request
+    peer_sig_hashes = [] :: [non_neg_integer()],
     %% EAP identifier counter (monotonic per RFC 3748)
     eap_next_id      :: non_neg_integer(),
     %% X.509 certificate for IKEv2 responder auth (TS 33.402 §7.2.1)
-    cert_der         :: binary() | undefined,
+    %% Default certificate: the ePDG's own first, then intermediates.
+    cert_chain       :: [binary()] | undefined,
     private_key      :: term() | undefined,
     %% Stored IKE_SA_INIT request bytes (as received from the UE) for use
     %% when verifying the UE's AUTH payload (RFC 7296 §2.15 "InitiatorSigned
@@ -262,7 +268,7 @@ init(#{peer_ip := PeerIP, peer_port := PeerPort} = _Ctx) ->
     RSPI = epdg_ikev2_crypto:generate_spi(),
     epdg_metrics:inc(ue_sessions_total),
     epdg_metrics:gauge_inc(ue_sessions_active),
-    {CertDer, PrivKey} = load_ike_certificate(),
+    {CertChain, PrivKey} = load_ike_certificate(),
     {ok, idle, #data{
         peer_ip       = PeerIP,
         peer_port     = PeerPort,
@@ -272,7 +278,7 @@ init(#{peer_ip := PeerIP, peer_port := PeerPort} = _Ctx) ->
         mobike        = false,
         redirect_supported = false,
         eap_next_id   = 1,
-        cert_der      = CertDer,
+        cert_chain    = CertChain,
         private_key   = PrivKey,
         eap_done      = false,
         ike_auth_last_resp = undefined,
@@ -899,7 +905,8 @@ handle_ike_sa_init_request(#{initiator_spi := ISPI, next_payload := NextPL,
                                 "(ignored, responder-only)", [PeerIP, PeerPort]);
                 false -> ok
             end,
-            Data1 = Data#data{redirect_supported = RedirectSupported},
+            Data1 = Data#data{redirect_supported = RedirectSupported,
+                              peer_sig_hashes = signature_hash_algorithms(Payloads)},
             case process_sa_init_payloads(Payloads) of
                 {ok, Parsed} ->
                     log_key_length_defaulted(Parsed, PeerIP, PeerPort),
@@ -1063,7 +1070,7 @@ send_sa_init_response(ISPI, MsgId,
                        #{suite := Suite, peer_dh_pub := PeerPub, nonce_i := NonceI},
                        LocalPort,
                        #data{responder_spi = RSPI, peer_ip = PeerIP,
-                             peer_port = PeerPort, cert_der = CertDer} = Data) ->
+                             peer_port = PeerPort, cert_chain = CertChain} = Data) ->
     #{dh := #{id := DHGroupId}} = Suite,
     {DHPub, DHPriv} = epdg_ikev2_crypto:dh_generate(DHGroupId),
 
@@ -1112,7 +1119,7 @@ send_sa_init_response(ISPI, MsgId,
     %% Standard ordering (matches strongSwan / cisco / RFC §1.2 example):
     %% SA, KE, Nonce, [CERTREQ], N(NAT_SOURCE), N(NAT_DESTINATION).
     Payloads1 = [{sa, SAPayload}, {ke, KEPayload}, {nonce, NoncePayload}],
-    Payloads2 = case CertDer of
+    Payloads2 = case CertChain of
         undefined -> Payloads1;
         _ ->
             CertReq = epdg_ikev2_codec:encode_certreq_payload(<<>>),
@@ -1241,7 +1248,9 @@ handle_ike_auth_request(Header, RawData,
                               nonce_i = NonceI, nonce_r = NonceR,
                               crypto_suite = Suite,
                               initiator_spi = ISPI, responder_spi = RSPI,
-                              cert_der = CertDer, private_key = PrivKey,
+                              cert_chain = DefaultChain,
+                              private_key = DefaultKey,
+                              peer_sig_hashes = PeerSigHashes,
                               ike_sa_init_resp = IkeSaInitRespBytes,
                               peer_ip = PeerIP, peer_port = PeerPort,
                               eap_next_id = EapId} = Data) ->
@@ -1344,6 +1353,12 @@ handle_ike_auth_request(Header, RawData,
                                     true ->
                                         none;
                                     false ->
+                                        %% ADR-0045: the certificate of the
+                                        %% UE's home PLMN, the one its IDr
+                                        %% names.
+                                        {CertChain, PrivKey} =
+                                            ike_certificate_for(
+                                              IMSI, {DefaultChain, DefaultKey}),
                                         %% AUTH over (IKE_SA_INIT_resp | Nonce_i
                                         %% | prf(SK_pr, IDr')).
                                         #{prf := PRF} = KeyParams,
@@ -1351,10 +1366,11 @@ handle_ike_auth_request(Header, RawData,
                                             epdg_ikev2_crypto:sign_auth_data(
                                                 PRF, IkeSaInitRespBytes, NonceI,
                                                 #{sk_pr => maps:get(sk_pr, Keys),
-                                                  id_payload => IDrPayload},
+                                                  id_payload => IDrPayload,
+                                                  sig_hashes => PeerSigHashes},
                                                 PrivKey),
-                                        {epdg_ikev2_codec:encode_cert_payload(
-                                             CertDer),
+                                        {[epdg_ikev2_codec:encode_cert_payload(C)
+                                          || C <- CertChain],
                                          epdg_ikev2_codec:encode_auth_payload(
                                              AuthMethod, Signature)}
                                 end,
@@ -1415,7 +1431,7 @@ prerequisites_ok(#data{shared_secret = undefined}) -> {error, no_shared_secret};
 prerequisites_ok(#data{nonce_i = undefined}) -> {error, no_nonce_i};
 prerequisites_ok(#data{nonce_r = undefined}) -> {error, no_nonce_r};
 prerequisites_ok(#data{crypto_suite = undefined}) -> {error, no_suite};
-prerequisites_ok(#data{cert_der = undefined}) -> {error, no_cert};
+prerequisites_ok(#data{cert_chain = undefined}) -> {error, no_cert};
 prerequisites_ok(#data{private_key = undefined}) -> {error, no_priv_key};
 prerequisites_ok(#data{ike_sa_init_resp = undefined}) -> {error, no_ike_sa_init_resp};
 prerequisites_ok(_) -> ok.
@@ -3169,15 +3185,17 @@ send_informational_response(MsgId, ExtraPayloads,
 
 %% Assemble the first IKE_AUTH response inner payload chain. With EAP-only
 %% authentication (RFC 5998) the certificate and cert-based AUTH are omitted
-%% (CertAuth = none); otherwise CertAuth = {CertPayload, AuthPayload} and both
-%% are inserted between IDr and the EAP request.
+%% (CertAuth = none); otherwise CertAuth = {CertPayloads, AuthPayload} and
+%% they are inserted between IDr and the EAP request, one CERT payload per
+%% certificate, the ePDG's own first (RFC 7296 §3.6).
 -spec build_first_auth_chain(binary(), binary(),
-                             none | {binary(), binary()}) ->
+                             none | {[binary(), ...], binary()}) ->
           [{atom(), binary()}].
 build_first_auth_chain(IDrPayload, EapBin, none) ->
     [{idr, IDrPayload}, {eap, EapBin}];
-build_first_auth_chain(IDrPayload, EapBin, {CertBin, AuthBin}) ->
-    [{idr, IDrPayload}, {cert, CertBin}, {auth, AuthBin}, {eap, EapBin}].
+build_first_auth_chain(IDrPayload, EapBin, {CertBins, AuthBin}) ->
+    [{idr, IDrPayload}] ++ [{cert, C} || C <- CertBins]
+        ++ [{auth, AuthBin}, {eap, EapBin}].
 
 %% Honour RFC 5998 EAP-only only when the operator flag is on *and* the
 %% UE offered N(EAP_ONLY_AUTHENTICATION). Exported for the gate tests.
@@ -3206,6 +3224,16 @@ find_notify(NotifyType, Payloads) ->
               NType =:= NotifyType;
          (_) -> false
       end, Payloads).
+
+%% Hash algorithm ids (16 bit each) of the UE's
+%% N(SIGNATURE_HASH_ALGORITHMS); [] when it sent none (RFC 7427 §4).
+signature_hash_algorithms(Payloads) ->
+    case [Ids || #{type := notify,
+                   data := <<_Proto:8, SPISize:8, ?N_SIGNATURE_HASH_ALGORITHMS:16,
+                             _SPI:SPISize/binary, Ids/binary>>} <- Payloads] of
+        [Ids | _] -> [Id || <<Id:16>> <= Ids];
+        []        -> []
+    end.
 
 %% Tear down any prior live session for this IMSI before the new one
 %% registers (see established/3 enter). The old FSM's terminate/3 releases
@@ -3700,9 +3728,7 @@ restore_child_sas(#data{peer_ip = PeerIP, peer_port = PeerPort,
 %%====================================================================
 
 load_ike_certificate() ->
-    CertFile = epdg_config:get(ike_cert_file, ""),
-    KeyFile  = epdg_config:get(ike_key_file, ""),
-    case {CertFile, KeyFile} of
+    case {epdg_config:get(ike_cert_file, ""), epdg_config:get(ike_key_file, "")} of
         {"", _} ->
             logger:info("No IKE certificate file configured (EPDG_IKE_CERT_FILE)"),
             {undefined, undefined};
@@ -3710,21 +3736,51 @@ load_ike_certificate() ->
             logger:info("No IKE private key file configured (EPDG_IKE_KEY_FILE)"),
             {undefined, undefined};
         {CF, KF} ->
-            CertResult = epdg_ikev2_crypto:load_certificate(CF),
-            KeyResult  = epdg_ikev2_crypto:load_private_key(KF),
-            case {CertResult, KeyResult} of
-                {{ok, DerCert}, {ok, PrivKey}} ->
-                    logger:info("IKE certificate loaded from ~s (~p bytes)",
-                                [CF, byte_size(DerCert)]),
-                    {DerCert, PrivKey};
-                {{error, CertErr}, _} ->
-                    logger:error("Failed to load IKE certificate ~s: ~p",
-                                 [CF, CertErr]),
-                    {undefined, undefined};
-                {_, {error, KeyErr}} ->
-                    logger:error("Failed to load IKE private key ~s: ~p",
-                                 [KF, KeyErr]),
-                    {undefined, undefined}
+            load_ike_certificate(CF, KF)
+    end.
+
+load_ike_certificate(CF, KF) ->
+    CertResult = epdg_ikev2_crypto:load_certificate_chain(CF),
+    KeyResult  = epdg_ikev2_crypto:load_private_key(KF),
+    case {CertResult, KeyResult} of
+        {{ok, Chain}, {ok, PrivKey}} ->
+            logger:info("IKE certificate loaded from ~s (~p certificates, ~p bytes)",
+                        [CF, length(Chain), iolist_size(Chain)]),
+            {Chain, PrivKey};
+        {{error, CertErr}, _} ->
+            logger:error("Failed to load IKE certificate ~s: ~p", [CF, CertErr]),
+            {undefined, undefined};
+        {_, {error, KeyErr}} ->
+            logger:error("Failed to load IKE private key ~s: ~p", [KF, KeyErr]),
+            {undefined, undefined}
+    end.
+
+%% Certificate and key for a UE (ADR-0045): those of its home PLMN when
+%% EPDG_IKE_PLMN_CERT_DIR holds a directory for it, otherwise the default.
+ike_certificate_for(IMSI, Default) ->
+    plmn_certificate(epdg_config:get(ike_plmn_cert_dir, ""),
+                     epdg_config:home_plmn_for_imsi(IMSI), Default).
+
+plmn_certificate("", _HomePlmn, Default) ->
+    Default;
+plmn_certificate(_Dir, platform, Default) ->
+    Default;
+plmn_certificate(Dir, {Mcc, Mnc}, Default) ->
+    PlmnDir = filename:join(Dir, Mcc ++ "-" ++ Mnc),
+    case filelib:is_dir(PlmnDir) of
+        false ->
+            Default;
+        true ->
+            case load_ike_certificate(filename:join(PlmnDir, "tls.crt"),
+                                      filename:join(PlmnDir, "tls.key")) of
+                {undefined, undefined} ->
+                    %% The UE will most likely reject the default
+                    %% certificate; the error above says why.
+                    logger:error("IKE certificate of PLMN ~s-~s unusable, "
+                                 "sending the default certificate", [Mcc, Mnc]),
+                    Default;
+                Pair ->
+                    Pair
             end
     end.
 

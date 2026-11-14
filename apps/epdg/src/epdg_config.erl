@@ -8,7 +8,8 @@
 -export([init/0, get/1, get/2, parse_gtpc_mode/1, parse_ue_ip_pools/1,
          parse_instance_id/2, parse_legacy_dh_groups/1, parse_bool/2,
          parse_trace_local_addrs/1, default_ike_id_fqdn/0,
-         ike_id_fqdn_for_imsi/1, ike_id_fqdn_for_imsi/4]).
+         ike_id_fqdn_for_imsi/1, ike_id_fqdn_for_imsi/4,
+         home_plmn_for_imsi/1, home_plmn_for_imsi/3]).
 
 %% ?UE6_PREFIX_LEN: floor for UE IPv6 pool widths (check_v6_pool_width/3).
 -include("epdg_ipv6.hrl").
@@ -40,6 +41,10 @@ init() ->
     %% IKE X.509 certificate (TS 33.402 §7.2.1)
     set_from_env("EPDG_IKE_CERT_FILE", ike_cert_file, ""),
     set_from_env("EPDG_IKE_KEY_FILE", ike_key_file, ""),
+    %% Certificates of additional home PLMNs (ADR-0045): one directory per
+    %% PLMN, <dir>/<MCC>-<MNC>/tls.crt and tls.key. Empty: every UE gets
+    %% the certificate above.
+    set_from_env("EPDG_IKE_PLMN_CERT_DIR", ike_plmn_cert_dir, ""),
     %% IDr (FQDN the ePDG presents as its IKEv2 identity; should match
     %% the SubjectAltName:DNS of the configured certificate).
     set_from_env("EPDG_IKE_ID_FQDN", ike_id_fqdn, fun default_ike_id_fqdn/0),
@@ -573,32 +578,52 @@ default_ike_id_fqdn() ->
 
 %% IDr for a UE (ADR-0045). A UE of an additional home PLMN resolved that
 %% PLMN's ePDG FQDN (TS 23.003 §19.4.2.9.2) and checks the IDr and the
-%% certificate against it; every other UE keeps the configured IDr. The home
-%% PLMN is the longest MCC+MNC prefix of the IMSI, the platform PLMN
-%% included, because the IMSI does not show the MNC length.
+%% certificate against it; every other UE keeps the configured IDr.
 -spec ike_id_fqdn_for_imsi(binary() | undefined) -> string().
 ike_id_fqdn_for_imsi(IMSI) ->
     ike_id_fqdn_for_imsi(IMSI, get(ike_id_fqdn, "epdg.localdomain"),
-                         {os:getenv("MCC", "001"), os:getenv("MNC", "01")},
-                         os:getenv("ADDITIONAL_PLMNS", "")).
+                         platform_plmn(), additional_plmns()).
 
 -spec ike_id_fqdn_for_imsi(binary() | undefined, string(),
                            {string(), string()}, string()) -> string().
-ike_id_fqdn_for_imsi(IMSI, Default, {PMcc, PMnc}, Additional) when is_binary(IMSI) ->
+ike_id_fqdn_for_imsi(IMSI, Default, Platform, Additional) ->
+    case home_plmn_for_imsi(IMSI, Platform, Additional) of
+        platform   -> Default;
+        {Mcc, Mnc} -> plmn_epdg_fqdn(Mcc, Mnc)
+    end.
+
+%% Home PLMN of a UE: `platform', or the {MCC, MNC} of the additional home
+%% PLMN (as configured, MNC digits as on the SIM) that is the longest MCC+MNC
+%% prefix of the IMSI, the platform PLMN included, because the IMSI does not
+%% show the MNC length. The platform wins a tie. The IDr and the certificate
+%% are both chosen from this, so they always name the same PLMN.
+-spec home_plmn_for_imsi(binary() | undefined) -> platform | {string(), string()}.
+home_plmn_for_imsi(IMSI) ->
+    home_plmn_for_imsi(IMSI, platform_plmn(), additional_plmns()).
+
+-spec home_plmn_for_imsi(binary() | undefined, {string(), string()}, string()) ->
+          platform | {string(), string()}.
+home_plmn_for_imsi(IMSI, {PMcc, PMnc}, Additional) when is_binary(IMSI) ->
     Digits = binary_to_list(IMSI),
     Additionals = [{Mcc, Mnc} || Item <- string:lexemes(Additional, ","),
                                  [Mcc, Mnc] <- [string:lexemes(string:trim(Item), "-")],
                                  length(Mcc) =:= 3, length(Mnc) >= 2, length(Mnc) =< 3,
                                  is_digits(Mcc ++ Mnc)],
-    Candidates = [{length(PMcc ++ PMnc), Default} || lists:prefix(PMcc ++ PMnc, Digits)]
-        ++ [{length(Mcc ++ Mnc), plmn_epdg_fqdn(Mcc, Mnc)}
+    Candidates = [{-length(PMcc ++ PMnc), 0, platform} || lists:prefix(PMcc ++ PMnc, Digits)]
+        ++ [{-length(Mcc ++ Mnc), 1, {Mcc, Mnc}}
             || {Mcc, Mnc} <- Additionals, lists:prefix(Mcc ++ Mnc, Digits)],
-    case lists:reverse(lists:keysort(1, Candidates)) of
-        [{_, Fqdn} | _] -> Fqdn;
-        [] -> Default
+    case lists:sort(Candidates) of
+        [{_, _, Plmn} | _] -> Plmn;
+        []                 -> platform
     end;
-ike_id_fqdn_for_imsi(_IMSI, Default, _Platform, _Additional) ->
-    Default.
+home_plmn_for_imsi(_IMSI, _Platform, _Additional) ->
+    platform.
+
+platform_plmn() ->
+    {os:getenv("MCC", "001"), os:getenv("MNC", "01")}.
+
+additional_plmns() ->
+    os:getenv("ADDITIONAL_PLMNS", "").
 
 plmn_epdg_fqdn(Mcc, Mnc) ->
     Mnc3 = string:right(Mnc, 3, $0),
