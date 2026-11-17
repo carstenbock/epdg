@@ -33,7 +33,10 @@
          %% Session persistence: snapshot <-> #data roundtrip
          session_snapshot/1, data_from_snapshot/1,
          %% S2b teardown: whether and with what to send the Delete Session
-         pgw_delete_params/1, s2b_delete_action/2]).
+         pgw_delete_params/1, s2b_delete_action/2,
+         %% APN selection from the UE's IDr
+         requested_apn/2, normalise_apn/2, apn_acceptable/1,
+         response_idr/2, csr_reject_notify/1, with_linked_ebi/2]).
 -endif.
 
 %% ?UE6_PREFIX_LEN: CFG_REPLY prefix length, XFRM inner selectors, handover
@@ -59,6 +62,10 @@
 -define(N_EAP_ONLY_AUTHENTICATION, 16417).
 %% RFC 7427 §4: hash algorithms the UE can verify signatures with.
 -define(N_SIGNATURE_HASH_ALGORITHMS, 16431).
+%% TS 24.302 §8.1.2.2 Table 8.1.2.2-1 (private error notify types).
+-define(N_NO_APN_SUBSCRIPTION, 9002).
+-define(N_MAX_CONNECTION_REACHED, 8193).
+-define(N_AUTHORIZATION_REJECTED, 9003).
 
 %% MOBIKE return-routability (COOKIE2) check defaults (RFC 4555 §3.7).
 %% Retransmit the COOKIE2 probe a few times (UDP) before giving up.
@@ -389,8 +396,10 @@ maybe_send_swm_str(SessionId, DestHost, IMSI, UeNai) ->
 %% Request needs them, taken from the decoded Create Session Response kept
 %% in #data.pgw_session (keys `pgw_c_fteid' and `ebi', see
 %% epdg_gtpc_codec:decode_create_session_response/1). `none' when the PGW
-%% never created a session for this UE. The EBI the PGW echoes may be
-%% absent (`undefined'); the ePDG always asks for the default bearer EBI 5.
+%% never created a session for this UE. The stored EBI is the one the PGW
+%% echoed or, failing that, the one the ePDG asked for (with_linked_ebi/2);
+%% 5 is the fallback for a session stored before EBIs were assigned per PDN
+%% connection, when the ePDG always asked for 5.
 -spec pgw_delete_params(map() | undefined) ->
           {ok, #{pgw_c_teid := pos_integer(), ebi := 5..15}} | none.
 pgw_delete_params(PGW) when is_map(PGW) ->
@@ -403,6 +412,32 @@ pgw_delete_params(_) ->
 
 linked_ebi(#{ebi := E}) when is_integer(E), E >= 5, E =< 15 -> E;
 linked_ebi(_) -> 5.
+
+%% The Create Session Response with the EBI of the default bearer: the one
+%% the PGW echoed, or else the one the ePDG asked for (Ebi).
+with_linked_ebi(#{ebi := E} = Resp, _Ebi)
+  when is_integer(E), E >= 5, E =< 15 ->
+    Resp;
+with_linked_ebi(Resp, Ebi) ->
+    Resp#{ebi => Ebi}.
+
+%% Claim the EPS bearer IDs this session uses (default bearer and
+%% dedicated bearers) in the UE-wide pool, see epdg_ue_registry:claim_ebi/3.
+%% Needed after a restore; for a live session the claims already exist.
+claim_session_ebis(#data{imsi = IMSI, pgw_session = PGW,
+                         dedicated_bearers = Beds}) when is_binary(IMSI) ->
+    Ebis = [linked_ebi(PGW) || is_map(PGW)] ++ maps:keys(Beds),
+    lists:foreach(
+      fun(E) ->
+              case epdg_ue_registry:claim_ebi_exact(IMSI, E, self()) of
+                  ok -> ok;
+                  {error, taken} ->
+                      logger:warning("EBI ~B of IMSI=~p is held by another "
+                                     "session", [E, IMSI])
+              end
+      end, Ebis);
+claim_session_ebis(_) ->
+    ok.
 
 %% Whether terminate/3 releases the PDN connection at the PGW. Pure, so
 %% the rule is testable without a live FSM.
@@ -575,15 +610,21 @@ ike_auth({call, From}, get_info, Data) ->
 %% State: established (IPsec tunnel active)
 %%====================================================================
 
-established(enter, _OldState, #data{responder_spi = RSPI, imsi = IMSI} = Data) ->
+established(enter, _OldState, #data{responder_spi = RSPI, imsi = IMSI,
+                                     apn = Apn} = Data) ->
     %% A UE that lost connectivity (e.g. CPE NAT pinhole collapse) and
     %% re-dialled leaves its previous IKE SA + Child SAs behind until DPD
     %% reaps them. Supersede that stale session now so we don't run two
     %% live tunnels for one IMSI with overlapping XFRM SAs (which can make
     %% the kernel pick a stale outbound SPI and silently black-hole the
-    %% downlink). Done BEFORE register/3 overwrites the IMSI reverse map.
-    supersede_existing_session(IMSI, RSPI),
-    epdg_ue_registry:register(RSPI, self(), IMSI),
+    %% downlink). Done BEFORE register/4 overwrites the IMSI reverse map.
+    %% Per APN: the UE's tunnels to other APNs are other PDN connections
+    %% (TS 24.302 §6.5.3) and stay up.
+    supersede_existing_session(IMSI, Apn, RSPI),
+    epdg_ue_registry:register(RSPI, self(), IMSI, Apn),
+    %% A restored session re-claims its EPS bearer IDs (a fresh one
+    %% already holds them; the claim is idempotent).
+    claim_session_ebis(Data),
     logger:info("Tunnel established IMSI=~p RSPI=~.16B", [IMSI, RSPI]),
     epdg_metrics:inc(ike_tunnels_established_total),
     %% Persist the full session snapshot (no-op unless the session store
@@ -734,7 +775,7 @@ handle_bearer_request(create, #{seq_num := Seq, bearer_contexts := BCs},
                             gtpu_teid_local = DefLocalU,
                             imsi = IMSI} = Data) ->
     {NewBeds, RespBearers} =
-        lists:foldl(fun(BC, Acc) -> create_one_bearer(BC, DefLocalU, Acc) end,
+        lists:foldl(fun(BC, Acc) -> create_one_bearer(BC, DefLocalU, IMSI, Acc) end,
                     {Beds, []}, BCs),
     logger:info("S2b Create Bearer: IMSI=~p added ~B dedicated bearer(s) ~p",
                 [IMSI, length(RespBearers), [E || #{ebi := E} <- RespBearers]]),
@@ -765,8 +806,10 @@ handle_bearer_request(delete, #{seq_num := Seq, ebis := Ebis},
                             imsi = IMSI} = Data) ->
     PgwCTeid = pgw_c_teid(PGW),
     %% The default (linked) bearer EBI echoed by the PGW in the Create Session
-    %% Response; 5 is the standard default-bearer EBI when absent.
-    DefaultEbi = maps:get(ebi, PGW, 5),
+    %% Response, or the one the ePDG asked for (with_linked_ebi/2). The key is
+    %% always present but may be `undefined' in a session stored by an
+    %% older version, hence linked_ebi/1 and not maps:get/3.
+    DefaultEbi = linked_ebi(PGW),
     RespBearers = [#{ebi => E} || E <- Ebis],
     case lists:member(DefaultEbi, Ebis) of
         true ->
@@ -786,7 +829,9 @@ handle_bearer_request(delete, #{seq_num := Seq, ebis := Ebis},
             _ = try_send_delete_informational(Data),
             {stop, {shutdown, pgw_bearer_delete}, Data};
         false ->
-            NewBeds = lists:foldl(fun release_one_bearer/2, Beds, Ebis),
+            NewBeds = lists:foldl(
+                        fun(E, A) -> release_one_bearer(E, A, IMSI) end,
+                        Beds, Ebis),
             logger:info("S2b Delete Bearer: IMSI=~p removed dedicated bearer(s) "
                         "~p", [IMSI, Ebis]),
             epdg_gtpc_client:send_bearer_response(
@@ -799,8 +844,8 @@ handle_bearer_request(delete, #{seq_num := Seq, ebis := Ebis},
 
 %% Create a single dedicated bearer: assign an EBI, allocate the ePDG S2b-U
 %% TEID, install the forwarder classifier, and accumulate the response context.
-create_one_bearer(BC, DefLocalU, {BAcc, RAcc}) ->
-    Ebi     = assign_ebi(BC, BAcc),
+create_one_bearer(BC, DefLocalU, IMSI, {BAcc, RAcc}) ->
+    Ebi     = assign_ebi(BC, BAcc, IMSI),
     LocalU  = new_teid(),
     {PgwUTeid, PgwUIp} = pgw_u_fteid_parts(maps:get(pgw_u_fteid, BC, undefined)),
     Tft     = maps:get(tft, BC, undefined),
@@ -848,23 +893,41 @@ update_one_bearer(#{ebi := Ebi} = BC, DefLocalU, {BAcc, RAcc})
 update_one_bearer(_BC, _DefLocalU, Acc) ->
     Acc.
 
-release_one_bearer(Ebi, BAcc) ->
+release_one_bearer(Ebi, BAcc, IMSI) ->
     case maps:take(Ebi, BAcc) of
         {Bearer, BAcc1} ->
             catch epdg_gtpu_forwarder:unregister_bearer(
                     maps:get(local_u_teid, Bearer)),
+            release_ebi(IMSI, Ebi),
             BAcc1;
         error ->
             BAcc
     end.
 
 %% EPS Bearer ID for a new dedicated bearer. The PGW does not assign it over
-%% S2b, so the ePDG allocates the next free dedicated EBI (6..15); if a peer
-%% did include one, honour it.
-assign_ebi(#{ebi := E}, _BAcc) when is_integer(E), E >= 6, E =< 15 -> E;
-assign_ebi(_BC, BAcc) ->
-    Used = maps:keys(BAcc),
-    next_free_ebi(lists:seq(6, 15), Used).
+%% S2b, so the ePDG allocates the next EBI (6..15) that no bearer of this UE
+%% uses, in any of its PDN connections (epdg_ue_registry:claim_ebi/3); if a
+%% peer did include one, honour it.
+assign_ebi(#{ebi := E}, _BAcc, IMSI) when is_integer(E), E >= 6, E =< 15 ->
+    _ = claim_ebi_exact(IMSI, E),
+    E;
+assign_ebi(_BC, BAcc, IMSI) when is_binary(IMSI) ->
+    case epdg_ue_registry:claim_ebi(IMSI, self(), lists:seq(6, 15)) of
+        {ok, E} -> E;
+        {error, no_free_ebi} -> next_free_ebi(lists:seq(6, 15), maps:keys(BAcc))
+    end;
+assign_ebi(_BC, BAcc, _IMSI) ->
+    next_free_ebi(lists:seq(6, 15), maps:keys(BAcc)).
+
+claim_ebi_exact(IMSI, E) when is_binary(IMSI) ->
+    epdg_ue_registry:claim_ebi_exact(IMSI, E, self());
+claim_ebi_exact(_IMSI, _E) ->
+    ok.
+
+release_ebi(IMSI, E) when is_binary(IMSI) ->
+    epdg_ue_registry:release_ebi(IMSI, E, self());
+release_ebi(_IMSI, _E) ->
+    ok.
 
 next_free_ebi([], _Used) -> 15;   %% pool exhausted (defensive)
 next_free_ebi([E | T], Used) ->
@@ -1316,111 +1379,132 @@ handle_ike_auth_request(Header, RawData,
                             logger:info("IKE_AUTH IDi type=~p data=~p IMSI=~p mobike=~p",
                                         [IDiType, UeNai, IMSI, Mobike]),
 
-                            %% Build IDr = FQDN of ePDG (RFC 7296 §3.5 ID_FQDN=2).
-                            %% ADR-0045: per the UE's home PLMN.
-                            IDrFqdn = list_to_binary(
-                                epdg_config:ike_id_fqdn_for_imsi(IMSI)),
-                            IDrPayload = epdg_ikev2_codec:encode_id_payload(2, IDrFqdn),
+                            %% TS 24.302 §7.2.2.1: the UE names the APN of this PDN connection
+                            %% in IDr; no IDr means the default APN. Checked here, before EAP
+                            %% starts, so a refused APN costs no SWm session.
+                            OwnFqdn = list_to_binary(
+                                          epdg_config:ike_id_fqdn_for_imsi(IMSI)),
+                            Apn = case requested_apn(InnerPayloads, OwnFqdn) of
+                                      default -> default_apn();
+                                      ReqApn  -> ReqApn
+                                  end,
+                            case apn_acceptable(Apn) of
+                                false ->
+                                    logger:warning("IKE_AUTH APN ~p not allowed on this ePDG "
+                                                   "IMSI=~p", [Apn, IMSI]),
+                                    epdg_metrics:inc(ike_auth_apn_rejected_total),
+                                    send_ike_notify_and_stop(
+                                      MsgId, InFlags, ISPI, RSPI, ?N_NO_APN_SUBSCRIPTION,
+                                      Data#data{keys_params = KeyParams, ike_keys = Keys,
+                                                imsi = IMSI, apn = Apn});
+                                true ->
+                                %% Build IDr (RFC 7296 §3.5 ID_FQDN=2): the
+                                %% ePDG's FQDN per the UE's home PLMN
+                                %% (ADR-0045) or the APN, see response_idr/2.
+                                IDrPayload = epdg_ikev2_codec:encode_id_payload(
+                                               2, response_idr(OwnFqdn, Apn)),
 
-                            %% First EAP message: Request/Identity. Replaced
-                            %% once SWm DER/DEA is wired in.
-                            EapReq  = epdg_ikev2_codec:encode_eap_request_identity(EapId),
-                            EapBin  = epdg_ikev2_codec:encode_eap_payload(EapReq),
+                                %% First EAP message: Request/Identity. Replaced
+                                %% once SWm DER/DEA is wired in.
+                                EapReq  = epdg_ikev2_codec:encode_eap_request_identity(EapId),
+                                EapBin  = epdg_ikev2_codec:encode_eap_payload(EapReq),
 
-                            %% RFC 5998: if the UE offered EAP-only auth, omit
-                            %% the certificate and the cert-based AUTH — the UE
-                            %% authenticates us via the EAP-AKA' MSK in the final
-                            %% exchange. Otherwise sign IDr with our key and send
-                            %% the cert (this also avoids needing a private key /
-                            %% certificate at all in the EAP-only case).
-                            %%
-                            %% SPEC-DEVIATION: TS 33.402 §7.2.1 — public-key
-                            %% signature authentication with certificates SHALL
-                            %% be used to authenticate the ePDG. Honoured only
-                            %% when the UE offers N(EAP_ONLY_AUTHENTICATION)
-                            %% and EPDG_EAP_ONLY_AUTH is on: RFC 5998 §3
-                            %% requires a mutually authenticating, key-
-                            %% generating EAP method (EAP-AKA'), and the UE
-                            %% then knows it talks to a gateway trusted by its
-                            %% home AAA, not necessarily this one (RFC 5998
-                            %% §6.2). false restores the TS 33.402 / RFC 7296
-                            %% CERT+AUTH path.
-                            EapOnly = eap_only_selected(
-                                          epdg_config:get(eap_only_auth, true),
-                                          InnerPayloads),
-                            CertAuth =
-                                case EapOnly of
-                                    true ->
-                                        none;
-                                    false ->
-                                        %% ADR-0045: the certificate of the
-                                        %% UE's home PLMN, the one its IDr
-                                        %% names.
-                                        {CertChain, PrivKey} =
-                                            ike_certificate_for(
-                                              IMSI, {DefaultChain, DefaultKey}),
-                                        %% AUTH over (IKE_SA_INIT_resp | Nonce_i
-                                        %% | prf(SK_pr, IDr')).
-                                        #{prf := PRF} = KeyParams,
-                                        {AuthMethod, Signature} =
-                                            epdg_ikev2_crypto:sign_auth_data(
-                                                PRF, IkeSaInitRespBytes, NonceI,
-                                                #{sk_pr => maps:get(sk_pr, Keys),
-                                                  id_payload => IDrPayload,
-                                                  sig_hashes => PeerSigHashes},
-                                                PrivKey),
-                                        {[epdg_ikev2_codec:encode_cert_payload(C)
-                                          || C <- CertChain],
-                                         epdg_ikev2_codec:encode_auth_payload(
-                                             AuthMethod, Signature)}
-                                end,
-                            logger:info("IKE_AUTH first response auth=~s IMSI=~p",
-                                        [eap_only_auth_label(EapOnly, InnerPayloads),
-                                         IMSI]),
-                            InnerChain = build_first_auth_chain(
-                                           IDrPayload, EapBin, CertAuth),
+                                %% RFC 5998: if the UE offered EAP-only auth, omit
+                                %% the certificate and the cert-based AUTH — the UE
+                                %% authenticates us via the EAP-AKA' MSK in the final
+                                %% exchange. Otherwise sign IDr with our key and send
+                                %% the cert (this also avoids needing a private key /
+                                %% certificate at all in the EAP-only case).
+                                %%
+                                %% SPEC-DEVIATION: TS 33.402 §7.2.1 — public-key
+                                %% signature authentication with certificates SHALL
+                                %% be used to authenticate the ePDG. Honoured only
+                                %% when the UE offers N(EAP_ONLY_AUTHENTICATION)
+                                %% and EPDG_EAP_ONLY_AUTH is on: RFC 5998 §3
+                                %% requires a mutually authenticating, key-
+                                %% generating EAP method (EAP-AKA'), and the UE
+                                %% then knows it talks to a gateway trusted by its
+                                %% home AAA, not necessarily this one (RFC 5998
+                                %% §6.2). false restores the TS 33.402 / RFC 7296
+                                %% CERT+AUTH path.
+                                EapOnly = eap_only_selected(
+                                              epdg_config:get(eap_only_auth, true),
+                                              InnerPayloads),
+                                CertAuth =
+                                    case EapOnly of
+                                        true ->
+                                            none;
+                                        false ->
+                                            %% ADR-0045: the certificate of the
+                                            %% UE's home PLMN, the one its IDr
+                                            %% names.
+                                            {CertChain, PrivKey} =
+                                                ike_certificate_for(
+                                                  IMSI, {DefaultChain, DefaultKey}),
+                                            %% AUTH over (IKE_SA_INIT_resp | Nonce_i
+                                            %% | prf(SK_pr, IDr')).
+                                            #{prf := PRF} = KeyParams,
+                                            {AuthMethod, Signature} =
+                                                epdg_ikev2_crypto:sign_auth_data(
+                                                    PRF, IkeSaInitRespBytes, NonceI,
+                                                    #{sk_pr => maps:get(sk_pr, Keys),
+                                                      id_payload => IDrPayload,
+                                                      sig_hashes => PeerSigHashes},
+                                                    PrivKey),
+                                            {[epdg_ikev2_codec:encode_cert_payload(C)
+                                              || C <- CertChain],
+                                             epdg_ikev2_codec:encode_auth_payload(
+                                                 AuthMethod, Signature)}
+                                    end,
+                                logger:info("IKE_AUTH first response auth=~s IMSI=~p",
+                                            [eap_only_auth_label(EapOnly, InnerPayloads),
+                                             IMSI]),
+                                InnerChain = build_first_auth_chain(
+                                               IDrPayload, EapBin, CertAuth),
 
-                            %% Preserve peer's flag set except we flip Response
-                            %% and clear Initiator (we are responder).
-                            RespFlags = (InFlags band (bnot 16#08)) bor 16#20,
+                                %% Preserve peer's flag set except we flip Response
+                                %% and clear Initiator (we are responder).
+                                RespFlags = (InFlags band (bnot 16#08)) bor 16#20,
 
-                            Hdr = #{initiator_spi     => ISPI,
-                                    responder_spi     => RSPI,
-                                    exchange_type_raw => 35,  %% IKE_AUTH
-                                    flags             => RespFlags,
-                                    message_id        => MsgId},
+                                Hdr = #{initiator_spi     => ISPI,
+                                        responder_spi     => RSPI,
+                                        exchange_type_raw => 35,  %% IKE_AUTH
+                                        flags             => RespFlags,
+                                        message_id        => MsgId},
 
-                            case encrypt_and_mirror(
-                                   KeyParams, Keys, Hdr, InnerChain, Data) of
-                                {ok, RespBytes} ->
-                                    catch epdg_ikev2_listener:send(
-                                            PeerIP, PeerPort, RespBytes),
-                                    logger:info(
-                                      "IKE_AUTH response sent (~p bytes) "
-                                      "IMSI=~p MsgId=~B",
-                                      [byte_size(RespBytes), IMSI, MsgId]),
-                                    NewData = Data#data{
-                                        keys_params  = KeyParams,
-                                        ike_keys     = Keys,
-                                        idr_body     = IDrPayload,
-                                        idi_body     = IDiBody,
-                                        imsi         = IMSI,
-                                        ue_nai       = UeNai,
-                                        mobike       = Mobike,
-                                        eap_next_id  = (EapId + 1) rem 256,
-                                        sai2_body    = Sai2Body,
-                                        tsi_body     = TsiBody,
-                                        tsr_body     = TsrBody,
-                                        cp_body      = CpBody,
-                                        ike_auth_last_resp = RespBytes,
-                                        ike_auth_last_msg_id = MsgId
-                                    },
-                                    {next_state, ike_auth, NewData};
-                                {error, EErr} ->
-                                    logger:warning(
-                                      "IKE_AUTH response encrypt failed: ~p",
-                                      [EErr]),
-                                    {stop, normal, Data}
+                                case encrypt_and_mirror(
+                                       KeyParams, Keys, Hdr, InnerChain, Data) of
+                                    {ok, RespBytes} ->
+                                        catch epdg_ikev2_listener:send(
+                                                PeerIP, PeerPort, RespBytes),
+                                        logger:info(
+                                          "IKE_AUTH response sent (~p bytes) "
+                                          "IMSI=~p MsgId=~B",
+                                          [byte_size(RespBytes), IMSI, MsgId]),
+                                        NewData = Data#data{
+                                            keys_params  = KeyParams,
+                                            ike_keys     = Keys,
+                                            idr_body     = IDrPayload,
+                                            idi_body     = IDiBody,
+                                            imsi         = IMSI,
+                                            apn          = Apn,
+                                            ue_nai       = UeNai,
+                                            mobike       = Mobike,
+                                            eap_next_id  = (EapId + 1) rem 256,
+                                            sai2_body    = Sai2Body,
+                                            tsi_body     = TsiBody,
+                                            tsr_body     = TsrBody,
+                                            cp_body      = CpBody,
+                                            ike_auth_last_resp = RespBytes,
+                                            ike_auth_last_msg_id = MsgId
+                                        },
+                                        {next_state, ike_auth, NewData};
+                                    {error, EErr} ->
+                                        logger:warning(
+                                          "IKE_AUTH response encrypt failed: ~p",
+                                          [EErr]),
+                                        {stop, normal, Data}
+                                end
                             end
                     end
             end
@@ -1448,6 +1532,77 @@ extract_idi(Payloads) ->
                 _              -> {undefined, <<>>, <<>>}
             end;
         _ -> {undefined, <<>>, <<>>}
+    end.
+
+%% The APN the UE asks for in the IDr payload of its first IKE_AUTH
+%% request (TS 24.302 §7.2.2.1; GSMA IR.51 §4.7.4), as a lower-case APN
+%% network identifier, or `default' when the UE asks for the default APN.
+%% Handsets send the bare network identifier ("ims", "mms") as ID_FQDN;
+%% Android can be configured to send it as ID_KEY_ID instead
+%% (CarrierConfigManager KEY_IKE_REMOTE_ID_TYPE_INT), so both are read.
+%% Any other ID type (an IP address, a DN) names no APN.
+-spec requested_apn([map()], binary()) -> binary() | default.
+requested_apn(Payloads, OwnFqdn) ->
+    case epdg_ikev2_codec:find_payload(idr, Payloads) of
+        {ok, #{data := D}} ->
+            case epdg_ikev2_codec:decode_id_payload(D) of
+                {ok, {T, Raw}} when T =:= 2; T =:= 11 ->
+                    normalise_apn(Raw, OwnFqdn);
+                _ ->
+                    default
+            end;
+        _ ->
+            default
+    end.
+
+%% APN network identifiers are case-insensitive (TS 23.003 §9.1). An APN
+%% with the operator identifier appended (".mncNNN.mccNNN.gprs" or the
+%% ".apn.epc...3gppnetwork.org" form) is cut back to the network
+%% identifier, which is what the HSS, AAA and PGW-C match on. A UE that
+%% names the ePDG itself in IDr (a generic IKEv2 client such as
+%% strongSwan with the ePDG's FQDN as remote identity) asks for no APN.
+-spec normalise_apn(binary(), binary()) -> binary() | default.
+normalise_apn(Raw, OwnFqdn) ->
+    Apn0 = string:lowercase(string:trim(Raw, trailing, ".")),
+    case Apn0 =:= string:lowercase(OwnFqdn)
+         orelse binary:match(Apn0, <<"epdg.epc.">>) =:= {0, 9} of
+        true ->
+            default;
+        false ->
+            Apn = re:replace(Apn0,
+                             <<"\\.(mnc[0-9]{3}\\.mcc[0-9]{3}\\.gprs"
+                               "|apn\\.epc\\.mnc[0-9]{3}\\.mcc[0-9]{3}"
+                               "\\.3gppnetwork\\.org)$">>,
+                             <<>>, [{return, binary}]),
+            case Apn of
+                <<>> -> default;
+                _    -> Apn
+            end
+    end.
+
+%% Whether this ePDG serves a PDN connection to Apn. EPDG_ALLOWED_APNS
+%% (empty = all) is a local gate; the subscriber's own APNs are
+%% authorised by the HSS (apn_list_swx) when the PGW-C asks the AAA over
+%% S6b.
+%% SPEC-DEVIATION: TS 24.302 §7.2.5 -- emergency sessions over SWu
+%% ("EMERGENCY" in IDr) are not supported; the request is refused like an
+%% APN that is not allowed.
+-spec apn_acceptable(binary()) -> boolean().
+apn_acceptable(<<"emergency">>) ->
+    false;
+apn_acceptable(Apn) ->
+    epdg_config:apn_allowed(Apn, epdg_config:get(allowed_apns, [])).
+
+%% Identity in the IKE_AUTH response IDr (EPDG_RESPONSE_IDR).
+%% SPEC-DEVIATION: TS 24.302 §7.4.1 -- the ePDG shall return the APN in
+%% IDr. The default `fqdn' returns the ePDG's FQDN instead, which is what
+%% UEs in the field have accepted so far; `apn' is the conformant setting,
+%% to be enabled once the devices in use are known to accept it.
+-spec response_idr(binary(), binary()) -> binary().
+response_idr(OwnFqdn, Apn) ->
+    case epdg_config:get(response_idr, fqdn) of
+        apn -> Apn;
+        _   -> OwnFqdn
     end.
 
 %% Extract IMSI from a 3GPP permanent identity NAI of the form
@@ -1638,7 +1793,7 @@ relay_eap_via_swm(MsgId, InFlags, EapBytes, ISPI, RSPI,
     Base = #{session_id  => SessionId,
              user_name   => pick_user_name(UeNai, IMSI),
              eap_payload => EapBytes,
-             apn         => to_bin(epdg_config:get(default_apn, "ims"))},
+             apn         => session_apn(Data)},
     %% TS 29.273 §9.2.3.1.1: carry the UE's local (outer) IP address as
     %% seen on the SWu socket in the SWm DER so the AAA can record where
     %% the subscriber attached from. This is the public/NAT'd source
@@ -1749,8 +1904,24 @@ handle_post_eap_auth(MsgId, InFlags, AuthRaw, InnerPayloads,
                               PeerIP, PeerPort, Data0#data{apn = Apn})
     end.
 
+%% IKE_AUTH error notify for a rejected S2b Create Session (TS 24.302
+%% §7.4.1 maps the AAA's refusal of an APN to private notify types).
+%% Cause 93 "APN access denied - no subscription" -> NO_APN_SUBSCRIPTION;
+%% 125 "UE not authorised by OCS or external AAA server" (what the PGW-C
+%% answers when S6b refuses the APN, or the OCS the subscriber) ->
+%% AUTHORIZATION_REJECTED. Anything else stays NO_ADDITIONAL_SAS as before.
+-spec csr_reject_notify(integer()) -> non_neg_integer().
+csr_reject_notify(93)     -> ?N_NO_APN_SUBSCRIPTION;
+csr_reject_notify(125)    -> ?N_AUTHORIZATION_REJECTED;
+csr_reject_notify(_Cause) -> 37.  %% NO_ADDITIONAL_SAS
+
 default_apn() ->
-    list_to_binary(epdg_config:get(default_apn, "ims")).
+    string:lowercase(list_to_binary(epdg_config:get(default_apn, "ims"))).
+
+%% APN of this session: the one the UE asked for in IDr, or the default
+%% for a session that was created before the APN was taken from IDr.
+session_apn(#data{apn = undefined}) -> default_apn();
+session_apn(#data{apn = Apn})       -> Apn.
 
 %% Only attach UE-Local-IP-Address when we actually have the UE's outer
 %% address (always true once the IKE_SA_INIT was received, but the guard
@@ -1815,9 +1986,29 @@ proceed_with_s2b(MsgId, InFlags, ISPI, RSPI,
                  InnerPayloads, _UeNai, IMSI, IDrBody,
                  NonceI, NonceR,
                  IkeSaInitRespBytes, Apn,
-                 PeerIP, PeerPort,
-                 #data{keys_params = KeyParams, ike_keys = Keys,
-                       eap_msk = MSK} = Data0) ->
+                 PeerIP, PeerPort, Data0) ->
+    %% The default bearer of this PDN connection gets an EPS bearer ID not
+    %% used by the UE's other PDN connections (TS 29.274 §7.2.1).
+    case epdg_ue_registry:claim_ebi(IMSI, self(), lists:seq(5, 15)) of
+        {ok, Ebi} ->
+            create_s2b_session(MsgId, InFlags, ISPI, RSPI, InnerPayloads,
+                               IMSI, IDrBody, NonceI, NonceR,
+                               IkeSaInitRespBytes, Apn, Ebi,
+                               PeerIP, PeerPort, Data0);
+        {error, no_free_ebi} ->
+            logger:warning("No free EPS bearer ID for IMSI=~p APN=~p: "
+                           "too many PDN connections", [IMSI, Apn]),
+            send_ike_notify_and_stop(MsgId, InFlags, ISPI, RSPI,
+                                     ?N_MAX_CONNECTION_REACHED, Data0)
+    end.
+
+create_s2b_session(MsgId, InFlags, ISPI, RSPI,
+                   InnerPayloads, IMSI, IDrBody,
+                   NonceI, NonceR,
+                   IkeSaInitRespBytes, Apn, Ebi,
+                   PeerIP, PeerPort,
+                   #data{keys_params = KeyParams, ike_keys = Keys,
+                         eap_msk = MSK} = Data0) ->
     LocalCTeid = new_teid(),
     LocalUTeid = new_teid(),
     %% PDN type: honour the UE's IKEv2 CFG_REQUEST when dual-stack is enabled,
@@ -1829,9 +2020,9 @@ proceed_with_s2b(MsgId, InFlags, ISPI, RSPI,
     %% PDN (and any active call) survive the handover instead of being torn down
     %% and re-created on a fresh address.
     #{v4 := HoV4, v6 := HoV6} = requested_handover_addrs(Data0#data.cp_body),
-    logger:info("S2b Create-Session IMSI=~p APN=~p pdn_type=~B (1=v4 2=v6 3=v4v6)"
-                " handover_v4=~p handover_v6=~p",
-                [IMSI, Apn, PdnType, HoV4, HoV6]),
+    logger:info("S2b Create-Session IMSI=~p APN=~p EBI=~B pdn_type=~B "
+                "(1=v4 2=v6 3=v4v6) handover_v4=~p handover_v6=~p",
+                [IMSI, Apn, Ebi, PdnType, HoV4, HoV6]),
     CsrParams = #{
             imsi         => IMSI,
             apn          => Apn,
@@ -1839,7 +2030,7 @@ proceed_with_s2b(MsgId, InFlags, ISPI, RSPI,
             pdn_type     => PdnType,
             handover_v4  => HoV4,
             handover_v6  => HoV6,
-            ebi          => 5,
+            ebi          => Ebi,
             local_c_teid => LocalCTeid,
             local_u_teid => LocalUTeid
         },
@@ -1861,18 +2052,22 @@ proceed_with_s2b(MsgId, InFlags, ISPI, RSPI,
         {ok, #{cause := Cause} = Resp}
           when Cause =:= undefined
                orelse (Cause >= 16 andalso Cause =< 63) ->
+            %% Keep the EBI this PDN connection was created with when the
+            %% PGW does not echo one: teardown and Delete Bearer handling
+            %% read it from the stored response (linked_ebi/1).
             register_bearer_then_finalize(MsgId, InFlags, ISPI, RSPI,
                                InnerPayloads, IMSI, IDrBody,
                                NonceI, NonceR,
                                IkeSaInitRespBytes, MSK,
                                KeyParams, Keys,
-                               LocalCTeid, LocalUTeid, Resp,
+                               LocalCTeid, LocalUTeid,
+                               with_linked_ebi(Resp, Ebi),
                                PeerIP, PeerPort, Data0);
         {ok, #{cause := Cause}} ->
-            logger:warning("S2b Create-Session rejected cause=~B IMSI=~p",
-                           [Cause, IMSI]),
+            logger:warning("S2b Create-Session rejected cause=~B IMSI=~p "
+                           "APN=~p", [Cause, IMSI, Apn]),
             send_ike_notify_and_stop(MsgId, InFlags, ISPI, RSPI,
-                                     37, Data0); %% NO_ADDITIONAL_SAS
+                                     csr_reject_notify(Cause), Data0);
         {error, Reason} ->
             logger:warning("S2b Create-Session failed: ~p IMSI=~p",
                            [Reason, IMSI]),
@@ -2852,10 +3047,6 @@ pick_user_name(<<>>, IMSI)      when is_binary(IMSI) -> IMSI;
 pick_user_name(NAI, _)          when is_binary(NAI)  -> NAI;
 pick_user_name(_, _) -> <<>>.
 
-to_bin(B) when is_binary(B) -> B;
-to_bin(L) when is_list(L)   -> list_to_binary(L);
-to_bin(_)                   -> <<>>.
-
 msk_len(B) when is_binary(B) -> byte_size(B);
 msk_len(_) -> 0.
 
@@ -3235,18 +3426,19 @@ signature_hash_algorithms(Payloads) ->
         []        -> []
     end.
 
-%% Tear down any prior live session for this IMSI before the new one
-%% registers (see established/3 enter). The old FSM's terminate/3 releases
+%% Tear down any prior live session for this IMSI and APN before the new
+%% one registers (see established/3 enter). The old FSM's terminate/3 releases
 %% its Child SAs, policies, S2b PDN connection and SWm session. At this
 %% point the old session still holds its own (different) UE inner IP — the
 %% PGW has not yet freed it — so deleting the old session's inner-IP
 %% policies cannot disturb the new session's policies.
-supersede_existing_session(undefined, _RSPI) -> ok;
-supersede_existing_session(IMSI, RSPI) ->
-    case epdg_ue_registry:lookup_by_imsi(IMSI) of
+supersede_existing_session(undefined, _Apn, _RSPI) -> ok;
+supersede_existing_session(IMSI, Apn, RSPI) ->
+    case epdg_ue_registry:lookup_by_imsi_apn(IMSI, Apn) of
         {ok, OldPid} when OldPid =/= self() ->
-            logger:notice("Superseding stale session for IMSI=~p "
-                          "(new RSPI=~.16B, old pid=~p)", [IMSI, RSPI, OldPid]),
+            logger:notice("Superseding stale session for IMSI=~p APN=~p "
+                          "(new RSPI=~.16B, old pid=~p)",
+                          [IMSI, Apn, RSPI, OldPid]),
             epdg_metrics:inc(session_superseded_total),
             gen_statem:cast(OldPid, supersede);
         _ ->

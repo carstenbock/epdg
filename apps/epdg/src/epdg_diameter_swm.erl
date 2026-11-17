@@ -45,7 +45,7 @@
 -ifdef(TEST).
 -export([session_state_marker/0]).
 %% Exported for eunit (epdg_swm_rar_tests).
--export([swm_session_held/2, blocked_transport/1]).
+-export([swm_session_held/2, asr_targets/2, blocked_transport/1]).
 -endif.
 
 -define(SERVER, ?MODULE).
@@ -525,20 +525,28 @@ handle_request(#diameter_packet{msg = Msg}, _SvcName, _Peer) ->
             {answer_message, 3001}
     end.
 
-%% AAA-initiated abort (TS 29.273 §7.1.2.4). Look the UE up by IMSI
-%% (bare or NAI) and tear the IKE SA down; always answer ASA 2001 so
-%% the AAA does not retry a session that is already gone.
+%% AAA-initiated abort (TS 29.273 §7.1.2.4). Look the UE's sessions up by
+%% IMSI (bare or NAI) and tear down the IKE SA of the aborted SWm session;
+%% always answer ASA 2001 so the AAA does not retry a session that is
+%% already gone. A UE has one session per PDN connection (TS 24.302
+%% §6.5.3), each with its own SWm session, so the Session-Id picks the
+%% one to end; aborting the MMS session must leave the IMS one up.
 handle_inbound_asr(AVPs) ->
     IMSI = avp_bin('User-Name', AVPs),
     Sid  = avp_bin('Session-Id', AVPs),
-    Found = lookup_ue_by_imsi(IMSI),
-    case Found of
-        {ok, Pid} ->
-            epdg_ue_fsm:disconnect(Pid);
-        error ->
-            ok
-    end,
+    lists:foreach(fun epdg_ue_fsm:disconnect/1,
+                  asr_targets(Sid, lookup_ues_by_imsi(IMSI))),
     {reply, asa_ok(Sid, IMSI)}.
+
+%% The sessions an ASR for Sid ends: those holding Sid. When none can be
+%% shown to hold it and the UE has a single session, that one, as before
+%% sessions were kept per PDN connection.
+-spec asr_targets(binary(), [pid()]) -> [pid()].
+asr_targets(Sid, Pids) ->
+    case [P || P <- Pids, swm_session_held(Sid, [P]) =:= true] of
+        [] when length(Pids) =:= 1 -> Pids;
+        Held                       -> Held
+    end.
 
 %% AAA-initiated re-authorization (TS 29.273 §7.1.2.2). The AAA also uses
 %% it to audit old sessions (KI-46): a Session-Id this ePDG does not hold
@@ -550,20 +558,29 @@ handle_inbound_rar(AVPs) ->
     IMSI = avp_bin('User-Name', AVPs),
     %% Without a User-Name the session cannot be looked up: answer as before.
     RC = case IMSI =/= <<>> andalso
-              swm_session_held(Sid, lookup_ue_by_imsi(IMSI)) =:= false of
+              swm_session_held(Sid, lookup_ues_by_imsi(IMSI)) =:= false of
         true  -> 5002;
         false -> 2001
     end,
     {reply, raa(Sid, RC)}.
 
-%% Whether the UE FSM found for the RAR's User-Name holds the Session-Id.
-%% `unsure' (FSM busy or gone mid-call) counts as held: a wrong 5002 would
-%% make the AAA end a live session, a wrong 2001 only delays the clean-up
-%% to the next audit.
--spec swm_session_held(binary(), {ok, pid()} | error) -> boolean() | unsure.
-swm_session_held(_Sid, error) ->
-    false;
-swm_session_held(Sid, {ok, Pid}) ->
+%% Whether one of the UE FSMs found for the RAR's User-Name (one per PDN
+%% connection) holds the Session-Id. `unsure' (FSM busy or gone mid-call)
+%% counts as held: a wrong 5002 would make the AAA end a live session, a
+%% wrong 2001 only delays the clean-up to the next audit.
+-spec swm_session_held(binary(), [pid()]) -> boolean() | unsure.
+swm_session_held(Sid, Pids) ->
+    Answers = [fsm_holds(Sid, P) || P <- Pids],
+    case lists:member(true, Answers) of
+        true  -> true;
+        false ->
+            case lists:member(unsure, Answers) of
+                true  -> unsure;
+                false -> false
+            end
+    end.
+
+fsm_holds(Sid, Pid) ->
     try epdg_ue_fsm:get_info(Pid) of
         {ok, #{swm_session_id := Sid}} -> true;
         {ok, #{swm_session_id := _}}   -> false;
@@ -581,8 +598,11 @@ avp_bin(Key, AVPs) ->
         _                     -> <<>>
     end.
 
-lookup_ue_by_imsi(<<>>) -> error;
-lookup_ue_by_imsi(IMSI) ->
+%% Every session of the UE named by User-Name: the bare IMSI, the NAI, or
+%% the NAI user part with the EAP method digit.
+-spec lookup_ues_by_imsi(binary()) -> [pid()].
+lookup_ues_by_imsi(<<>>) -> [];
+lookup_ues_by_imsi(IMSI) ->
     Bare = case binary:split(IMSI, <<"@">>) of
         [User, _] -> User;
         [User]    -> User
@@ -594,20 +614,15 @@ lookup_ue_by_imsi(IMSI) ->
         _ ->
             Bare
     end,
-    case epdg_ue_registry:lookup_by_imsi(IMSI) of
-        {ok, Pid} -> {ok, Pid};
-        error ->
-            case epdg_ue_registry:lookup_by_imsi(Canon) of
-                {ok, Pid} -> {ok, Pid};
-                error ->
-                    case [Pid || {_SPI, Pid, U} <- epdg_ue_registry:all(),
-                                 is_binary(U),
-                                 (U =:= IMSI orelse U =:= Canon
-                                  orelse U =:= Bare)] of
-                        [Pid | _] -> {ok, Pid};
-                        [] -> error
-                    end
-            end
+    case lists:usort(epdg_ue_registry:lookup_all_by_imsi(IMSI) ++
+                     epdg_ue_registry:lookup_all_by_imsi(Canon)) of
+        [] ->
+            lists:usort([Pid || {_SPI, Pid, U} <- epdg_ue_registry:all(),
+                                is_binary(U),
+                                (U =:= IMSI orelse U =:= Canon
+                                 orelse U =:= Bare)]);
+        Pids ->
+            Pids
     end.
 
 asa_ok(Sid, IMSI) ->

@@ -1,6 +1,8 @@
 %%%-------------------------------------------------------------------
 %%% @doc UE session registry backed by ETS.
-%%% Maps responder SPI → UE FSM pid, and IMSI → SPI for reverse lookup.
+%%% Maps responder SPI → UE FSM pid, and {IMSI, APN} → SPI for reverse
+%%% lookup. A UE holds one IKE SA per PDN connection (TS 24.302 §6.5.3),
+%%% so one IMSI can have several sessions, one per APN.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(epdg_ue_registry).
@@ -8,11 +10,12 @@
 -behaviour(gen_server).
 
 -export([start_link/0,
-         register/3, unregister/1,
+         register/3, register/4, unregister/1,
          register_initiator/3, lookup_by_initiator/2, unregister_initiator/2,
          register_cteid/2, lookup_by_cteid/1, unregister_cteid/1,
          register_esp_spis/3, unregister_esp_spis/2, esp_spi_claimed/1,
-         lookup_by_spi/1, lookup_by_imsi/1,
+         lookup_by_spi/1, lookup_by_imsi_apn/2, lookup_all_by_imsi/1,
+         claim_ebi/3, claim_ebi_exact/3, release_ebi/3,
          count/0, all/0, broadcast/1, broadcast/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
@@ -23,6 +26,7 @@
 -define(TAB_INIT, epdg_initiator_tab).  %% {PeerIP, ISPI} -> Pid (dedup IKE_SA_INIT retransmits)
 -define(TAB_CTEID, epdg_cteid_tab).     %% ePDG local S2b-C TEID -> Pid (route PGW-initiated bearer msgs)
 -define(TAB_ESP, epdg_esp_spi_tab).     %% ESP SPI (in+out) -> Pid (kernel-SA ownership for the XFRM reconciler)
+-define(TAB_EBI, epdg_ebi_tab).         %% {IMSI, EBI} -> Pid (EPS bearer IDs in use per UE)
 
 %%====================================================================
 %% API
@@ -33,7 +37,14 @@ start_link() ->
 
 -spec register(non_neg_integer(), pid(), binary() | undefined) -> ok.
 register(SPI, Pid, IMSI) ->
-    gen_server:call(?SERVER, {register, SPI, Pid, IMSI}).
+    register(SPI, Pid, IMSI, undefined).
+
+%% Register a session; with an IMSI it also becomes the session of
+%% {IMSI, APN}, replacing an earlier one of the same UE and APN.
+-spec register(non_neg_integer(), pid(), binary() | undefined,
+               binary() | undefined) -> ok.
+register(SPI, Pid, IMSI, APN) ->
+    gen_server:call(?SERVER, {register, SPI, Pid, IMSI, APN}).
 
 -spec unregister(non_neg_integer()) -> ok.
 unregister(SPI) ->
@@ -129,14 +140,66 @@ lookup_by_spi(SPI) ->
         [] -> error
     end.
 
--spec lookup_by_imsi(binary()) -> {ok, pid()} | error.
-lookup_by_imsi(IMSI) ->
-    case ets:lookup(?TAB_IMSI, IMSI) of
+-spec lookup_by_imsi_apn(binary(), binary() | undefined) -> {ok, pid()} | error.
+lookup_by_imsi_apn(IMSI, APN) ->
+    case ets:lookup(?TAB_IMSI, {IMSI, APN}) of
         [{_, SPI}] ->
             lookup_by_spi(SPI);
         [] ->
             error
     end.
+
+%% Every session of one UE, one per PDN connection.
+-spec lookup_all_by_imsi(binary()) -> [pid()].
+lookup_all_by_imsi(IMSI) ->
+    [Pid || [SPI] <- ets:match(?TAB_IMSI, {{IMSI, '_'}, '$1'}),
+            {ok, Pid} <- [lookup_by_spi(SPI)]].
+
+%% EPS bearer IDs (TS 24.007 §11.2.3.1.5: 5..15) identify a bearer within
+%% one UE, across all of its PDN connections (TS 29.274 §7.2.1: IMSI +
+%% EBI). Over S2b the ePDG assigns them, for the default bearer of each
+%% PDN connection and for dedicated bearers, so the sessions of one IMSI
+%% share this pool. A claim is held by the session's FSM and dropped when
+%% it dies ('DOWN' below). ets:insert_new makes a claim atomic without a
+%% call to the registry process.
+-spec claim_ebi(binary(), pid(), [5..15]) -> {ok, 5..15} | {error, no_free_ebi}.
+claim_ebi(_IMSI, _Pid, []) ->
+    {error, no_free_ebi};
+claim_ebi(IMSI, Pid, [Ebi | Rest]) ->
+    case claim_ebi_exact(IMSI, Ebi, Pid) of
+        ok              -> {ok, Ebi};
+        {error, taken}  -> claim_ebi(IMSI, Pid, Rest)
+    end.
+
+%% Claim one given EBI. Idempotent for its holder; a claim left by a dead
+%% process is taken over.
+-spec claim_ebi_exact(binary(), 5..15, pid()) -> ok | {error, taken}.
+claim_ebi_exact(IMSI, Ebi, Pid) ->
+    Key = {IMSI, Ebi},
+    case ets:insert_new(?TAB_EBI, {Key, Pid}) of
+        true ->
+            ok;
+        false ->
+            case ets:lookup(?TAB_EBI, Key) of
+                [{_, Pid}] ->
+                    ok;
+                [{_, Other} = Obj] ->
+                    case is_process_alive(Other) of
+                        true ->
+                            {error, taken};
+                        false ->
+                            ets:delete_object(?TAB_EBI, Obj),
+                            claim_ebi_exact(IMSI, Ebi, Pid)
+                    end;
+                [] ->
+                    claim_ebi_exact(IMSI, Ebi, Pid)
+            end
+    end.
+
+-spec release_ebi(binary(), 5..15, pid()) -> ok.
+release_ebi(IMSI, Ebi, Pid) ->
+    ets:delete_object(?TAB_EBI, {{IMSI, Ebi}, Pid}),
+    ok.
 
 -spec count() -> non_neg_integer().
 count() ->
@@ -181,14 +244,16 @@ init([]) ->
                          {write_concurrency, true}]),
     ets:new(?TAB_ESP, [named_table, public, set, {read_concurrency, true},
                        {write_concurrency, true}]),
+    ets:new(?TAB_EBI, [named_table, public, set, {read_concurrency, true},
+                       {write_concurrency, true}]),
     {ok, #{}}.
 
-handle_call({register, SPI, Pid, IMSI}, _From, State) ->
+handle_call({register, SPI, Pid, IMSI, APN}, _From, State) ->
     MRef = erlang:monitor(process, Pid),
     ets:insert(?TAB_SPI, {SPI, Pid, IMSI}),
     case IMSI of
         undefined -> ok;
-        _ -> ets:insert(?TAB_IMSI, {IMSI, SPI})
+        _ -> ets:insert(?TAB_IMSI, {{IMSI, APN}, SPI})
     end,
     NewState = State#{SPI => MRef, Pid => SPI},
     {reply, ok, NewState};
@@ -209,6 +274,7 @@ handle_info({'DOWN', _MRef, process, Pid, _Reason}, State) ->
     %% net; the FSM also unregisters explicitly in terminate/3).
     ets:match_delete(?TAB_CTEID, {'_', Pid}),
     ets:match_delete(?TAB_ESP, {'_', Pid}),
+    ets:match_delete(?TAB_EBI, {'_', Pid}),
     case maps:find(Pid, State) of
         {ok, SPI} ->
             do_unregister(SPI, State),
@@ -234,18 +300,14 @@ do_unregister(SPI, State) ->
     case ets:lookup(?TAB_SPI, SPI) of
         [{_, _Pid, IMSI}] ->
             ets:delete(?TAB_SPI, SPI),
-            %% Only drop the IMSI->SPI reverse mapping if it still points at
-            %% THIS SPI. When a UE re-attaches, the new session's FSM
-            %% overwrites IMSI->SPI with its own (newer) SPI before the old
-            %% FSM tears down; deleting unconditionally here would orphan the
-            %% live session from IMSI lookups and defeat per-IMSI dedup.
+            %% Only drop the {IMSI, APN}->SPI reverse mapping if it still
+            %% points at THIS SPI. When a UE re-attaches, the new session's
+            %% FSM overwrites it with its own (newer) SPI before the old FSM
+            %% tears down; deleting unconditionally here would orphan the
+            %% live session from IMSI lookups and defeat the dedup.
             case IMSI of
                 undefined -> ok;
-                _ ->
-                    case ets:lookup(?TAB_IMSI, IMSI) of
-                        [{_, SPI}] -> ets:delete(?TAB_IMSI, IMSI);
-                        _          -> ok
-                    end
+                _ -> ets:match_delete(?TAB_IMSI, {{IMSI, '_'}, SPI})
             end,
             case maps:find(SPI, State) of
                 {ok, MRef} -> erlang:demonitor(MRef, [flush]);

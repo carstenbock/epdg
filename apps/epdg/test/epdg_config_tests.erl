@@ -255,3 +255,24 @@ idr_ignores_malformed_entries_test() ->
     ?assertEqual(?DEFAULT_IDR,
                  epdg_config:ike_id_fqdn_for_imsi(<<"262250000000001">>, ?DEFAULT_IDR,
                                                   ?PLATFORM, "26-25,x,262-,262-2a")).
+
+%% EPDG_ALLOWED_APNS is compared with the APN from the UE's IDr, which is
+%% lower-cased (TS 23.003 §9.1: case-insensitive); an empty value means
+%% "allow all" and must not turn into a list with an empty entry.
+allowed_apns_parse_test() ->
+    ?assertEqual([<<"ims">>, <<"mms">>],
+                 epdg_config:parse_apn_list(" IMS , mms ,")),
+    ?assertEqual([], epdg_config:parse_apn_list("")).
+
+%% "ims" is always allowed so a typo in the list cannot take VoWiFi down.
+apn_allowed_test() ->
+    ?assert(epdg_config:apn_allowed(<<"internet">>, [])),
+    ?assert(epdg_config:apn_allowed(<<"ims">>, [<<"mms">>])),
+    ?assertNot(epdg_config:apn_allowed(<<"internet">>, [<<"mms">>])).
+
+%% A wrong EPDG_RESPONSE_IDR must stop the boot: it changes what every UE
+%% sees in IKE_AUTH.
+response_idr_parse_test() ->
+    ?assertEqual(fqdn, epdg_config:parse_response_idr("fqdn")),
+    ?assertEqual(apn, epdg_config:parse_response_idr(" APN ")),
+    ?assertError({invalid_config, _, _}, epdg_config:parse_response_idr("both")).

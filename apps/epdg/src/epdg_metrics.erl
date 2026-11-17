@@ -79,6 +79,7 @@ init() ->
         ike_redirects_sent_total,
         ike_invalid_spi_sent_total,
         session_superseded_total,
+        ike_auth_apn_rejected_total,
         tun_startup_cleaned_total,
         xfrm_reconcile_runs_total,
         xfrm_reconcile_orphan_sas_deleted_total,

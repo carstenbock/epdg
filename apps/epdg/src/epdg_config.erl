@@ -9,7 +9,8 @@
          parse_instance_id/2, parse_legacy_dh_groups/1, parse_bool/2,
          parse_trace_local_addrs/1, default_ike_id_fqdn/0,
          ike_id_fqdn_for_imsi/1, ike_id_fqdn_for_imsi/4,
-         home_plmn_for_imsi/1, home_plmn_for_imsi/3]).
+         home_plmn_for_imsi/1, home_plmn_for_imsi/3,
+         parse_apn_list/1, apn_allowed/2, parse_response_idr/1]).
 
 %% ?UE6_PREFIX_LEN: floor for UE IPv6 pool widths (check_v6_pool_width/3).
 -include("epdg_ipv6.hrl").
@@ -222,9 +223,19 @@ init() ->
     %% in the Create-Session PAA (IPv4, IPv6 or IPv4v6). GSMA IR.51/IR.92.
     set_from_env_bool("EPDG_IPV6_ENABLED", ipv6_enabled, false),
 
-    %% Allowed APNs (comma-separated; empty = allow all, "ims" is always allowed)
-    set_from_env("EPDG_ALLOWED_APNS", allowed_apns, "ims"),
+    %% APN the UE gets when its IKE_AUTH request carries no IDr
+    %% (TS 24.302 §7.2.2.1: no IDr = default APN).
     set_from_env("EPDG_DEFAULT_APN", default_apn, "ims"),
+    %% APNs a UE may request in IDr (comma-separated, case-insensitive).
+    %% Empty = allow all: the HSS authorises APNs per subscriber
+    %% (apn_list_swx, enforced by the AAA at S6b). "ims" is always allowed.
+    application:set_env(?APP, allowed_apns,
+                        parse_apn_list(env_or("EPDG_ALLOWED_APNS", ""))),
+    %% What the ePDG puts in its IKE_AUTH response IDr: "fqdn" (its own
+    %% FQDN, the historical behaviour) or "apn" (the APN of the PDN
+    %% connection, TS 24.302 §7.4.1). See parse_response_idr/1.
+    application:set_env(?APP, response_idr,
+                        parse_response_idr(env_or("EPDG_RESPONSE_IDR", "fqdn"))),
 
     %% Dead Peer Detection (RFC 7296 §2.4). Default 120 s: VoWiFi UEs behind
     %% residential CPE NAT with aggressive power-save go briefly silent while
@@ -287,6 +298,40 @@ set_from_env(EnvVar, AppKey, Default) ->
         Val -> Val
     end,
     application:set_env(?APP, AppKey, Value).
+
+env_or(EnvVar, Default) ->
+    case os:getenv(EnvVar) of
+        false -> Default;
+        Val   -> Val
+    end.
+
+%% Parse EPDG_ALLOWED_APNS into lower-case binaries. APN network
+%% identifiers are case-insensitive (TS 23.003 §9.1), so the comparison
+%% with the APN from the UE's IDr is done in lower case.
+-spec parse_apn_list(string()) -> [binary()].
+parse_apn_list(Csv) when is_list(Csv) ->
+    [list_to_binary(string:lowercase(E))
+     || E0 <- string:split(Csv, ",", all),
+        E <- [string:trim(E0)], E =/= ""].
+
+%% True when a UE may request Apn. An empty list allows every APN; "ims"
+%% is always allowed, so a typo in the list cannot take VoWiFi down.
+-spec apn_allowed(binary(), [binary()]) -> boolean().
+apn_allowed(_Apn, [])        -> true;
+apn_allowed(<<"ims">>, _)    -> true;
+apn_allowed(Apn, AllowList)  -> lists:member(Apn, AllowList).
+
+%% EPDG_RESPONSE_IDR: an unknown value fails the boot. Silently falling
+%% back would hide a misconfiguration that changes what every UE sees.
+-spec parse_response_idr(string()) -> fqdn | apn.
+parse_response_idr(S) ->
+    case string:lowercase(string:trim(S)) of
+        "fqdn" -> fqdn;
+        "apn"  -> apn;
+        Other  -> error({invalid_config,
+                         "EPDG_RESPONSE_IDR must be \"fqdn\" or \"apn\"",
+                         Other})
+    end.
 
 set_from_env_int(EnvVar, AppKey, Default) ->
     Value = case os:getenv(EnvVar) of
