@@ -548,3 +548,17 @@ encode_echo_response_test() ->
     %% which is what a peer's own echo handler will do with it.
     ?assertEqual({echo_response, 16#1234},
                  epdg_gtpu_forwarder:decode_gtpu(Rsp)).
+
+%% ADR-0047 / KI-198: the ePDG leg of the inner traffic must not be tracked,
+%% or kube-proxy NATs a UE packet to a Service VIP before the co-located
+%% PGW-U and the reply that returns through the PGW-U is dropped as INVALID.
+%% Both devices of the leg are covered (uplink arrives on the XFRM
+%% interface, downlink on the TUN), the hook runs before conntrack (-200),
+%% and the table is replaced atomically on every restart.
+notrack_ruleset_covers_the_epdg_leg_before_conntrack_test() ->
+    R = epdg_gtpu_forwarder:notrack_ruleset("epdgct0", ["epdgx1", "epdg0"]),
+    ?assertMatch({match, _}, re:run(R, "iifname \\{ \"epdgx1\", \"epdg0\" \\} notrack")),
+    {match, [Prio]} = re:run(R, "hook prerouting priority (-?[0-9]+);",
+                             [{capture, all_but_first, list}]),
+    ?assert(list_to_integer(Prio) < -200),
+    ?assertMatch({match, _}, re:run(R, "^table inet epdgct0\ndelete table inet epdgct0\ntable inet epdgct0 \\{")).

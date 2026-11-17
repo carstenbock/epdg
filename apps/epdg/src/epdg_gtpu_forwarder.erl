@@ -129,7 +129,7 @@
 -ifdef(TEST).
 %% Kernel programming of the XFRM interface, for integration checks against
 %% a real kernel (needs NET_ADMIN; not part of the EUnit run).
--export([setup_xfrm_if/5, teardown_xfrm_routing/4]).
+-export([setup_xfrm_if/5, teardown_xfrm_routing/4, notrack_ruleset/2]).
 -endif.
 -define(MAX_INSTANCES, 64).
 %% XFRM interface of the instance (setup_xfrm_if/5): device "epdgx" ++ Id,
@@ -1101,6 +1101,7 @@ setup_xfrm_if(InstanceId, TunName, Table, Prio, Pools) ->
                       || Fam <- Fams])
                 ++ scope_pool_rules_cmds(Pools, XName, Table, Prio),
             run_cmds_or_warn(XName, Cmds),
+            setup_conntrack_bypass(InstanceId, [XName, TunName]),
             application:set_env(epdg, xfrm_if, Params),
             application:set_env(epdg, xfrm_mode_changed, not Existed),
             logger:notice("XFRM interface ~s (if_id 0x~.16B, MTU ~B): per-UE "
@@ -1124,6 +1125,7 @@ setup_xfrm_if(InstanceId, TunName, Table, Prio, Pools) ->
             %% table and installed the unscoped pool rules; drop what an
             %% earlier incarnation routed to or scoped to the interface.
             teardown_xfrm_routing(InstanceId, TunName, Prio, Pools),
+            remove_conntrack_bypass(InstanceId),
             case Existed of
                 true  -> run_quiet(io_lib:format("ip link del ~s", [XName]));
                 false -> ok
@@ -1135,6 +1137,56 @@ setup_xfrm_if(InstanceId, TunName, Table, Prio, Pools) ->
 %% Remove the instance's XFRM routing (rules and tables), not the device:
 %% SAs that survive a restart stay usable only with the interface they were
 %% created for, and an idle interface costs nothing.
+%% Conntrack bypass for the ePDG side of the inner traffic (ADR-0047, KI-198).
+%%
+%% The ePDG and a co-located PGW-U share the node's network namespace, so
+%% netfilter sees a UE packet twice: on the XFRM interface (decrypted
+%% uplink) and again on ogstun* after the PGW-U. kube-proxy's DNAT for
+%% Service VIPs then already fired on the first pass, rewrote the packet to
+%% a pod address before the PGW-U and the ePDG's pool rule sent it into the
+%% TUN, where it was lost; replies that came back through the PGW-U and the
+%% TUN did not match the conntrack entry of the first pass and were dropped
+%% as INVALID. Untracked on the XFRM interface and the TUN (both
+%% directions of the ePDG leg), the packet takes the S2b path unchanged and
+%% is tracked and NATed only once, on the PGW-U side. Priority -300 runs
+%% before conntrack (-200). The ePDG itself needs no conntrack state there.
+notrack_ruleset(Table, Ifaces) ->
+    Names = string:join(["\"" ++ I ++ "\"" || I <- Ifaces], ", "),
+    lists:flatten(io_lib:format(
+      "table inet ~s\n"
+      "delete table inet ~s\n"
+      "table inet ~s {\n"
+      "  chain pre {\n"
+      "    type filter hook prerouting priority -300; policy accept;\n"
+      "    iifname { ~s } notrack\n"
+      "  }\n"
+      "}\n",
+      [Table, Table, Table, Names])).
+
+notrack_table(InstanceId) ->
+    "epdgct" ++ integer_to_list(InstanceId).
+
+setup_conntrack_bypass(InstanceId, Ifaces) ->
+    Table = notrack_table(InstanceId),
+    case epdg_config:get(conntrack_bypass, "true") =/= "false" of
+        true ->
+            case epdg_srccheck:nft_script(notrack_ruleset(Table, Ifaces)) of
+                ok ->
+                    logger:notice("conntrack bypass: ~s untracked (table inet ~s)",
+                                  [string:join(Ifaces, ", "), Table]);
+                {error, Err} ->
+                    logger:warning("conntrack bypass not installed (table inet ~s): ~s. "
+                                   "Services on Service VIPs stay unreachable for "
+                                   "co-located VoWiFi UEs (KI-198)", [Table, Err])
+            end;
+        false ->
+            remove_conntrack_bypass(InstanceId),
+            logger:notice("conntrack bypass disabled (EPDG_CONNTRACK_BYPASS=false)")
+    end.
+
+remove_conntrack_bypass(InstanceId) ->
+    run_quiet("nft delete table inet " ++ notrack_table(InstanceId)).
+
 teardown_xfrm_routing(InstanceId, TunName, Prio, Pools) ->
     #{name := XName, downlink_table := DlTable, local_table := LocalTable} =
         xfrm_if_params(InstanceId),
